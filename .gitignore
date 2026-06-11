@@ -1,0 +1,12 @@
+jobs/
+ka_tools/
+
+.codex/
+.agents/
+codex-home-cache/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+.DS_Store

@@ -1,0 +1,30 @@
+{
+  "ka-tools": {
+    "port": "3000:3000",
+    "env_file": "/home/devops/ka/data/ka_tools/.env.local",
+    "volumes": [
+      "/home/devops/ka/data/ka_tools/data:/app/data"
+    ]
+  },
+  "audioqas": {
+    "port": "8001:8000",
+    "volumes": [
+      "/home/devops/ka/data/audioqas/.venv/model-cache:/model-cache"
+    ],
+    "env": {
+      "HF_HOME": "/model-cache/huggingface"
+    }
+  },
+  "agora-token-generator": {
+    "port": "8002:3010"
+  },
+  "api-examples-web": {
+    "port": "8003:3000"
+  },
+  "agora-rest-api-debugger": {
+    "port": "8004:3000"
+  },
+  "loga": {
+    "port": "8005:5050"
+  }
+}
