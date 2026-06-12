@@ -51,13 +51,7 @@ Git 仓库，生成文件、构建镜像并尝试运行：
 ./automation/runner.sh --source-type git --source https://github.com/example/repo.git --build --run
 ```
 
-如果需要在 `RUN_SUCCEEDED` 时输出访问 URL，可额外传入：
-
-```bash
-./automation/runner.sh --source-type git --source https://github.com/example/repo.git --build --run --tool-id my-tool
-```
-
-当传入 `--tool-id` 时，runner 会先从共享源码副本复制出一个 job 私有工作副本，再在该私有副本中对前端绝对路径 API/静态资源引用做第一版子路径改写，并在 `automation/jobs/<项目名>/nginx-add.conf` 生成需要新增的 nginx 规则。对外访问路径不再使用 `tool-id`，统一改为 `tools2/<项目名>`。如果本机存在 `/etc/nginx/sites-available/athena.conf`，runner 只会在 `RUN_SUCCEEDED` 之后检查其中的 `athena.agoralab.co` 的 `443 ssl http2` server block：如果已存在该项目的 nginx 规则，则完全不做修改；只有在缺少该项目规则时，才会先通过 `sudo -n` 在同目录备份出 `/etc/nginx/sites-available/athena_<时间戳>.conf`，再把对应 `nginx-add.conf` 内容插入到 `client_max_body_size 100m;` 后面，并通过 `sudo -n` 执行配置读取、写回、`nginx -t` 与 reload；失败时只记 warning，不会让工具部署结果回滚为失败。
+`RUN_SUCCEEDED` 时会输出访问 URL。runner 会先从共享源码副本复制出一个 job 私有工作副本，再在该私有副本中对前端绝对路径 API/静态资源引用做第一版子路径改写，并在 `automation/jobs/<项目名>/nginx-add.conf` 生成该项目需要新增的 nginx 规则。对外访问路径统一使用 `tools2/<项目名>`。如果本机存在 `/etc/nginx/sites-available/tools.conf`，runner 会在 `RUN_SUCCEEDED` 之后直接读写这个文件：若当前项目已存在 Runner 管理的 `# BEGIN KA TOOL <项目名> ... # END KA TOOL <项目名>` block，则按最新端口和代理模式覆盖；若不存在，则直接追加到文件末尾。写回前会通过 `sudo -n` 先备份出 `/etc/nginx/sites-available/tools_<时间戳>.conf`，随后执行 `nginx -t` 与 reload；失败时只记 warning，不会让工具部署结果回滚为失败。`--tool-id` 现在只是透传记录字段，不再决定是否启用这套平台部署流程。
 
 前端子路径改写只发生在 job 私有工作副本中，不会修改原始上游仓库；当前已覆盖根目录、`src/`、`static/`、`public/`、`client/`、`web/` 等常见前端目录，并会对 `window.location.origin` / `window.location.href` 一类运行时跳转逻辑做部署时补丁，使其优先使用 `window.__TOOL_BASE_PATH__`。
 

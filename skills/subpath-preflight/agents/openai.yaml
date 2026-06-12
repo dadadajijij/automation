@@ -1,0 +1,4 @@
+interface:
+  display_name: "子路径预改造"
+  short_description: "帮助客户在提交前自行完成子路径适配"
+  default_prompt: "使用 $subpath-preflight 帮我指导客户在提交代码前完成子路径适配，并给出修改清单、最小示例和提交前验收项。"

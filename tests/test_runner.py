@@ -8,6 +8,35 @@ import runner
 
 
 class RunnerProjectSlugTests(unittest.TestCase):
+    def test_json_safe_converts_path_set_and_dataclass(self) -> None:
+        payload = {
+            "path": Path("/tmp/demo"),
+            "items": {"b", "a"},
+            "command": runner.CommandResult(args=["echo", "ok"], returncode=0, stdout="ok"),
+        }
+
+        safe = runner.json_safe(payload)
+
+        self.assertEqual(safe["path"], "/tmp/demo")
+        self.assertEqual(safe["items"], ["a", "b"])
+        self.assertEqual(
+            safe["command"],
+            {"args": ["echo", "ok"], "returncode": 0, "stdout": "ok"},
+        )
+        json.dumps(safe)
+
+    def test_json_dumps_safe_handles_non_serializable_objects(self) -> None:
+        text = runner.json_dumps_safe({"path": Path("/tmp/demo"), "items": {"b", "a"}})
+        self.assertIn('"/tmp/demo"', text)
+        self.assertIn('"items"', text)
+
+    def test_build_access_url_does_not_require_tool_id(self) -> None:
+        url = runner.build_access_url({"project_slug": "agora-token-generator"})
+        self.assertEqual(url, "https://athena.agoralab.co/tools2/agora-token-generator")
+
+    def test_build_access_url_returns_none_without_project_slug(self) -> None:
+        self.assertIsNone(runner.build_access_url({"tool_id": "tool-abc"}))
+
     def test_build_deployment_base_path_uses_project_slug(self) -> None:
         self.assertEqual(
             runner.build_deployment_base_path("agora-token-generator"),
@@ -72,76 +101,23 @@ class RunnerProjectSlugTests(unittest.TestCase):
         self.assertIn("proxy_pass http://127.0.0.1:8004/tools2/agora-rest-api-debugger/;", conf)
         self.assertNotIn("return 301 /tools2/agora-rest-api-debugger/;", conf)
 
-    def test_upsert_tool_nginx_into_athena_conf_inserts_after_client_max_body_size(self) -> None:
-        original = """server {
-    listen 443 ssl http2;
-    server_name athena.agoralab.co;
-    client_max_body_size 100m;
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-    }
-}
-"""
-        updated, status = runner.upsert_tool_nginx_into_athena_conf(original, "audioqas", 8001)
+    def test_upsert_tool_nginx_into_tools_conf_inserts_managed_block(self) -> None:
+        updated, status = runner.upsert_tool_nginx_into_tools_conf("", "audioqas", 8001)
         self.assertEqual(status, "inserted_managed")
         self.assertIn("# BEGIN KA TOOL audioqas", updated)
         self.assertIn("location = /tools2/audioqas {", updated)
-        self.assertLess(updated.index("client_max_body_size 100m;"), updated.index("# BEGIN KA TOOL audioqas"))
 
-    def test_upsert_tool_nginx_into_athena_conf_is_idempotent_for_managed_block(self) -> None:
-        original = """server {
-    listen 443 ssl http2;
-    server_name athena.agoralab.co;
-    client_max_body_size 100m;
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-    }
-}
-"""
-        first, first_status = runner.upsert_tool_nginx_into_athena_conf(original, "audioqas", 8001)
-        second, second_status = runner.upsert_tool_nginx_into_athena_conf(first, "audioqas", 8001)
-        self.assertEqual(first_status, "inserted_managed")
+    def test_upsert_tool_nginx_into_tools_conf_is_idempotent_for_managed_block(self) -> None:
+        original = runner.render_athena_managed_tool_block("audioqas", 8001, indent="")
+        first, first_status = runner.upsert_tool_nginx_into_tools_conf(original, "audioqas", 8001)
+        second, second_status = runner.upsert_tool_nginx_into_tools_conf(first, "audioqas", 8001)
+        self.assertEqual(first_status, "already_managed")
         self.assertEqual(second_status, "already_managed")
         self.assertEqual(first, second)
 
-    def test_upsert_tool_nginx_into_athena_conf_does_not_modify_existing_managed_block(self) -> None:
-        managed_block = runner.render_athena_managed_tool_block("audioqas", 8001)
-        original = f"""server {{
-    listen 443 ssl http2;
-    server_name athena.agoralab.co;
-    client_max_body_size 100m;
-{managed_block}
-    location / {{
-        proxy_pass http://127.0.0.1:3000;
-    }}
-}}
-"""
-        updated, status = runner.upsert_tool_nginx_into_athena_conf(original, "audioqas", 8001)
-        self.assertEqual(status, "already_managed")
-        self.assertEqual(updated, original)
-
-    def test_upsert_tool_nginx_into_athena_conf_updates_existing_managed_block_when_mode_changes(self) -> None:
-        original = """server {
-    listen 443 ssl http2;
-    server_name athena.agoralab.co;
-    client_max_body_size 100m;
-    # BEGIN KA TOOL agora-rest-api-debugger
-    # Additional nginx rules for agora-rest-api-debugger
-    location = /tools2/agora-rest-api-debugger {
-        return 301 /tools2/agora-rest-api-debugger/;
-    }
-
-    location ^~ /tools2/agora-rest-api-debugger/ {
-        proxy_pass http://127.0.0.1:8004/;
-        proxy_set_header X-Forwarded-Prefix /tools2/agora-rest-api-debugger;
-    }
-    # END KA TOOL agora-rest-api-debugger
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-    }
-}
-"""
-        updated, status = runner.upsert_tool_nginx_into_athena_conf(
+    def test_upsert_tool_nginx_into_tools_conf_updates_existing_managed_block_when_mode_changes(self) -> None:
+        original = runner.render_athena_managed_tool_block("agora-rest-api-debugger", 8004, indent="")
+        updated, status = runner.upsert_tool_nginx_into_tools_conf(
             original,
             "agora-rest-api-debugger",
             8004,
@@ -151,22 +127,13 @@ class RunnerProjectSlugTests(unittest.TestCase):
         self.assertIn("proxy_pass http://127.0.0.1:8004/tools2/agora-rest-api-debugger/;", updated)
         self.assertNotIn("proxy_pass http://127.0.0.1:8004/;", updated)
 
-    def test_upsert_tool_nginx_into_athena_conf_detects_existing_unmanaged_block(self) -> None:
-        original = """server {
-    listen 443 ssl http2;
-    server_name athena.agoralab.co;
-    client_max_body_size 100m;
-    location = /tools2/audioqas {
-        return 301 /tools2/audioqas/;
-    }
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-    }
-}
-"""
-        updated, status = runner.upsert_tool_nginx_into_athena_conf(original, "audioqas", 8001)
-        self.assertEqual(status, "already_present_unmanaged")
-        self.assertEqual(updated, original)
+    def test_upsert_tool_nginx_into_tools_conf_appends_after_existing_block(self) -> None:
+        original = runner.render_athena_managed_tool_block("mos-video-compare", 8006, indent="")
+        updated, status = runner.upsert_tool_nginx_into_tools_conf(original, "loga", 8005)
+        self.assertEqual(status, "inserted_managed")
+        self.assertIn("# BEGIN KA TOOL mos-video-compare", updated)
+        self.assertIn("# BEGIN KA TOOL loga", updated)
+        self.assertLess(updated.index("# BEGIN KA TOOL mos-video-compare"), updated.index("# BEGIN KA TOOL loga"))
 
     def test_build_sudo_command_prefixes_non_interactive_sudo(self) -> None:
         self.assertEqual(
@@ -178,7 +145,7 @@ class RunnerProjectSlugTests(unittest.TestCase):
         backup_path = runner.ATHENA_NGINX_CONFIG_PATH.with_name(
             f"{runner.ATHENA_NGINX_CONFIG_PATH.stem}_20260607T010203Z{runner.ATHENA_NGINX_CONFIG_PATH.suffix}"
         )
-        self.assertEqual(str(backup_path), "/etc/nginx/sites-available/athena_20260607T010203Z.conf")
+        self.assertEqual(str(backup_path), "/etc/nginx/sites-available/tools_20260607T010203Z.conf")
 
     def test_local_source_signature_ignores_temp_source_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -450,6 +417,125 @@ class RunnerProjectSlugTests(unittest.TestCase):
             roots = runner.detect_frontend_runtime_roots(repo_dir)
             self.assertIn(src_dir.resolve(), roots)
 
+    def test_detect_frontend_runtime_roots_from_fastapi_template_and_static_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            app_dir = repo_dir / "app"
+            views_dir = repo_dir / "views"
+            static_dir = repo_dir / "static"
+            app_dir.mkdir(parents=True)
+            views_dir.mkdir()
+            static_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "from fastapi import FastAPI",
+                        "from fastapi.staticfiles import StaticFiles",
+                        "from fastapi.templating import Jinja2Templates",
+                        "",
+                        "BASE_DIR = Path(__file__).resolve().parent.parent",
+                        "templates = Jinja2Templates(directory=str(BASE_DIR / 'views'))",
+                        "app = FastAPI()",
+                        "app.mount('/static', StaticFiles(directory=str(BASE_DIR / 'static')), name='static')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            roots = runner.detect_frontend_runtime_roots(repo_dir)
+
+            self.assertIn(views_dir.resolve(), roots)
+            self.assertIn(static_dir.resolve(), roots)
+
+    def test_detect_frontend_runtime_roots_from_flask_template_and_static_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            templates_dir = repo_dir / "templates"
+            static_dir = repo_dir / "static"
+            templates_dir.mkdir()
+            static_dir.mkdir()
+            (repo_dir / "server.py").write_text(
+                "\n".join(
+                    [
+                        "from flask import Flask",
+                        "",
+                        "app = Flask(__name__, template_folder='templates', static_folder='static')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            roots = runner.detect_frontend_runtime_roots(repo_dir)
+
+            self.assertIn(templates_dir.resolve(), roots)
+            self.assertIn(static_dir.resolve(), roots)
+
+    def test_detect_frontend_runtime_roots_from_fastify_static_root_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            backend_src_dir = repo_dir / "backend" / "src"
+            frontend_dist_dir = repo_dir / "frontend" / "dist"
+            backend_src_dir.mkdir(parents=True)
+            frontend_dist_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"scripts": {"start": "node ./backend/src/index.js"}}) + "\n",
+                encoding="utf-8",
+            )
+            (backend_src_dir / "index.js").write_text(
+                "\n".join(
+                    [
+                        "import path from 'path'",
+                        "const frontendDist = path.resolve(__dirname, '../../frontend/dist')",
+                        "await fastify.register(fastifyStatic, {",
+                        "  root: frontendDist,",
+                        "  prefix: '/'",
+                        "})",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            roots = runner.detect_frontend_runtime_roots(repo_dir)
+
+            self.assertIn(frontend_dist_dir.resolve(), roots)
+
+    def test_detect_frontend_runtime_roots_from_npm_workspace_frontend_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_src_dir = repo_dir / "frontend" / "src"
+            frontend_src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo-workspaces",
+                        "private": True,
+                        "workspaces": ["frontend", "backend"],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "frontend" / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            roots = runner.detect_frontend_runtime_roots(repo_dir)
+
+            self.assertIn(frontend_src_dir.resolve(), roots)
+
     def test_src_index_html_relative_assets_rewrite_without_src_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
@@ -474,7 +560,7 @@ class RunnerProjectSlugTests(unittest.TestCase):
         rewritten = runner.rewrite_origin_based_subpath_logic(original)
         self.assertIn("window.__TOOL_ORIGIN_URL__", rewritten)
         self.assertIn("return window.__TOOL_ORIGIN_URL__ || origin;", rewritten)
-        self.assertIn("window.withToolBase ? window.withToolBase(SETUP_PAGE_URL) : SETUP_PAGE_URL;", rewritten)
+        self.assertIn('Reflect.get(window, "withToolBase")?.(SETUP_PAGE_URL) ?? SETUP_PAGE_URL', rewritten)
 
     def test_find_frontend_rewrite_targets_excludes_typescript_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -521,6 +607,75 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertIn(html_path, targets)
             self.assertIn(js_path, targets)
 
+    def test_find_frontend_rewrite_targets_include_fastapi_views_and_static_app_js(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            app_dir = repo_dir / "app"
+            views_dir = repo_dir / "views"
+            static_dir = repo_dir / "static"
+            app_dir.mkdir(parents=True)
+            views_dir.mkdir()
+            static_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "from fastapi import FastAPI",
+                        "from fastapi.staticfiles import StaticFiles",
+                        "from fastapi.templating import Jinja2Templates",
+                        "",
+                        "BASE_DIR = Path(__file__).resolve().parent.parent",
+                        "views = Jinja2Templates(directory=str(BASE_DIR / 'views'))",
+                        "app = FastAPI()",
+                        "app.mount('/static', StaticFiles(directory=str(BASE_DIR / 'static')), name='static')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            html_path = views_dir / "index.html"
+            js_path = static_dir / "app.js"
+            html_path.write_text('<link rel="stylesheet" href="/static/styles.css">\n', encoding="utf-8")
+            js_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
+
+            targets = runner.find_frontend_rewrite_targets(repo_dir)
+
+            self.assertIn(html_path, targets)
+            self.assertIn(js_path, targets)
+
+    def test_find_frontend_rewrite_targets_include_workspace_vite_index_and_src_tsx(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_dir = frontend_dir / "src"
+            src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
+            html_path = frontend_dir / "index.html"
+            entry_path = src_dir / "main.tsx"
+            html_path.write_text('<link rel="icon" href="/vite.svg">\n<script type="module" src="/src/main.tsx"></script>\n', encoding="utf-8")
+            entry_path.write_text("fetch('/api/jobs')\n", encoding="utf-8")
+
+            targets = runner.find_frontend_rewrite_targets(repo_dir)
+
+            self.assertIn(html_path, targets)
+            self.assertIn(entry_path, targets)
+
     def test_find_subpath_audit_targets_includes_tsx_for_nextjs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
@@ -565,6 +720,42 @@ class RunnerProjectSlugTests(unittest.TestCase):
 
             self.assertIn(html_path, targets)
 
+    def test_find_subpath_audit_targets_include_fastapi_views_and_static_js(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            app_dir = repo_dir / "app"
+            views_dir = repo_dir / "views"
+            static_dir = repo_dir / "static"
+            app_dir.mkdir(parents=True)
+            views_dir.mkdir()
+            static_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "from fastapi import FastAPI",
+                        "from fastapi.staticfiles import StaticFiles",
+                        "from fastapi.templating import Jinja2Templates",
+                        "",
+                        "BASE_DIR = Path(__file__).resolve().parent.parent",
+                        "views = Jinja2Templates(directory=str(BASE_DIR / 'views'))",
+                        "app = FastAPI()",
+                        "app.mount('/static', StaticFiles(directory=str(BASE_DIR / 'static')), name='static')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            html_path = views_dir / "index.html"
+            js_path = static_dir / "app.js"
+            html_path.write_text('<script src="/static/app.js"></script>\n', encoding="utf-8")
+            js_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
+
+            targets = runner.find_subpath_audit_targets(repo_dir, {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
+
+            self.assertIn(html_path, targets)
+            self.assertIn(js_path, targets)
+
     def test_scan_nextjs_flags_raw_anchor_root_href(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
@@ -599,6 +790,196 @@ class RunnerProjectSlugTests(unittest.TestCase):
 
             self.assertEqual(len(findings), 1)
             self.assertIn("/api/token", findings[0].message)
+
+    def test_scan_generic_runtime_root_js_flags_root_relative_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
+
+            findings = runner.scan_subpath_findings(file_path, "generic", "/tools2/demo", repo_dir)
+
+            self.assertEqual(len(findings), 1)
+            self.assertIn("/api/analyze-upload", findings[0].message)
+
+    def test_scan_generic_runtime_root_js_flags_root_relative_eventsource(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "sse.js"
+            file_path.write_text("new EventSource('/api/jobs/123/progress')\n", encoding="utf-8")
+
+            findings = runner.scan_subpath_findings(file_path, "generic", "/tools2/demo", repo_dir)
+
+            self.assertEqual(len(findings), 1)
+            self.assertIn("/api/jobs/123/progress", findings[0].message)
+
+    def test_rewrite_frontend_subpath_urls_for_vite_index_keeps_src_entry_and_prefixes_icon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_dir = frontend_dir / "src"
+            src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
+            html_path = frontend_dir / "index.html"
+            html_path.write_text(
+                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
+                encoding="utf-8",
+            )
+
+            changed = runner.rewrite_frontend_subpath_urls(html_path, "/tools2/demo-workspaces", repo_dir)
+            rewritten = html_path.read_text(encoding="utf-8")
+
+            self.assertTrue(changed)
+            self.assertIn('href="/tools2/demo-workspaces/vite.svg"', rewritten)
+            self.assertIn('src="/src/main.tsx"', rewritten)
+
+    def test_scan_subpath_findings_allows_vite_index_src_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_dir = frontend_dir / "src"
+            src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
+            (src_dir / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
+            html_path = frontend_dir / "index.html"
+            html_path.write_text('<script type="module" src="/src/main.tsx"></script>\n', encoding="utf-8")
+
+            findings = runner.scan_subpath_findings(html_path, "vite", "/tools2/demo-workspaces", repo_dir)
+
+            self.assertEqual(findings, [])
+
+    def test_rewrite_frontend_subpath_urls_rewrites_vite_template_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_dir = frontend_dir / "src" / "api"
+            src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            file_path = src_dir / "jobs.ts"
+            file_path.write_text("fetch(`/api/jobs/${jobId}`)\n", encoding="utf-8")
+
+            changed = runner.rewrite_frontend_subpath_urls(file_path, "/tools2/demo-workspaces", repo_dir)
+            rewritten = file_path.read_text(encoding="utf-8")
+
+            self.assertTrue(changed)
+            self.assertIn('Reflect.get(window, "withToolBase")?.(`/api/jobs/${jobId}`) ?? `/api/jobs/${jobId}`', rewritten)
+
+    def test_rewrite_frontend_subpath_urls_rewrites_eventsource_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_hooks_dir = frontend_dir / "src" / "hooks"
+            src_hooks_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            file_path = src_hooks_dir / "useJobSSE.ts"
+            file_path.write_text(
+                "new EventSource('/api/jobs/123/progress')\nnew EventSource(`/api/jobs/${jobId}/progress`)\n",
+                encoding="utf-8",
+            )
+
+            changed = runner.rewrite_frontend_subpath_urls(file_path, "/tools2/demo-workspaces", repo_dir)
+            rewritten = file_path.read_text(encoding="utf-8")
+
+            self.assertTrue(changed)
+            self.assertIn('new EventSource((Reflect.get(window, "withToolBase")?.(\'/api/jobs/123/progress\') ?? \'/api/jobs/123/progress\'))', rewritten)
+            self.assertIn('new EventSource((Reflect.get(window, "withToolBase")?.(`/api/jobs/${jobId}/progress`) ?? `/api/jobs/${jobId}/progress`))', rewritten)
+
+    def test_rewrite_frontend_subpath_urls_rewrites_returned_api_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_api_dir = frontend_dir / "src" / "api"
+            src_api_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            file_path = src_api_dir / "jobs.ts"
+            file_path.write_text("export function downloadUrl(jobId: string): string { return `/api/jobs/${jobId}/download` }\n", encoding="utf-8")
+
+            changed = runner.rewrite_frontend_subpath_urls(file_path, "/tools2/demo-workspaces", repo_dir)
+            rewritten = file_path.read_text(encoding="utf-8")
+
+            self.assertTrue(changed)
+            self.assertIn('return (Reflect.get(window, "withToolBase")?.(`/api/jobs/${jobId}/download`) ?? `/api/jobs/${jobId}/download`)', rewritten)
 
     def test_scan_path_template_string_is_not_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -865,9 +1246,96 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(after["findings"], [])
 
+    def test_auto_fix_subpath_issues_rewrites_fastapi_views_and_static_js(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            app_dir = repo_dir / "app"
+            views_dir = repo_dir / "views"
+            static_dir = repo_dir / "static"
+            app_dir.mkdir(parents=True)
+            views_dir.mkdir()
+            static_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "from fastapi import FastAPI",
+                        "from fastapi.staticfiles import StaticFiles",
+                        "from fastapi.templating import Jinja2Templates",
+                        "",
+                        "BASE_DIR = Path(__file__).resolve().parent.parent",
+                        "views = Jinja2Templates(directory=str(BASE_DIR / 'views'))",
+                        "app = FastAPI()",
+                        "app.mount('/static', StaticFiles(directory=str(BASE_DIR / 'static')), name='static')",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            html_path = views_dir / "index.html"
+            js_path = static_dir / "app.js"
+            html_path.write_text(
+                '<!DOCTYPE html><html><head><link rel="stylesheet" href="/static/styles.css"></head><body><script src="/static/app.js"></script></body></html>\n',
+                encoding="utf-8",
+            )
+            js_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
+
+            initial = runner.run_static_subpath_audit(repo_dir, "demo-fastapi", {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
+            changed = runner.auto_fix_subpath_issues(repo_dir, "demo-fastapi", {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
+            after = runner.run_static_subpath_audit(repo_dir, "demo-fastapi", {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
+
+            self.assertTrue(initial["findings"])
+            self.assertIn("views/index.html", changed)
+            self.assertIn("static/app.js", changed)
+            self.assertEqual(after["findings"], [])
+
+    def test_auto_fix_subpath_issues_rewrites_workspace_vite_html_and_api_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_api_dir = frontend_dir / "src" / "api"
+            src_dir = frontend_dir / "src"
+            src_api_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "decrypt-online", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "frontend",
+                        "private": True,
+                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
+            (src_dir / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
+            html_path = frontend_dir / "index.html"
+            api_path = src_api_dir / "jobs.ts"
+            html_path.write_text(
+                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
+                encoding="utf-8",
+            )
+            api_path.write_text("fetch('/api/jobs')\nfetch(`/api/jobs/${jobId}`)\n", encoding="utf-8")
+
+            initial = runner.run_static_subpath_audit(repo_dir, "decrypt-online", {"framework": "vite", "proxy_mode": "strip_prefix", "adapter": "vite"})
+            changed = runner.auto_fix_subpath_issues(repo_dir, "decrypt-online", {"framework": "vite", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
+            after = runner.run_static_subpath_audit(repo_dir, "decrypt-online", {"framework": "vite", "proxy_mode": "strip_prefix", "adapter": "vite"})
+
+            self.assertTrue(initial["findings"])
+            self.assertIn("frontend/index.html", changed)
+            self.assertIn("frontend/src/api/jobs.ts", changed)
+            self.assertEqual(after["findings"], [])
+
     def test_detect_subpath_strategy_for_vite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
+            src_dir = repo_dir / "src" / "api"
+            src_dir.mkdir(parents=True)
             (repo_dir / "package.json").write_text(
                 json.dumps({"devDependencies": {"vite": "^5.0.0"}}) + "\n",
                 encoding="utf-8",
@@ -876,14 +1344,108 @@ class RunnerProjectSlugTests(unittest.TestCase):
                 "import { defineConfig } from 'vite'\nexport default defineConfig({})\n",
                 encoding="utf-8",
             )
+            (repo_dir / "index.html").write_text(
+                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
+                encoding="utf-8",
+            )
+            (repo_dir / "src" / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
+            (src_dir / "jobs.ts").write_text("fetch('/api/jobs')\n", encoding="utf-8")
 
             strategy = runner.detect_subpath_strategy(repo_dir)
             changed = runner.apply_subpath_rewrites(repo_dir, "demo-vite")
 
             self.assertEqual(strategy["framework"], "vite")
             self.assertEqual(strategy["proxy_mode"], "preserve_prefix")
-            self.assertEqual(changed, ["vite.config.ts"])
+            self.assertIn("vite.config.ts", changed)
+            self.assertIn("index.html", changed)
+            self.assertIn("src/api/jobs.ts", changed)
             self.assertIn('base: "/tools2/demo-vite/"', (repo_dir / "vite.config.ts").read_text(encoding="utf-8"))
+
+    def test_detect_subpath_strategy_for_vite_fastify_static_uses_strip_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            frontend_dist_dir = frontend_dir / "dist"
+            backend_src_dir = repo_dir / "backend" / "src"
+            frontend_dir.mkdir(parents=True)
+            frontend_dist_dir.mkdir(parents=True)
+            backend_src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "decrypt-online",
+                        "private": True,
+                        "workspaces": ["frontend", "backend"],
+                        "scripts": {"start": "npm run start --workspace=backend"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps({"name": "frontend", "private": True, "devDependencies": {"vite": "^5.0.0"}}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
+            (repo_dir / "backend" / "package.json").write_text(
+                json.dumps({"name": "backend", "private": True, "scripts": {"start": "tsx src/index.ts"}}) + "\n",
+                encoding="utf-8",
+            )
+            (backend_src_dir / "index.ts").write_text(
+                "\n".join(
+                    [
+                        "import path from 'path'",
+                        "const frontendDist = path.resolve(__dirname, '../../frontend/dist')",
+                        "await fastify.register(fastifyStatic, {",
+                        "  root: frontendDist,",
+                        "  prefix: '/'",
+                        "})",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            strategy = runner.detect_subpath_strategy(repo_dir)
+
+            self.assertEqual(strategy["framework"], "vite")
+            self.assertEqual(strategy["proxy_mode"], "strip_prefix")
+
+    def test_detect_subpath_strategy_for_workspace_vite_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            src_api_dir = frontend_dir / "src" / "api"
+            frontend_dir.mkdir(parents=True)
+            src_api_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "package.json").write_text(
+                json.dumps({"name": "frontend", "private": True, "devDependencies": {"vite": "^5.0.0"}}) + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite'\nexport default defineConfig({})\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "index.html").write_text(
+                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
+                encoding="utf-8",
+            )
+            (frontend_dir / "src" / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
+            (src_api_dir / "jobs.ts").write_text("fetch('/api/jobs')\nfetch(`/api/jobs/${jobId}`)\n", encoding="utf-8")
+
+            strategy = runner.detect_subpath_strategy(repo_dir)
+            changed = runner.apply_subpath_rewrites(repo_dir, "demo-workspaces")
+
+            self.assertEqual(strategy["framework"], "vite")
+            self.assertEqual(strategy["proxy_mode"], "preserve_prefix")
+            self.assertIn("frontend/vite.config.ts", changed)
+            self.assertIn("frontend/index.html", changed)
+            self.assertIn("frontend/src/api/jobs.ts", changed)
+            self.assertIn('base: "/tools2/demo-workspaces/"', (frontend_dir / "vite.config.ts").read_text(encoding="utf-8"))
 
     def test_detect_subpath_strategy_for_vue_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1151,6 +1713,36 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertEqual(selected["relative_dir"], "apps/portal")
             self.assertEqual(selected["build_command"], "pnpm --dir apps/portal build")
 
+    def test_summarize_analysis_is_json_serializable_with_workspace_service_package(self) -> None:
+        analysis = {
+            "service_runtime": "node",
+            "package_manager": "pnpm",
+            "has_nextjs_ts_config": False,
+            "python_entry_command": None,
+            "node_entry_command": "pnpm --dir apps/portal start",
+            "detected_port": 3000,
+            "requires_python": None,
+            "system_dependency_hints": [],
+            "env_var_names": [],
+            "config_file_hints": [],
+            "database_file_hints": [],
+            "storage_hints": [],
+            "selected_service_package": {
+                "name": "@agora-rest-api-debugger/portal",
+                "relative_dir": "apps/portal",
+                "package_dir": Path("/tmp/apps/portal"),
+                "build_command": "pnpm --dir apps/portal build",
+                "start_command": "pnpm --dir apps/portal start",
+                "scripts": {"build": "next build", "start": "next start"},
+                "dependencies": ["next", "react", "react-dom"],
+            },
+        }
+
+        summary = runner.summarize_analysis(analysis, "git", "agora-rest-api-debugger")
+
+        self.assertNotIn("package_dir", summary["selected_service_package"])
+        json.dumps(summary)
+
     def test_validate_generated_files_accepts_monorepo_filtered_build(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
@@ -1404,6 +1996,212 @@ class RunnerProjectSlugTests(unittest.TestCase):
         runner.extend_warnings(result, ["more"])
 
         self.assertEqual(result["warnings"], ["existing", "added", "more"])
+
+    def test_detect_python_entrypoint_uses_readme_uvicorn_command_as_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "README.md").write_text(
+                "\n".join(
+                    [
+                        "# Demo",
+                        "```bash",
+                        "uvicorn app.main:app --host 0.0.0.0 --port 8008",
+                        "```",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "def create_app():",
+                        "    return object()",
+                        "",
+                        "app = create_app()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            entry_path, entry_command, _entry_text = runner.detect_python_entrypoint(
+                repo_dir,
+                readme_text=runner.read_text(repo_dir / "README.md"),
+                python_dependencies=["fastapi", "uvicorn"],
+            )
+
+            self.assertEqual(entry_path, repo_dir / "README.md")
+            self.assertEqual(entry_command, "uvicorn app.main:app --host 0.0.0.0 --port 8008")
+
+    def test_detect_python_entrypoint_prefers_source_over_readme_when_source_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "README.md").write_text(
+                "\n".join(
+                    [
+                        "# Demo",
+                        "```bash",
+                        "uvicorn app.main:app --host 0.0.0.0 --port 8008",
+                        "```",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from fastapi import FastAPI",
+                        "",
+                        "app = FastAPI()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            entry_path, entry_command, _entry_text = runner.detect_python_entrypoint(
+                repo_dir,
+                readme_text=runner.read_text(repo_dir / "README.md"),
+                python_dependencies=["fastapi", "uvicorn"],
+            )
+
+            self.assertEqual(entry_path, app_dir / "main.py")
+            self.assertEqual(entry_command, "uvicorn app.main:app --host 0.0.0.0")
+
+    def test_detect_python_entrypoint_uses_uvicorn_for_fastapi_app_without_main_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from fastapi import FastAPI",
+                        "",
+                        "app = FastAPI()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            entry_path, entry_command, _entry_text = runner.detect_python_entrypoint(
+                repo_dir,
+                python_dependencies=["fastapi", "uvicorn"],
+            )
+
+            self.assertEqual(entry_path, app_dir / "main.py")
+            self.assertEqual(entry_command, "uvicorn app.main:app --host 0.0.0.0")
+
+    def test_detect_python_entrypoint_keeps_python_module_when_uvicorn_run_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "import uvicorn",
+                        "from fastapi import FastAPI",
+                        "",
+                        "app = FastAPI()",
+                        "",
+                        "if __name__ == \"__main__\":",
+                        "    uvicorn.run(app, host=\"0.0.0.0\", port=8008)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            entry_path, entry_command, _entry_text = runner.detect_python_entrypoint(
+                repo_dir,
+                python_dependencies=["fastapi", "uvicorn"],
+            )
+
+            self.assertEqual(entry_path, app_dir / "main.py")
+            self.assertEqual(entry_command, "python -m app.main")
+
+    def test_detect_python_entrypoint_keeps_python_module_for_flask_main_program(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "server.py").write_text(
+                "\n".join(
+                    [
+                        "from flask import Flask",
+                        "",
+                        "app = Flask(__name__)",
+                        "",
+                        "if __name__ == \"__main__\":",
+                        "    app.run(host=\"0.0.0.0\", port=5000)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            entry_path, entry_command, _entry_text = runner.detect_python_entrypoint(
+                repo_dir,
+                python_dependencies=["flask"],
+            )
+
+            self.assertEqual(entry_path, repo_dir / "server.py")
+            self.assertEqual(entry_command, "python -m server")
+
+    def test_collect_repo_analysis_prefers_source_entrypoint_for_fastapi_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        'requires-python = ">=3.11,<3.12"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0,<0.116",',
+                        '  "uvicorn[standard]>=0.32.0,<0.33",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "README.md").write_text(
+                "\n".join(
+                    [
+                        "# Demo",
+                        "```bash",
+                        "uvicorn app.main:app --host 0.0.0.0 --port 8008",
+                        "```",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "\n".join(
+                    [
+                        "from fastapi import FastAPI",
+                        "",
+                        "app = FastAPI()",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            analysis = runner.collect_repo_analysis(repo_dir, "local", str(repo_dir), None)
+
+            self.assertEqual(analysis["service_runtime"], "python")
+            self.assertEqual(analysis["python_entry_command"], "uvicorn app.main:app --host 0.0.0.0")
 
 
 if __name__ == "__main__":

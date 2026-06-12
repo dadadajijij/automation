@@ -26,5 +26,7 @@
   },
   "loga": {
     "port": "8005:5050"
-  }
+  },
+  "mos-video-compare": "8006:8008",
+  "decrypt-online": "8007:44002"
 }

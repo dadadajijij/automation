@@ -41,7 +41,7 @@ python3 runner.py "$@"
 - 共享源码目录：`automation/jobs/<project_slug>/repo`
 - 本次任务目录：`automation/jobs/<project_slug>/<job_id>/`
 - 本次任务输出目录：`automation/jobs/<project_slug>/<job_id>/output/`
-- 如果带 `tool_id`，会复制出独立工作副本：`automation/jobs/<project_slug>/<job_id>/work-repo`
+- 会复制出独立工作副本：`automation/jobs/<project_slug>/<job_id>/work-repo`
 
 典型输出物：
 
@@ -60,7 +60,7 @@ python3 runner.py "$@"
 一次完整成功部署，请求参数通常是：
 
 ```bash
---source-type git --source <repo> --ref <branch> --tool-id <tool> --build --run
+--source-type git --source <repo> --ref <branch> --build --run
 ```
 
 成功路径上的主要状态流转如下：
@@ -145,9 +145,8 @@ python3 runner.py "$@"
 - 若共享 repo 已命中相同签名，则复用已有 `jobs/<slug>/repo`
 - 若未命中，则重新 clone 到临时目录后替换共享 repo
 
-如果这次任务带 `tool_id`：
+Runner 会从共享 repo 复制一份到 `work-repo`：
 
-- 再从共享 repo 复制一份到 `work-repo`
 - 后续所有生成、构建、运行都基于 `work-repo`
 - 并且在写入 `source_ready` 之前，还会先经过一轮静态子路径审计；这一步失败时会直接落到 `SUBPATH_STATIC_AUDIT_FAILED`
 
@@ -216,7 +215,7 @@ python3 runner.py "$@"
 
 ### 4.4 子路径改写
 
-如果带 `tool_id`，说明最终要挂在 `/tools2/<project_slug>` 子路径下：
+当前任务默认按平台工具部署处理，最终会挂在 `/tools2/<project_slug>` 子路径下：
 
 - 会先识别项目所处的前端/静态类型，再决定具体的子路径适配方式
 - 改写结果记录在 `artifacts.rewritten_frontend_files`
@@ -353,7 +352,7 @@ python3 runner.py "$@"
 
 ### 4.4.3 静态子路径审计失败
 
-带 `tool_id` 时，源码准备好后、写入 `source_ready` 之前，还会先做一轮静态子路径审计：
+源码准备好后、写入 `source_ready` 之前，还会先做一轮静态子路径审计：
 
 - 首轮审计结果会写入 `artifacts.subpath_static_audit`
 - 若框架支持自动修复，目前只会对 Next.js 做补救；补救后的再次审计会追加到 `artifacts.subpath_static_audit_attempts`
@@ -580,7 +579,7 @@ Runner 会合并三类信息生成 `artifacts.run_spec`：
 
 ### 4.11 运行时子路径审计
 
-只有带 `tool_id` 时才会执行。
+这一步默认会执行。
 
 这一步发生在健康检查通过之后、`run_succeeded` 之前，主要检查：
 
@@ -608,7 +607,7 @@ Runner 会合并三类信息生成 `artifacts.run_spec`：
 
 ### 4.12 Athena Nginx 同步
 
-只有带 `tool_id`，并且前面的运行已经成功时，才会执行 Athena nginx 同步。
+当前流程在前面的运行已经成功时，会执行 Athena nginx 同步。
 
 这一阶段有两个很重要的特征：
 
@@ -621,14 +620,15 @@ Runner 会合并三类信息生成 `artifacts.run_spec`：
 
 `athena_nginx_sync.status` 常见取值与含义：
 
-- `synced`：已写入配置并完成 reload
-- `already_managed`：现有配置里已存在同内容的 managed block
-- `already_present_unmanaged`：现有配置里已有同路径规则，但不是 Runner 管理的 block
+- `synced`：已把当前项目的 managed block 写入或更新到 `/etc/nginx/sites-available/tools.conf`，并完成 reload
+- `already_managed`：`tools.conf` 里已存在同内容的 managed block，无需写回
+- `updated_managed`：`tools.conf` 里已存在该项目的 managed block，但内容有变化，已按最新规则更新
+- `inserted_managed`：`tools.conf` 里原本没有该项目 block，已追加写入
 - `sudo_unavailable`：本机没有可用 `sudo`
-- `read_failed`：无法读取 Athena nginx 配置
-- `merge_failed`：找不到 HTTPS server block，或找不到 `client_max_body_size 100m;` 这个插入锚点
+- `read_failed`：无法读取 `tools.conf`
+- `merge_failed`：Runner 无法生成或合并当前项目 block
 - `backup_failed`：备份原始配置失败
-- `write_failed`：写回更新配置失败
+- `write_failed`：写回更新后的 `tools.conf` 失败
 - `nginx_missing`：本机没有 `nginx` 命令
 - `nginx_test_failed`：`nginx -t` 失败
 - `nginx_reload_failed`：reload 失败，Runner 会尝试回滚
@@ -659,7 +659,7 @@ Runner 会合并三类信息生成 `artifacts.run_spec`：
 
 - `COMPLETED_WITHOUT_BUILD`：只带 `generated_files` 和 `confirmed_port`
 - `COMPLETED_WITH_BUILD` / `BUILD_SUCCEEDED`：带镜像信息
-- `RUN_SUCCEEDED`：额外带 `container_id`、`port`，若有 `tool_id` 还会带外部访问 `url`
+- `RUN_SUCCEEDED`：额外带 `container_id`、`port` 和外部访问 `url`
 - 失败态统一是：
   - `ok: false`
   - `status: <失败状态>`
