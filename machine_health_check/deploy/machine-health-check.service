@@ -1,0 +1,15 @@
+[Unit]
+Description=Machine Health Check Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/devops/ka/automation/machine_health_check
+EnvironmentFile=-/home/devops/ka/automation/machine_health_check/.env
+ExecStart=/usr/bin/env bash /home/devops/ka/automation/machine_health_check/scripts/run_check.sh
+User=devops
+Group=devops
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+{
+  "report_dir": "reports",
+  "history_dir": "reports/history",
+  "network": {
+    "ping_targets": [
+      "127.0.0.1",
+      "8.8.8.8"
+    ],
+    "tcp_targets": [
+      {
+        "host": "1.1.1.1",
+        "port": 53,
+        "timeout_seconds": 2
+      }
+    ]
+  },
+  "mount_points": [
+    "/"
+  ],
+  "notifications": {
+    "enabled": true,
+    "wecom_webhook": ""
+  },
+  "thresholds": {
+    "cpu_usage_percent": {
+      "warning": 80,
+      "critical": 90
+    },
+    "load_ratio": {
+      "warning": 0.7,
+      "critical": 1.0
+    },
+    "memory_usage_percent": {
+      "warning": 80,
+      "critical": 90
+    },
+    "swap_usage_percent": {
+      "warning": 20,
+      "critical": 50
+    },
+    "disk_usage_percent": {
+      "warning": 80,
+      "critical": 90
+    },
+    "inode_usage_percent": {
+      "warning": 80,
+      "critical": 90
+    }
+  }
+}
