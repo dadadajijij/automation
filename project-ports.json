@@ -9,7 +9,7 @@
   "audioqas": {
     "port": "8001:8000",
     "volumes": [
-      "/home/devops/ka/data/audioqas/.venv/model-cache:/model-cache"
+      "/home/devops/ka/data_noneedback/audioqas/model-cache:/model-cache"
     ],
     "env": {
       "HF_HOME": "/model-cache/huggingface"
@@ -27,6 +27,10 @@
   "loga": {
     "port": "8005:5050"
   },
-  "mos-video-compare": "8006:8008",
-  "decrypt-online": "8007:44002"
+  "mos-video-compare": {
+    "port": "8006:8008"
+  },
+  "decrypt-online": {
+    "port": "8007:44002"
+  }
 }

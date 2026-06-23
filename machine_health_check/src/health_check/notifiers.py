@@ -13,6 +13,7 @@ def _display_name(name: str) -> str:
         "memory": "内存",
         "disk": "磁盘",
         "network": "网络",
+        "services": "服务",
     }
     return mapping.get(name, name)
 
@@ -28,6 +29,27 @@ def _display_status(status: str) -> str:
     return mapping.get(status, status)
 
 
+def _append_service_issues(lines: list[str], report: CheckReport) -> None:
+    services_item = next((item for item in report.items if item.name == "services"), None)
+    if services_item is None:
+        return
+
+    raw_services = services_item.details.get("services", [])
+    if not isinstance(raw_services, list):
+        return
+
+    issue_services = [service for service in raw_services if str(service.get("status", "ok")) != "ok"]
+    if not issue_services:
+        return
+
+    lines.append("需关注服务:")
+    for service in issue_services:
+        display_name = str(service.get("display_name", service.get("name", "unknown")))
+        status = _display_status(str(service.get("status", "warning")))
+        summary = str(service.get("summary", ""))
+        lines.append(f"- {display_name}: {status} | {summary}")
+
+
 def _build_wecom_message(report: CheckReport) -> str:
     lines = [
         "服务器健康巡检结果",
@@ -39,6 +61,8 @@ def _build_wecom_message(report: CheckReport) -> str:
     lines.append("巡检项:")
     for item in report.items:
         lines.append(f"- {_display_name(item.name)}: {_display_status(item.status)} | {item.summary}")
+
+    _append_service_issues(lines, report)
 
     return "\n".join(lines)
 

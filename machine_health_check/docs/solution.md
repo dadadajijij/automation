@@ -1,327 +1,413 @@
-# 服务器健康检查自动化服务方案
+# 服务器健康检查实现说明
 
-## 1. 目标
+本文描述 `machine_health_check` 当前已经落地的能力、配置结构和输出行为，以代码实现为准。
 
-在当前服务器上建设一套轻量、可扩展、可定时执行的健康检查服务，用于日常巡检以下核心状态：
+## 1. 目标与定位
 
-- CPU 使用率与负载
-- 内存使用情况
-- 磁盘容量与 inode 使用情况
-- 网络连通性与基础吞吐状态
-- 系统运行时信息
-- 异常告警与巡检报告输出
+这个子项目是一个轻量的单机巡检工具，适合：
 
-这套服务优先满足以下要求：
+- 定时巡检当前 Linux 主机
+- 输出结构化 JSON 报告
+- 对本机服务和 Podman 容器做基础健康检查
+- 通过企业微信 webhook 发送文本告警
 
-- 单机可部署，依赖少
-- 对业务侵入低
-- 支持后续扩展更多巡检项
-- 支持接入企业微信、钉钉、飞书或邮件告警
-- 支持本地定时执行与留档
+它不是时序监控系统，也不负责长期指标存储或高频采样。
 
-## 2. 适用场景
-
-适合以下场景：
-
-- 单台 Linux 服务器的日常健康巡检
-- 小规模主机的统一巡检脚本模板
-- 现有环境没有完整监控系统时的补充方案
-- 作为 Prometheus / Zabbix / 云监控之前的过渡方案
-
-不建议把它当作高频时序监控系统。它更适合“定时巡检 + 异常告警 + 巡检报告”。
-
-## 3. 总体方案
-
-建议采用分层设计：
-
-1. 采集层
-   负责从系统读取基础状态，比如 `/proc`、`/sys`、`os.statvfs`、`socket`、`ip`、`df` 等。
-
-2. 规则层
-   根据配置阈值判断状态是否正常，例如 CPU 超过 85%、内存超过 90%、根分区超过 80%。
-
-3. 输出层
-   输出 JSON 巡检报告、控制台结果、日志文件，并在异常时触发告警。
-
-4. 调度层
-   使用 `cron` 或 `systemd timer` 定时执行。
-
-## 4. 建议巡检项
-
-### 4.1 CPU
-
-- 当前 CPU 总使用率
-- 1 分钟 / 5 分钟 / 15 分钟负载
-- CPU 核心数
-- 是否存在负载持续高于核心数的情况
-
-建议阈值：
-
-- `warning`: CPU 使用率 >= 80%
-- `critical`: CPU 使用率 >= 90%
-- `warning`: 1 分钟负载 >= CPU 核数的 70%
-- `critical`: 1 分钟负载 >= CPU 核数的 100%
-
-### 4.2 内存
-
-- 总内存
-- 已使用内存
-- 可用内存
-- 内存使用率
-- Swap 总量与使用率
-
-建议阈值：
-
-- `warning`: 内存使用率 >= 80%
-- `critical`: 内存使用率 >= 90%
-- `warning`: swap 使用率 >= 20%
-- `critical`: swap 使用率 >= 50%
-
-### 4.3 磁盘
-
-- 各挂载点容量使用率
-- inode 使用率
-- 根目录 `/`
-- 关键业务目录，例如 `/var`、`/data`、`/home`
-
-建议阈值：
-
-- `warning`: 磁盘使用率 >= 80%
-- `critical`: 磁盘使用率 >= 90%
-- `warning`: inode 使用率 >= 80%
-- `critical`: inode 使用率 >= 90%
-
-### 4.4 网络
-
-- 默认网卡收发字节
-- 默认网卡收发包数
-- 网卡 error / drop 计数
-- 默认网关连通性
-- 外部目标连通性，例如 `8.8.8.8` 或公司内核心服务
-- DNS 解析是否正常
-
-建议把网络探测结果区分为三类：
-
-- `ok`：探测成功
-- `failed`：探测执行成功，但目标不可达
-- `unavailable`：当前环境没有探测权限或缺少探测工具
-
-这样可以避免在受限容器、低权限账户或禁用 ICMP 的环境中产生误报。
-
-建议阈值：
-
-- 网关不可达：`critical`
-- 外部目标连续失败：`critical`
-- 网卡错误计数突增：`warning` 或 `critical`
-
-### 4.5 系统基础状态
-
-- 主机名
-- 内核版本
-- 系统启动时长
-- 当前时间与时区
-- 登录用户数
-- 关键进程存活状态
-
-### 4.6 可选扩展项
-
-- 关键端口监听状态
-- 关键业务进程检查
-- Docker / Podman 容器状态
-- 磁盘读写延迟
-- TCP 连接数、TIME_WAIT 数量
-- NTP 时间同步状态
-- 证书过期时间
-
-## 5. 告警分级建议
-
-建议定义 3 级状态：
-
-- `ok`: 正常
-- `warning`: 需要关注，但不一定立即处理
-- `critical`: 需要立即处理
-
-可采用“取最严重项作为本次巡检总状态”的策略。
-
-示例：
-
-- 有任一项为 `critical`，总状态为 `critical`
-- 没有 `critical` 但有 `warning`，总状态为 `warning`
-- 全部正常则为 `ok`
-
-## 6. 执行方式建议
-
-### 方案 A：Cron 定时执行
-
-优点：
-
-- 简单
-- 部署快
-- 适合单机场景
-
-示例：
-
-```cron
-*/30 * * * * cd /home/devops/ka/automation/machine_health_check && PYTHONPATH=src /usr/bin/python3 -m health_check --config config/default.json >> logs/cron.log 2>&1
-```
-
-### 方案 B：systemd service + timer
-
-优点：
-
-- 更规范
-- 易于托管
-- 日志更好管理
-
-建议正式环境优先使用 `systemd timer`，当前项目已按 30 分钟一次生成对应部署文件。
-
-## 7. 输出与留档建议
-
-每次巡检建议输出：
-
-- 一份标准 JSON 结果
-- 一条简洁的控制台摘要
-- 异常时的告警消息
-
-建议目录：
-
-- `reports/latest.json`：最近一次巡检结果
-- `reports/history/`：按时间归档
-- `logs/`：运行日志
-
-## 8. 告警渠道建议
-
-第一阶段：
-
-- 控制台输出
-- 本地日志
-
-第二阶段：
-
-- Webhook 告警
-  - 企业微信机器人
-  - 钉钉机器人
-  - 飞书机器人
-- 邮件告警
-
-当前项目已优先接入企业微信机器人 Webhook。
-建议使用 `.env` 环境变量注入，不直接写入受版本控制的配置文件。
-当前行为为每次巡检都发送一次 webhook 消息，并带上全部巡检项状态。
-
-建议告警内容包含：
-
-- 主机名
-- 巡检时间
-- 总状态
-- 异常项摘要
-- 关键指标值
-
-## 9. 推荐项目结构
+## 2. 当前目录结构
 
 ```text
 machine_health_check/
 ├── config/
 │   └── default.json
+├── deploy/
+│   ├── machine-health-check.service
+│   └── machine-health-check.timer
 ├── docs/
+│   ├── deploy.md
 │   └── solution.md
 ├── scripts/
+│   ├── install_systemd.sh
 │   └── run_check.sh
 ├── src/
 │   └── health_check/
-│       ├── __init__.py
 │       ├── __main__.py
 │       ├── cli.py
 │       ├── config.py
-│       ├── models.py
-│       ├── runner.py
 │       ├── evaluators.py
+│       ├── models.py
+│       ├── notifiers.py
+│       ├── runner.py
+│       ├── service_checks.py
 │       └── collectors/
-│           ├── __init__.py
 │           ├── cpu.py
-│           ├── memory.py
 │           ├── disk.py
+│           ├── memory.py
 │           ├── network.py
+│           ├── services.py
 │           └── system.py
-└── reports/
+└── state/
+    └── last_status.json
 ```
 
-## 10. 技术选型建议
+当前代码实际写报告的目录不是 `state/`，而是配置里的：
 
-推荐第一版使用 Python 3 标准库优先实现：
+- `report_dir`
+- `history_dir`
 
-- 优点：
-  - 当前机器已有 Python 3.10
-  - 开发快
-  - 维护成本低
-  - 跨 Linux 发行版适配较容易
+默认分别是：
 
-可选依赖：
+- `reports`
+- `reports/history`
 
-- `psutil`
-  用于更稳定地获取 CPU、内存、磁盘、网络指标。
+## 3. 执行入口
 
-如果希望第一版尽量少依赖，建议先用标准库 + `/proc` 实现，后续再替换或增强为 `psutil` 版本。
+命令行入口是：
 
-## 11. 推荐实施路径
+```bash
+PYTHONPATH=src python3 -m health_check --config config/default.json
+```
 
-### 第一阶段：基础巡检
+也可以直接使用脚本：
 
-实现以下能力：
+```bash
+bash scripts/run_check.sh
+```
 
-- CPU、内存、磁盘、网络、系统信息采集
-- 阈值判断
-- JSON 报告输出
-- 本地命令行执行
+`run_check.sh` 会：
 
-### 第二阶段：定时任务 + 告警
+1. 切到 `machine_health_check/`
+2. 如果存在 `.env`，先 `source` 进去
+3. 执行 `python3 -m health_check --config config/default.json`
 
-增加：
+CLI 当前只支持两个参数：
 
-- cron 或 systemd timer
-- Webhook 告警
-- 历史报告归档
+- `--config`
+  配置文件路径，默认 `config/default.json`
+- `--no-write`
+  只打印报告，不写 `reports/latest.json` 和历史归档
 
-### 第三阶段：扩展检查
+## 4. 当前巡检项
 
-增加：
+一次巡检固定生成 6 个检查项：
 
-- 关键进程检查
-- 端口检查
-- 容器检查
-- 业务接口健康检查
+1. `system`
+2. `cpu`
+3. `memory`
+4. `disk`
+5. `network`
+6. `services`
 
-## 12. 阈值配置建议
+总体状态由 `worst_status()` 计算：
 
-阈值建议外置到配置文件，不写死在代码中。这样不同服务器可以复用一套程序，只修改配置即可。
+- 任一项 `critical`，总状态就是 `critical`
+- 否则只要有 `warning`，总状态就是 `warning`
+- 全部 `ok` 时，总状态是 `ok`
 
-示例：
+### 4.1 system
+
+采集自 [`collectors/system.py`](../src/health_check/collectors/system.py)：
+
+- 主机名
+- 内核版本
+- 平台字符串
+- 当前 UTC 时间
+- 启动时长
+- CPU 核数
+
+当前 `system` 项本身不做阈值判断，固定是：
+
+- `status = "ok"`
+
+### 4.2 cpu
+
+采集自 [`collectors/cpu.py`](../src/health_check/collectors/cpu.py)：
+
+- `/proc/stat` 两次采样间隔 0.2 秒，计算瞬时 CPU 使用率
+- `os.getloadavg()` 的 1 / 5 / 15 分钟负载
+- CPU 核数
+- `load_ratio_1m = loadavg[0] / cpu_count`
+
+阈值来自配置：
+
+- `thresholds.cpu_usage_percent`
+- `thresholds.load_ratio`
+
+CPU 最终状态取这两个判断结果的最严重值。
+
+### 4.3 memory
+
+采集自 [`collectors/memory.py`](../src/health_check/collectors/memory.py)：
+
+- `/proc/meminfo`
+- 总内存、已用、可用
+- swap 总量、已用
+- 内存使用率
+- swap 使用率
+
+阈值来自配置：
+
+- `thresholds.memory_usage_percent`
+- `thresholds.swap_usage_percent`
+
+### 4.4 disk
+
+采集自 [`collectors/disk.py`](../src/health_check/collectors/disk.py)：
+
+- 对配置里的每个挂载点执行 `os.statvfs()`
+- 磁盘总量、已用、可用
+- inode 总量、已用
+- 容量使用率
+- inode 使用率
+
+阈值来自配置：
+
+- `thresholds.disk_usage_percent`
+- `thresholds.inode_usage_percent`
+
+默认只检查：
+
+- `/`
+
+### 4.5 network
+
+采集自 [`collectors/network.py`](../src/health_check/collectors/network.py)：
+
+- `/proc/net/dev` 网卡统计
+- `ping` 检查
+- TCP 出站连通性检查
+
+当前网络探测状态分三类：
+
+- `ok`
+- `failed`
+- `unavailable`
+
+其中：
+
+- `ping` 命令不存在时会标记为 `unavailable`
+- TCP 权限不足时会标记为 `unavailable`
+- 探测失败时会标记为 `failed`
+
+网络项的汇总规则是：
+
+- 任一 ping 或 TCP 检查 `failed` -> `critical`
+- 任一 ping 或 TCP 检查 `unavailable` -> `warning`
+- 否则 `ok`
+
+默认配置会检查：
+
+- ping：`127.0.0.1`、`8.8.8.8`
+- TCP：`1.1.1.1:53`
+
+### 4.6 services
+
+服务检查实现位于 [`service_checks.py`](../src/health_check/service_checks.py)。
+
+当前支持两类目标：
+
+- 宿主机服务
+- Podman 容器服务
+
+#### 宿主机服务
+
+默认配置里当前只有：
+
+- `ka_tools`
+
+宿主机服务会做：
+
+- `ss -ltn` 端口监听检查
+- TCP 连接检查
+- 如果协议是 `http`，再做 HTTP 健康检查
+
+#### 容器服务
+
+容器服务从根仓库的 [`project-ports.json`](../../project-ports.json) 自动发现。
+
+默认排除：
+
+- `ka-tools`
+
+每个容器服务会做：
+
+- `podman ps --format json` 识别容器
+- TCP 连接检查
+- 协议是 `http` 或 `auto` 时的 HTTP 健康检查
+
+容器匹配优先级：
+
+1. `container_name`
+2. 规范化后的名称
+3. 宿主机映射端口
+
+默认 HTTP 检查路径会合并三类来源：
+
+1. 每个服务自己的 override
+2. `base_path_templates`
+3. 通用默认路径
+
+当前默认 `base_path_templates` 包含：
+
+- `/tools2/{service_name}`
+- `/tools2/{service_name}/`
+
+这意味着容器服务检查已经显式考虑了根仓库部署流水线的子路径发布方式。
+
+如果当前环境无法访问 Podman，服务检查不会直接当成容器真实故障，而是表现为：
+
+- `warning`
+- `podman_error`
+
+## 5. 配置结构
+
+默认配置文件是 [`config/default.json`](../config/default.json)。
+
+当前主要字段：
 
 ```json
 {
-  "thresholds": {
-    "cpu_usage_percent": { "warning": 80, "critical": 90 },
-    "memory_usage_percent": { "warning": 80, "critical": 90 },
-    "swap_usage_percent": { "warning": 20, "critical": 50 },
-    "disk_usage_percent": { "warning": 80, "critical": 90 },
-    "inode_usage_percent": { "warning": 80, "critical": 90 }
-  }
+  "report_dir": "reports",
+  "history_dir": "reports/history",
+  "network": {
+    "ping_targets": ["127.0.0.1", "8.8.8.8"],
+    "tcp_targets": [
+      { "host": "1.1.1.1", "port": 53, "timeout_seconds": 2 }
+    ]
+  },
+  "mount_points": ["/"],
+  "service_checks": { "...": "..." },
+  "notifications": {
+    "enabled": true,
+    "wecom_webhook": ""
+  },
+  "thresholds": { "...": "..." }
 }
 ```
 
-## 13. 风险与注意事项
+### 5.1 notifications
 
-- 仅做单次巡检时，CPU 瞬时值可能不够稳定
-- 网络质量判断不能只靠一次 ping
-- 有些云环境可能限制 ICMP，需要支持 TCP 探测作为补充
-- 不同挂载点的重要性不同，建议支持单独阈值
-- 如果服务器后续纳入统一监控平台，这套方案应转为补充巡检工具，而不是重复建设完整监控平台
+当前只接了企业微信 webhook。
 
-## 14. 结论
+读取顺序：
 
-这套方案适合你当前“服务器日常状态巡检”的目标，建议按以下顺序推进：
+1. 先读配置文件中的 `notifications.wecom_webhook`
+2. 如果为空，再读环境变量 `MACHINE_HEALTH_CHECK_WECOM_WEBHOOK`
 
-1. 先完成基础指标巡检脚本
-2. 再接入定时任务
-3. 最后补齐告警与扩展检查
+因此推荐把 webhook 放在 `.env` 中，而不是写进版本控制里的 JSON。
 
-当前目录已经适合直接开始第一阶段开发。
+### 5.2 service_checks
+
+关键字段：
+
+- `enabled`
+- `project_ports_file`
+- `host_services`
+- `container_services.exclude_names`
+- `container_services.default_host`
+- `container_services.default_timeout_seconds`
+- `container_services.default_protocol`
+- `container_services.default_health_paths`
+- `container_services.base_path_templates`
+- `container_services.default_success_status_codes`
+- `container_services.per_service_overrides`
+
+默认配置里已经针对这些服务写了 override：
+
+- `audioqas`
+- `agora-token-generator`
+- `api-examples-web`
+- `agora-rest-api-debugger`
+- `loga`
+- `mos-video-compare`
+- `decrypt-online`
+
+其中 `decrypt-online` 默认按纯 TCP 服务检查，不做 HTTP 探测。
+
+## 6. 输出格式
+
+主流程始终会先把完整报告打印到 stdout，结构来自 [`CheckReport.to_dict()`](../src/health_check/models.py)：
+
+```json
+{
+  "host": "hostname",
+  "generated_at": "2026-06-23T00:00:00+00:00",
+  "overall_status": "ok",
+  "items": [
+    {
+      "name": "cpu",
+      "status": "ok",
+      "summary": "...",
+      "details": {}
+    }
+  ]
+}
+```
+
+如果没有带 `--no-write`，还会写：
+
+- `reports/latest.json`
+- `reports/history/report-<UTC 时间戳>.json`
+
+当前不会写额外日志文件，systemd 场景下主要依赖 `journalctl` 看历史执行。
+
+## 7. 企业微信通知
+
+如果：
+
+- `notifications.enabled = true`
+- 且最终拿到了非空 `wecom_webhook`
+
+则会发送一条文本消息。消息内容包含：
+
+- 主机名
+- 巡检时间
+- 总状态
+- 每一个巡检项的状态和摘要
+- 所有非 `ok` 的服务项明细
+
+Webhook 发送结果会额外打印一条 JSON 到 stdout：
+
+```json
+{
+  "notification_sent": true,
+  "notification_message": "..."
+}
+```
+
+## 8. systemd 部署
+
+当前仓库已经提供：
+
+- [`deploy/machine-health-check.service`](../deploy/machine-health-check.service)
+- [`deploy/machine-health-check.timer`](../deploy/machine-health-check.timer)
+
+行为如下：
+
+- service 以 `devops` 用户执行
+- `WorkingDirectory` 固定为当前项目目录
+- 会自动读取 `.env`
+- timer 每 30 分钟触发一次
+- `Persistent=true`
+
+安装脚本是：
+
+```bash
+bash scripts/install_systemd.sh
+```
+
+它会：
+
+1. 拷贝 service / timer 到 `/etc/systemd/system/`
+2. `daemon-reload`
+3. `enable --now` timer
+4. 立即执行一次 service
+5. 输出 timer 状态
+
+## 9. 依赖与限制
+
+- 依赖 Python 3 标准库，无第三方 Python 包
+- 依赖 Linux `/proc`
+- `ping` 缺失时，ICMP 检查会退化为 `unavailable`
+- `podman ps` 不可用时，容器识别会退化为 warning
+- 网络与服务检查都是单次探测，不具备连续观测或抖动平滑能力
+- `state/last_status.json` 当前没有接进主流程

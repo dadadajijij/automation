@@ -16,10 +16,81 @@ import textwrap
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
+
+from subpath import (
+    apply_nextjs_subpath_adapter as subpath_apply_nextjs_subpath_adapter,
+    apply_subpath_rewrites as subpath_apply_subpath_rewrites,
+    apply_vite_subpath_adapter as subpath_apply_vite_subpath_adapter,
+    apply_framework_config_adapters as subpath_apply_framework_config_adapters,
+    auto_fix_nextjs_subpath_issues as subpath_auto_fix_nextjs_subpath_issues,
+    auto_fix_subpath_issues as subpath_auto_fix_subpath_issues,
+    build_subpath_plan as subpath_build_subpath_plan,
+    auto_fix_findings as subpath_auto_fix_findings,
+    run_build_output_subpath_audit as subpath_run_build_output_subpath_audit,
+    detect_runtime_root_evidence as subpath_detect_runtime_root_evidence,
+    ensure_cra_homepage as subpath_ensure_cra_homepage,
+    ensure_next_link_import as subpath_ensure_next_link_import,
+    ensure_nextjs_basepath_config as subpath_ensure_nextjs_basepath_config,
+    ensure_nextjs_helper_module as subpath_ensure_nextjs_helper_module,
+    ensure_vite_base_config as subpath_ensure_vite_base_config,
+    ensure_vue_cli_public_path as subpath_ensure_vue_cli_public_path,
+    insert_import_after_directives as subpath_insert_import_after_directives,
+    NEXTJS_RUNTIME_SHIM_BASENAME as SUBPATH_NEXTJS_RUNTIME_SHIM_BASENAME,
+    NEXTJS_WINDOW_TYPES_BASENAME as SUBPATH_NEXTJS_WINDOW_TYPES_BASENAME,
+    SubpathAuditFinding,
+    SUBPATH_ALLOWED_ROOT_COMMENT,
+    SUBPATH_BROWSER_ATTRS,
+    SUBPATH_CLIENT_METHOD_PATTERNS,
+    SUBPATH_TEMPLATE_ALLOWLIST_FIELDS,
+    build_deployment_base_path,
+    collect_runtime_follow_links as subpath_collect_runtime_follow_links,
+    collect_python_frontend_hint_files as subpath_collect_python_frontend_hint_files,
+    detect_frontend_root_hints_from_python_file as subpath_detect_frontend_root_hints_from_python_file,
+    detect_frontend_runtime_roots as subpath_detect_frontend_runtime_roots,
+    detect_frontend_runtime_root_groups as subpath_detect_frontend_runtime_root_groups,
+    detect_static_root_hints_from_node_entry as subpath_detect_static_root_hints_from_node_entry,
+    discover_runtime_root_frontend_files as subpath_discover_runtime_root_frontend_files,
+    find_plan_audit_targets as subpath_find_plan_audit_targets,
+    find_subpath_audit_targets as subpath_find_subpath_audit_targets,
+    find_plan_rewrite_targets as subpath_find_plan_rewrite_targets,
+    findings_to_error_texts as subpath_findings_to_error_texts,
+    frontend_runtime_root as subpath_frontend_runtime_root,
+    is_create_react_app_project as subpath_is_create_react_app_project,
+    is_allowed_vite_root_html_url as subpath_is_allowed_vite_root_html_url,
+    is_browser_facing_source as subpath_is_browser_facing_source,
+    is_express_static_project as subpath_is_express_static_project,
+    is_nextjs_project as subpath_is_nextjs_project,
+    is_runtime_root_relative_file as subpath_is_runtime_root_relative_file,
+    is_server_side_code_file as subpath_is_server_side_code_file,
+    is_static_html_project as subpath_is_static_html_project,
+    is_vite_project as subpath_is_vite_project,
+    is_vue_cli_project as subpath_is_vue_cli_project,
+    normalize_python_hint_path as subpath_normalize_python_hint_path,
+    prepare_subpath_sources as subpath_prepare_subpath_sources,
+    resolve_entrypoint_relative_dir as subpath_resolve_entrypoint_relative_dir,
+    resolve_python_hint_directory as subpath_resolve_python_hint_directory,
+    rewrite_frontend_subpath_urls as subpath_rewrite_frontend_subpath_urls,
+    rewrite_frontend_html_attribute_urls as subpath_rewrite_frontend_html_attribute_urls,
+    rewrite_frontend_html_link_urls as subpath_rewrite_frontend_html_link_urls,
+    rewrite_frontend_html_script_urls as subpath_rewrite_frontend_html_script_urls,
+    rewrite_frontend_html_form_action_urls as subpath_rewrite_frontend_html_form_action_urls,
+    rewrite_frontend_client_request_urls as subpath_rewrite_frontend_client_request_urls,
+    rewrite_frontend_request_api_urls as subpath_rewrite_frontend_request_api_urls,
+    rewrite_frontend_navigation_urls as subpath_rewrite_frontend_navigation_urls,
+    rewrite_frontend_eventsource_urls as subpath_rewrite_frontend_eventsource_urls,
+    rewrite_frontend_return_value_urls as subpath_rewrite_frontend_return_value_urls,
+    rewrite_origin_based_subpath_logic as subpath_rewrite_origin_based_subpath_logic,
+    run_runtime_subpath_audit as subpath_run_runtime_subpath_audit,
+    run_static_subpath_audit as subpath_run_static_subpath_audit,
+    runtime_subpath_findings_for_html as subpath_runtime_subpath_findings_for_html,
+    runtime_subpath_phase as subpath_runtime_subpath_phase,
+    scan_subpath_findings as subpath_scan_subpath_findings,
+    vite_project_roots as subpath_vite_project_roots,
+    workspace_frontend_package_dirs as subpath_workspace_frontend_package_dirs,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -167,6 +238,87 @@ def read_json(path: Path) -> Optional[Dict[str, object]]:
     return payload if isinstance(payload, dict) else None
 
 
+def read_subpath_declaration(repo_dir: Path) -> Optional[Dict[str, object]]:
+    declaration_path = repo_dir / ".ka" / "subpath.json"
+    try:
+        return read_json(declaration_path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def summarize_subpath_declaration(declaration: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if not isinstance(declaration, dict):
+        return None
+    projects = declaration.get("projects", [])
+    build_output_policy = declaration.get("build_output_policy", {})
+    default_project = declaration.get("default_project")
+    return {
+        "project_count": len(projects) if isinstance(projects, list) else 0,
+        "has_build_output_policy": isinstance(build_output_policy, dict) and bool(build_output_policy),
+        "declared_default_project": default_project if isinstance(default_project, str) and default_project.strip() else None,
+    }
+
+
+def subpath_plan_from_payload(plan_payload: object, repo_dir: Path) -> Optional[object]:
+    if not isinstance(plan_payload, dict):
+        return None
+    try:
+        from subpath.models import FrontendProjectStrategy, SubpathPlan
+
+        projects = tuple(
+            FrontendProjectStrategy(
+                project_id=str(item.get("project_id", "")),
+                framework=str(item.get("framework", "")),
+                proxy_mode=str(item.get("proxy_mode", "")),
+                adapter=str(item.get("adapter", "")),
+                source_adapter=str(item.get("source_adapter", "static_rewrite")),
+                project_root=Path(str(item.get("project_root", repo_dir))),
+                source_roots=tuple(Path(str(path)) for path in item.get("source_roots", [])),
+                runtime_roots=tuple(Path(str(path)) for path in item.get("runtime_roots", [])),
+                config_files=tuple(Path(str(path)) for path in item.get("config_files", [])),
+                capabilities=tuple(str(item2) for item2 in item.get("capabilities", [])),
+                evidence=tuple(str(item2) for item2 in item.get("evidence", [])),
+                runtime_entry_hint=str(item.get("runtime_entry_hint")) if item.get("runtime_entry_hint") is not None else None,
+                runtime_entry_candidates=tuple(str(item2) for item2 in item.get("runtime_entry_candidates", [])),
+            )
+            for item in plan_payload.get("projects", [])
+            if isinstance(item, dict)
+        )
+        return SubpathPlan(
+            projects=projects,
+            default_project=plan_payload.get("default_project"),
+            notes=tuple(str(item) for item in plan_payload.get("notes", [])),
+        )
+    except Exception:
+        return None
+
+
+def build_runtime_subpath_plan(repo_dir: Path):
+    return subpath_build_subpath_plan(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        detect_node_entry_script_paths=detect_node_entry_script_paths,
+        read_text_if_exists=read_text_if_exists,
+        collect_python_frontend_hint_files_fn=collect_python_frontend_hint_files,
+        workspace_frontend_package_dirs_fn=workspace_frontend_package_dirs,
+        vite_project_roots_fn=vite_project_roots,
+        collect_matching_files=collect_matching_files,
+        discover_workspace_packages=discover_workspace_packages,
+    )
+
+
+def build_runtime_root_evidence(repo_dir: Path):
+    return subpath_detect_runtime_root_evidence(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        detect_node_entry_script_paths=detect_node_entry_script_paths,
+        read_text_if_exists=read_text_if_exists,
+        collect_python_frontend_hint_files_fn=collect_python_frontend_hint_files,
+        workspace_frontend_package_dirs_fn=workspace_frontend_package_dirs,
+        collect_matching_files=collect_matching_files,
+    )
+
+
 def json_safe(value: object) -> object:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -193,6 +345,17 @@ def write_json(path: Path, payload: Dict[str, object]) -> None:
 
 def sorted_unique(items: Iterable[str]) -> List[str]:
     return sorted({item for item in items if item})
+
+
+def ordered_unique(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for item in items:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
 
 
 def append_warning(result: Dict[str, object], warning: str) -> None:
@@ -279,6 +442,20 @@ def copy_if_exists(src: Path, dst: Path) -> None:
     if src.exists():
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+
+def is_git_tracked_file(repo_dir: Path, path: Path) -> bool:
+    try:
+        relative_path = path.relative_to(repo_dir).as_posix()
+    except ValueError:
+        return False
+    if not relative_path:
+        return False
+    result = run_command(
+        ["git", "ls-files", "--error-unmatch", "--", relative_path],
+        cwd=repo_dir,
+    )
+    return result.returncode == 0
 
 
 def copytree_if_exists(src: Path, dst: Path) -> None:
@@ -451,42 +628,59 @@ def list_local_official_docker_images() -> List[str]:
     return list_local_official_docker_images_fallback()
 
 
-def load_project_ports_map() -> Dict[str, str]:
+def is_valid_port_mapping(value: object) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"\d{2,5}:\d{2,5}", value))
+
+
+def load_project_port_configs() -> Dict[str, Dict[str, object]]:
     payload = read_json(PROJECT_PORTS_PATH)
     if not isinstance(payload, dict):
         return {}
-    result: Dict[str, str] = {}
+    result: Dict[str, Dict[str, object]] = {}
     for key, value in payload.items():
         if not isinstance(key, str):
             continue
-        if isinstance(value, str) and re.fullmatch(r"\d{2,5}:\d{2,5}", value):
-            result[key] = value
-            continue
         if isinstance(value, dict):
             port_value = value.get("port")
-            if isinstance(port_value, str) and re.fullmatch(r"\d{2,5}:\d{2,5}", port_value):
-                result[key] = port_value
+            if is_valid_port_mapping(port_value):
+                result[key] = dict(value)
     return result
 
 
-def save_project_ports_map(mapping: Dict[str, str]) -> None:
-    payload = read_json(PROJECT_PORTS_PATH)
-    existing = payload if isinstance(payload, dict) else {}
-    updated: Dict[str, object] = dict(existing)
-    for project_slug, port_mapping in mapping.items():
-        current_value = updated.get(project_slug)
-        if isinstance(current_value, dict):
-            updated[project_slug] = {**current_value, "port": port_mapping}
-        else:
-            updated[project_slug] = port_mapping
+def save_project_port_configs(configs: Dict[str, Dict[str, object]]) -> None:
+    updated: Dict[str, object] = {}
+    for project_slug, config in configs.items():
+        if not isinstance(project_slug, str) or not project_slug:
+            continue
+        if not isinstance(config, dict):
+            continue
+        port_value = config.get("port")
+        if not is_valid_port_mapping(port_value):
+            continue
+        normalized: Dict[str, object] = {"port": str(port_value)}
+        volume_specs = config.get("volumes")
+        if isinstance(volume_specs, list):
+            volumes = [item for item in volume_specs if isinstance(item, str) and item.strip()]
+            if volumes:
+                normalized["volumes"] = volumes
+        env_config = config.get("env")
+        if isinstance(env_config, dict):
+            env_map = {
+                key: value
+                for key, value in env_config.items()
+                if isinstance(key, str) and key and isinstance(value, str)
+            }
+            if env_map:
+                normalized["env"] = env_map
+        env_file = config.get("env_file")
+        if isinstance(env_file, str) and env_file.strip():
+            normalized["env_file"] = env_file.strip()
+        updated[project_slug] = normalized
     write_text(PROJECT_PORTS_PATH, json.dumps(updated, ensure_ascii=False, indent=2) + "\n")
 
 
 def load_project_runtime_overrides(project_slug: str) -> Dict[str, object]:
-    payload = read_json(PROJECT_PORTS_PATH)
-    if not isinstance(payload, dict):
-        return {}
-    project_config = payload.get(project_slug)
+    project_config = load_project_port_configs().get(project_slug)
     if not isinstance(project_config, dict):
         return {}
 
@@ -523,16 +717,23 @@ def load_project_runtime_overrides(project_slug: str) -> Dict[str, object]:
 
 
 def resolve_project_port_mapping(project_slug: str, container_port: int) -> Tuple[int, int]:
-    mapping = load_project_ports_map()
-    if project_slug in mapping:
-        host_text, container_text = mapping[project_slug].split(":", 1)
+    port_configs = load_project_port_configs()
+    existing_config = port_configs.get(project_slug)
+    if isinstance(existing_config, dict) and is_valid_port_mapping(existing_config.get("port")):
+        host_text, container_text = str(existing_config["port"]).split(":", 1)
         return int(host_text), int(container_text)
-    used_host_ports = {int(value.split(":", 1)[0]) for value in mapping.values()}
+    used_host_ports = {
+        int(str(value.get("port")).split(":", 1)[0])
+        for value in port_configs.values()
+        if isinstance(value, dict) and is_valid_port_mapping(value.get("port"))
+    }
     candidate = DEFAULT_PROJECT_HOST_PORT_BASE
     while candidate in used_host_ports:
         candidate += 1
-    mapping[project_slug] = f"{candidate}:{container_port}"
-    save_project_ports_map(mapping)
+    updated_config = dict(existing_config) if isinstance(existing_config, dict) else {}
+    updated_config["port"] = f"{candidate}:{container_port}"
+    port_configs[project_slug] = updated_config
+    save_project_port_configs(port_configs)
     return candidate, container_port
 
 
@@ -1009,6 +1210,74 @@ def package_dependency_names(package_payload: Dict[str, object]) -> List[str]:
     return sorted(names)
 
 
+def detect_repo_package_manager(repo_dir: Path, package_payload: Dict[str, object]) -> str:
+    package_manager_field = package_payload.get("packageManager")
+    if isinstance(package_manager_field, str):
+        if package_manager_field.startswith("pnpm@"):
+            return "pnpm"
+        if package_manager_field.startswith("yarn@"):
+            return "yarn"
+        if package_manager_field.startswith("npm@"):
+            return "npm"
+    if (repo_dir / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (repo_dir / "package-lock.json").exists():
+        return "npm"
+    if (repo_dir / "yarn.lock").exists():
+        return "yarn"
+    return "unknown"
+
+
+def build_root_script_command(package_manager: str, script_name: str) -> str:
+    if package_manager == "pnpm":
+        return f"pnpm {script_name}"
+    if package_manager == "yarn":
+        return f"yarn {script_name}"
+    return f"npm run {script_name}"
+
+
+def build_workspace_script_command(
+    package_manager: str,
+    script_name: str,
+    relative_dir: str,
+    package_name: Optional[str] = None,
+) -> Optional[str]:
+    normalized_dir = relative_dir.strip()
+    if not normalized_dir:
+        return None
+    if package_manager == "pnpm":
+        return f"pnpm --dir {normalized_dir} {script_name}"
+    if package_manager == "npm":
+        return f"npm run {script_name} --workspace={normalized_dir}"
+    if package_manager == "yarn" and package_name:
+        return f"yarn workspace {package_name} {script_name}"
+    return None
+
+
+def looks_like_generated_artifact_path(path_text: str) -> bool:
+    generated_markers = {"dist", "build", ".next", "out", ".output"}
+    return any(part in generated_markers for part in Path(path_text).parts if part not in (".", "/"))
+
+
+def command_mentions_generated_artifact(command: str) -> bool:
+    lowered = command.lower()
+    return bool(re.search(r"(?:^|[\s/'\"`])(?:dist|build|\.next|out|\.output)(?:[\s/'\"`]|$)", lowered))
+
+
+def command_requires_prior_build(command: str) -> bool:
+    lowered = command.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "next start",
+            "vite preview",
+            "nuxt start",
+            "nuxt preview",
+            "gatsby serve",
+        )
+    )
+
+
 def discover_workspace_packages(repo_dir: Path, root_package: Dict[str, object]) -> List[Dict[str, object]]:
     workspace_members = root_package.get("workspaces")
     package_patterns: List[str] = []
@@ -1130,8 +1399,11 @@ def detect_port_from_text(text: str) -> Optional[int]:
         r'\b(?:app|application|server)\.run\([^)]*port\s*=\s*(\d{2,5})',
         r'--port(?:=|\s+)(\d{2,5})',
         r'port\s*=\s*int\(os\.environ\.get\([^)]*["\'](\d{2,5})["\']\)\)',
-        r'parser\.add_argument\(\s*["\']--port["\'][^)]*default\s*=\s*(\d{2,5})',
+        r'\b(?:const|let|var)\s+PORT\s*=\s*process\.env\.PORT\s*\|\|\s*(\d{2,5})',
+        r'\b(?:const|let|var)\s+PORT\s*=\s*process\.env\.PORT\s*\?\?\s*(\d{2,5})',
         r'process\.env\.PORT\s*\|\|\s*(\d{2,5})',
+        r'process\.env\.PORT\s*\?\?\s*(\d{2,5})',
+        r'parser\.add_argument\(\s*["\']--port["\'][^)]*default\s*=\s*(\d{2,5})',
         r'listen\(\s*(\d{2,5})\s*[,)]',
     ]
     for pattern in patterns:
@@ -1246,6 +1518,23 @@ def build_flask_entry_command(module_name: str, app_name: str, port: Optional[in
     return command
 
 
+def build_python_script_command(repo_dir: Path, file_path: Path) -> Optional[str]:
+    try:
+        relative_path = file_path.relative_to(repo_dir).as_posix()
+    except ValueError:
+        return None
+    if not relative_path:
+        return None
+    return f"python {relative_path}"
+
+
+def has_local_python_imports(text: str) -> bool:
+    for imported_module in re.findall(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\b", text, re.MULTILINE):
+        if imported_module not in {"__future__"}:
+            return True
+    return False
+
+
 def python_command_matches_repo(repo_dir: Path, command: str) -> bool:
     lowered = command.lower()
     uvicorn_match = re.search(
@@ -1319,6 +1608,8 @@ def detect_python_entrypoint_from_file(
     priority = python_entry_file_priority(repo_dir, file_path)
     port = detect_port_from_text(text)
     has_main = has_python_main_guard(text)
+    script_command = build_python_script_command(repo_dir, file_path)
+    has_local_imports = has_local_python_imports(text)
     imports_uvicorn = "uvicorn" in python_dependencies or bool(
         re.search(r"^\s*(?:from\s+uvicorn\s+import|import\s+uvicorn\b)", text, re.MULTILINE)
     )
@@ -1328,6 +1619,8 @@ def detect_python_entrypoint_from_file(
     asgi_app_name = detect_assigned_framework_app_name(text, ("FastAPI", "Starlette", "Quart"))
     flask_app_name = detect_assigned_framework_app_name(text, ("Flask",))
 
+    if has_main and has_local_imports and script_command:
+        return 245 + priority, script_command
     if has_main and re.search(r"\buvicorn\.run\s*\(", text):
         return 240 + priority, f"python -m {module_name}"
     if has_main and re.search(r"\b(?:app|application|server)\.run\s*\(", text):
@@ -1403,7 +1696,18 @@ def detect_python_entrypoint(
 def detect_node_entrypoint(repo_dir: Path, package_scripts: Dict[str, object]) -> Tuple[Optional[Path], Optional[str], Optional[str]]:
     start_script = package_scripts.get("start")
     if isinstance(start_script, str) and start_script.strip():
-        return None, start_script.strip(), None
+        command = start_script.strip()
+        script_path = extract_node_script_path_from_command(command)
+        if script_path:
+            candidate = (repo_dir / script_path).resolve()
+            try:
+                candidate.relative_to(repo_dir.resolve())
+            except ValueError:
+                candidate = None
+            if candidate and candidate.is_file():
+                text = read_text_if_exists(candidate)
+                return candidate, command, text
+        return None, command, None
     for filename in ("server.js", "app.js", "main.js", "index.js"):
         candidate = repo_dir / filename
         text = read_text_if_exists(candidate)
@@ -1511,18 +1815,17 @@ def detect_node_entry_script_paths(repo_dir: Path, package_scripts: Dict[str, ob
     return candidates
 
 
-def resolve_entrypoint_relative_dir(entry_file: Path, args_text: str) -> Optional[Path]:
+def resolve_entrypoint_relative_dir_hint(entry_file: Path, args_text: str) -> Optional[Path]:
     quoted_parts = re.findall(r'["\']([^"\']+)["\']', args_text)
     if not quoted_parts:
         return None
     candidate = entry_file.parent
     for part in quoted_parts:
         candidate = candidate / Path(part)
-    resolved = candidate.resolve()
-    return resolved if resolved.exists() and resolved.is_dir() else None
+    return candidate.resolve()
 
 
-def detect_static_root_hints_from_node_entry(repo_dir: Path, entry_file: Path) -> List[Path]:
+def detect_static_root_reference_paths_from_node_entry(repo_dir: Path, entry_file: Path) -> List[Path]:
     text = read_text_if_exists(entry_file)
     if not text:
         return []
@@ -1532,11 +1835,9 @@ def detect_static_root_hints_from_node_entry(repo_dir: Path, entry_file: Path) -
     hints: List[Path] = []
     seen: Set[Path] = set()
 
-    assignment_pattern = re.compile(
-        r'(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*path\.(?:join|resolve)\(\s*__dirname\s*,\s*(.*?)\)\s*;?'
-    )
+    assignment_pattern = re.compile(r'(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*path\.(?:join|resolve)\(\s*__dirname\s*,\s*(.*?)\)\s*;?')
     for match in assignment_pattern.finditer(text):
-        resolved = resolve_entrypoint_relative_dir(entry_file, match.group(2))
+        resolved = resolve_entrypoint_relative_dir_hint(entry_file, match.group(2))
         if resolved is None:
             continue
         try:
@@ -1545,11 +1846,9 @@ def detect_static_root_hints_from_node_entry(repo_dir: Path, entry_file: Path) -
             continue
         variable_dirs[match.group(1)] = resolved
 
-    inline_pattern = re.compile(
-        r'(?:express\.static|serveStatic|koaStatic|root\s*:)\s*[\(\s]*path\.(?:join|resolve)\(\s*__dirname\s*,\s*(.*?)\)\s*\)?'
-    )
+    inline_pattern = re.compile(r'(?:express\.static|serveStatic|koaStatic|root\s*:)\s*[\(\s]*path\.(?:join|resolve)\(\s*__dirname\s*,\s*(.*?)\)\s*\)?')
     for match in inline_pattern.finditer(text):
-        resolved = resolve_entrypoint_relative_dir(entry_file, match.group(1))
+        resolved = resolve_entrypoint_relative_dir_hint(entry_file, match.group(1))
         if resolved is None or resolved in seen:
             continue
         try:
@@ -1573,181 +1872,83 @@ def detect_static_root_hints_from_node_entry(repo_dir: Path, entry_file: Path) -
     return hints
 
 
+def resolve_entrypoint_relative_dir(entry_file: Path, args_text: str) -> Optional[Path]:
+    return subpath_resolve_entrypoint_relative_dir(entry_file, args_text)
+
+
+def detect_static_root_hints_from_node_entry(repo_dir: Path, entry_file: Path) -> List[Path]:
+    return subpath_detect_static_root_hints_from_node_entry(
+        repo_dir,
+        entry_file,
+        read_text_if_exists=read_text_if_exists,
+    )
+
+
 def workspace_frontend_package_dirs(repo_dir: Path) -> List[Path]:
-    root_package = parse_package_json(repo_dir)
-    workspace_packages = discover_workspace_packages(repo_dir, root_package)
-    targets: List[Path] = []
-    for package_info in workspace_packages:
-        package_dir = package_info.get("package_dir")
-        dependencies = package_info.get("dependencies", [])
-        if not isinstance(package_dir, Path) or not isinstance(dependencies, list):
-            continue
-        dep_set = {str(dep).lower() for dep in dependencies}
-        if dep_set.intersection({"vite", "react", "react-dom", "vue", "svelte", "@vitejs/plugin-react"}):
-            targets.append(package_dir.resolve())
-            continue
-        scripts = package_info.get("scripts", {})
-        if isinstance(scripts, dict) and any(isinstance(value, str) and "vite" in value for value in scripts.values()):
-            targets.append(package_dir.resolve())
-    return sorted(set(targets))
+    return subpath_workspace_frontend_package_dirs(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        discover_workspace_packages=discover_workspace_packages,
+    )
 
 
 def vite_project_roots(repo_dir: Path) -> List[Path]:
-    targets: List[Path] = []
-    package = parse_package_json(repo_dir)
-    dependencies = package.get("dependencies") if isinstance(package.get("dependencies"), dict) else {}
-    dev_dependencies = package.get("devDependencies") if isinstance(package.get("devDependencies"), dict) else {}
-    scripts = package.get("scripts") if isinstance(package.get("scripts"), dict) else {}
-    if (
-        "vite" in dependencies
-        or "vite" in dev_dependencies
-        or any((repo_dir / candidate).exists() for candidate in ("vite.config.ts", "vite.config.js", "vite.config.mjs"))
-        or any(isinstance(value, str) and "vite" in value for value in scripts.values())
-    ):
-        targets.append(repo_dir.resolve())
-    targets.extend(workspace_frontend_package_dirs(repo_dir))
-    return sorted(set(targets))
+    return subpath_vite_project_roots(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        workspace_frontend_package_dirs_fn=workspace_frontend_package_dirs,
+    )
 
 
 def collect_python_frontend_hint_files(repo_dir: Path) -> List[Path]:
-    patterns = [
-        "server.py",
-        "app.py",
-        "main.py",
-        "api.py",
-        "asgi.py",
-        "wsgi.py",
-        "*/server.py",
-        "*/app.py",
-        "*/main.py",
-        "*/api.py",
-        "*/asgi.py",
-        "*/wsgi.py",
-        "*/*/server.py",
-        "*/*/app.py",
-        "*/*/main.py",
-        "*/*/api.py",
-        "*/*/asgi.py",
-        "*/*/wsgi.py",
-        "app/**/*.py",
-        "backend/**/*.py",
-        "server/**/*.py",
-        "src/**/*.py",
-    ]
-    targets: List[Path] = []
-    for file_path in collect_matching_files(repo_dir, patterns):
-        relative = file_path.relative_to(repo_dir).as_posix()
-        if any(part in relative.split("/") for part in ("tests", "vendor", ".venv", "node_modules", "__pycache__", "docs")):
-            continue
-        targets.append(file_path)
-    return sorted(set(targets))
+    return subpath_collect_python_frontend_hint_files(
+        repo_dir,
+        collect_matching_files=collect_matching_files,
+    )
 
 
 def normalize_python_hint_path(expr: str) -> Optional[str]:
-    quoted_parts = [part.strip() for part in re.findall(r'["\']([^"\']+)["\']', expr) if part.strip()]
-    if not quoted_parts:
-        return None
-    if len(quoted_parts) == 1:
-        return quoted_parts[0]
-    return Path(*quoted_parts).as_posix()
+    return subpath_normalize_python_hint_path(expr)
 
 
 def resolve_python_hint_directory(repo_dir: Path, source_file: Path, path_text: str) -> List[Path]:
-    raw_path = path_text.strip()
-    if not raw_path or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw_path):
-        return []
-    repo_root = repo_dir.resolve()
-    resolved_dirs: List[Path] = []
-    seen: Set[Path] = set()
-
-    def add_candidate(candidate: Path) -> None:
-        resolved = candidate.resolve()
-        if not resolved.is_dir():
-            return
-        try:
-            resolved.relative_to(repo_root)
-        except ValueError:
-            return
-        if resolved not in seen:
-            resolved_dirs.append(resolved)
-            seen.add(resolved)
-
-    candidate_path = Path(raw_path)
-    if candidate_path.is_absolute():
-        add_candidate(candidate_path)
-        return resolved_dirs
-
-    if raw_path in {".", ".."} or raw_path.startswith(("./", "../")):
-        add_candidate(source_file.parent.resolve() / candidate_path)
-        return resolved_dirs
-
-    current = source_file.parent.resolve()
-    while True:
-        add_candidate(current / candidate_path)
-        if current == repo_root or current.parent == current:
-            break
-        current = current.parent
-    add_candidate(repo_root / candidate_path)
-    return resolved_dirs
+    return subpath_resolve_python_hint_directory(repo_dir, source_file, path_text)
 
 
 def detect_frontend_root_hints_from_python_file(repo_dir: Path, source_file: Path) -> List[Path]:
-    text = read_text_if_exists(source_file)
-    if not text:
-        return []
-
-    patterns = (
-        re.compile(r'Jinja2Templates\(\s*directory\s*=\s*(?P<expr>[^)\n]+)\)'),
-        re.compile(r'StaticFiles\(\s*directory\s*=\s*(?P<expr>[^)\n]+)\)'),
-        re.compile(r'\btemplate_folder\s*=\s*(?P<expr>[^,\)\n]+)'),
-        re.compile(r'\bstatic_folder\s*=\s*(?P<expr>[^,\)\n]+)'),
+    return subpath_detect_frontend_root_hints_from_python_file(
+        repo_dir,
+        source_file,
+        read_text_if_exists=read_text_if_exists,
     )
-    hints: List[Path] = []
-    seen: Set[Path] = set()
-    for pattern in patterns:
-        for match in pattern.finditer(text):
-            path_text = normalize_python_hint_path(match.group("expr"))
-            if not path_text:
-                continue
-            for resolved in resolve_python_hint_directory(repo_dir, source_file, path_text):
-                if resolved not in seen:
-                    hints.append(resolved)
-                    seen.add(resolved)
-    return hints
 
 
 def detect_frontend_runtime_roots(repo_dir: Path) -> List[Path]:
-    roots: List[Path] = []
-    seen: Set[Path] = set()
-    package = parse_package_json(repo_dir)
-    package_scripts = package.get("scripts", {}) if isinstance(package.get("scripts"), dict) else {}
+    return subpath_detect_frontend_runtime_roots(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        detect_node_entry_script_paths=detect_node_entry_script_paths,
+        detect_static_root_hints_from_node_entry_fn=detect_static_root_hints_from_node_entry,
+        collect_python_frontend_hint_files_fn=collect_python_frontend_hint_files,
+        detect_frontend_root_hints_from_python_file_fn=detect_frontend_root_hints_from_python_file,
+        workspace_frontend_package_dirs_fn=workspace_frontend_package_dirs,
+        read_text_if_exists=read_text_if_exists,
+        collect_matching_files=collect_matching_files,
+    )
 
-    for entry_file in detect_node_entry_script_paths(repo_dir, package_scripts):
-        for runtime_root in detect_static_root_hints_from_node_entry(repo_dir, entry_file):
-            if runtime_root not in seen:
-                roots.append(runtime_root)
-                seen.add(runtime_root)
 
-    for source_file in collect_python_frontend_hint_files(repo_dir):
-        for runtime_root in detect_frontend_root_hints_from_python_file(repo_dir, source_file):
-            if runtime_root not in seen:
-                roots.append(runtime_root)
-                seen.add(runtime_root)
-
-    for anchor in ("src", "static", "public", "client", "web", "views", "templates", "audioqas/web/static"):
-        candidate = (repo_dir / anchor).resolve()
-        if candidate.is_dir() and candidate not in seen:
-            roots.append(candidate)
-            seen.add(candidate)
-
-    for workspace_dir in workspace_frontend_package_dirs(repo_dir):
-        for anchor in ("src", "static", "public", "client", "web"):
-            candidate = (workspace_dir / anchor).resolve()
-            if candidate.is_dir() and candidate not in seen:
-                roots.append(candidate)
-                seen.add(candidate)
-
-    return roots
+def detect_frontend_runtime_root_groups(repo_dir: Path) -> Dict[str, tuple[Path, ...]]:
+    return subpath_detect_frontend_runtime_root_groups(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        detect_node_entry_script_paths=detect_node_entry_script_paths,
+        detect_static_root_hints_from_node_entry_fn=detect_static_root_hints_from_node_entry,
+        collect_python_frontend_hint_files_fn=collect_python_frontend_hint_files,
+        detect_frontend_root_hints_from_python_file_fn=detect_frontend_root_hints_from_python_file,
+        workspace_frontend_package_dirs_fn=workspace_frontend_package_dirs,
+        read_text_if_exists=read_text_if_exists,
+        collect_matching_files=collect_matching_files,
+    )
 
 
 def detect_system_dependency_hints(repo_dir: Path, package_scripts: Dict[str, object], readme_text: Optional[str]) -> List[str]:
@@ -2010,6 +2211,7 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
     pyproject_text = read_text_if_exists(pyproject_toml)
     requirements_text = read_text_if_exists(requirements_txt)
     readme_text = read_text_if_exists(readme)
+    detected_node_package_manager = detect_repo_package_manager(repo_dir, package)
     python_dependencies = sorted_unique(
         (parse_pyproject_dependencies(pyproject_text) if pyproject_text else [])
         + (parse_requirements_dependencies(requirements_text) if requirements_text else [])
@@ -2199,20 +2401,152 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
 
     package_manager = "unknown"
     if service_runtime == "node":
-        package_manager_field = package.get("packageManager")
-        if isinstance(package_manager_field, str) and package_manager_field.startswith("pnpm@"):
-            package_manager = "pnpm"
-        elif (repo_dir / "pnpm-lock.yaml").exists():
-            package_manager = "pnpm"
-        elif package_lock.exists():
-            package_manager = "npm"
-        elif (repo_dir / "yarn.lock").exists():
-            package_manager = "yarn"
+        package_manager = detected_node_package_manager
     elif service_runtime == "python":
         if pyproject_toml.exists():
             package_manager = "pip"
         elif requirements_txt.exists():
             package_manager = "pip"
+
+    frontend_runtime_roots: List[Path] = []
+    if service_runtime == "node" or package_json.exists():
+        frontend_runtime_roots = detect_frontend_runtime_roots(repo_dir)
+    frontend_runtime_root_paths = sorted_unique(
+        runtime_root.relative_to(repo_dir.resolve()).as_posix()
+        for runtime_root in frontend_runtime_roots
+        if runtime_root.exists()
+    )
+    referenced_runtime_root_paths: List[str] = []
+    if service_runtime == "node" or package_json.exists():
+        for entry_path in detect_node_entry_script_paths(repo_dir, package_scripts):
+            for runtime_root in detect_static_root_reference_paths_from_node_entry(repo_dir, entry_path):
+                try:
+                    referenced_runtime_root_paths.append(runtime_root.relative_to(repo_dir.resolve()).as_posix())
+                except ValueError:
+                    continue
+    referenced_runtime_root_paths = sorted_unique(referenced_runtime_root_paths)
+    combined_runtime_root_paths = sorted_unique(frontend_runtime_root_paths + referenced_runtime_root_paths)
+    runtime_build_artifact_paths = [
+        path_text for path_text in combined_runtime_root_paths if looks_like_generated_artifact_path(path_text)
+    ]
+
+    workspace_package_by_dir: Dict[str, Dict[str, object]] = {}
+    for workspace_package in workspace_packages:
+        relative_dir = str(workspace_package.get("relative_dir") or "").strip()
+        if relative_dir:
+            workspace_package_by_dir[relative_dir] = workspace_package
+
+    build_command_candidates: List[str] = []
+    required_build_commands: List[str] = []
+    root_build_script = package_scripts.get("build")
+    if isinstance(root_build_script, str) and root_build_script.strip():
+        build_command_candidates.append(build_root_script_command(detected_node_package_manager, "build"))
+
+    for runtime_root in runtime_build_artifact_paths:
+        for relative_dir, workspace_package in workspace_package_by_dir.items():
+            if runtime_root == relative_dir or runtime_root.startswith(f"{relative_dir}/"):
+                scripts = workspace_package.get("scripts", {})
+                if not isinstance(scripts, dict):
+                    continue
+                build_script = scripts.get("build")
+                if not isinstance(build_script, str) or not build_script.strip():
+                    continue
+                build_command = build_workspace_script_command(
+                    detected_node_package_manager,
+                    "build",
+                    relative_dir,
+                    package_name=str(workspace_package.get("name") or "").strip() or None,
+                )
+                if build_command:
+                    build_command_candidates.append(build_command)
+                    required_build_commands.append(build_command)
+
+    selected_service_build_command: Optional[str] = None
+    selected_service_has_build_script = False
+    if isinstance(selected_service_package, dict):
+        scripts = selected_service_package.get("scripts", {})
+        relative_dir = str(selected_service_package.get("relative_dir") or "").strip()
+        if isinstance(scripts, dict):
+            selected_build_script = scripts.get("build")
+            if isinstance(selected_build_script, str) and selected_build_script.strip():
+                selected_service_has_build_script = True
+                build_command = build_workspace_script_command(
+                    detected_node_package_manager,
+                    "build",
+                    relative_dir,
+                    package_name=str(selected_service_package.get("name") or "").strip() or None,
+                )
+                if build_command:
+                    selected_service_build_command = build_command
+                    build_command_candidates.append(build_command)
+
+    requires_build_step = False
+    build_requirement_reasons: List[str] = []
+    if runtime_build_artifact_paths:
+        requires_build_step = True
+        joined_paths = ", ".join(f"`{path_text}`" for path_text in runtime_build_artifact_paths)
+        build_requirement_reasons.append(f"runtime depends on generated assets at {joined_paths}")
+
+    start_script_texts: List[str] = []
+    root_start_script = package_scripts.get("start")
+    if isinstance(root_start_script, str) and root_start_script.strip():
+        start_script_texts.append(root_start_script.strip())
+    if isinstance(selected_service_package, dict):
+        selected_scripts = selected_service_package.get("scripts", {})
+        if isinstance(selected_scripts, dict):
+            selected_start_script = selected_scripts.get("start")
+            if isinstance(selected_start_script, str) and selected_start_script.strip():
+                start_script_texts.append(selected_start_script.strip())
+
+    if isinstance(node_entry_command, str) and node_entry_command.strip():
+        if command_requires_prior_build(node_entry_command):
+            requires_build_step = True
+            build_requirement_reasons.append(f'entry command `{node_entry_command}` requires built artifacts')
+        elif command_mentions_generated_artifact(node_entry_command):
+            requires_build_step = True
+            build_requirement_reasons.append(f'entry command `{node_entry_command}` references generated artifact paths')
+
+    for script_text in start_script_texts:
+        if command_requires_prior_build(script_text):
+            requires_build_step = True
+            build_requirement_reasons.append(f'start script `{script_text}` requires a prior build')
+        elif command_mentions_generated_artifact(script_text):
+            requires_build_step = True
+            build_requirement_reasons.append(f'start script `{script_text}` references generated artifact paths')
+
+    if selected_service_build_command and selected_service_has_build_script:
+        selected_service_requires_build = False
+        if isinstance(node_entry_command, str) and node_entry_command.strip():
+            selected_service_requires_build = (
+                command_requires_prior_build(node_entry_command)
+                or command_mentions_generated_artifact(node_entry_command)
+            )
+        if not selected_service_requires_build:
+            for script_text in start_script_texts:
+                if command_requires_prior_build(script_text) or command_mentions_generated_artifact(script_text):
+                    selected_service_requires_build = True
+                    break
+        if selected_service_requires_build:
+            required_build_commands.append(selected_service_build_command)
+
+    build_command_candidates = sorted_unique(build_command_candidates)
+    required_build_commands = ordered_unique(required_build_commands)
+    if requires_build_step and not required_build_commands:
+        if build_command_candidates:
+            required_build_commands = ordered_unique(build_command_candidates)
+        elif isinstance(root_build_script, str) and root_build_script.strip():
+            required_build_commands = [build_root_script_command(detected_node_package_manager, "build")]
+    build_requirement_reasons = sorted_unique(build_requirement_reasons)
+    if referenced_runtime_root_paths:
+        facts.append(f'- referenced runtime asset paths = {", ".join(referenced_runtime_root_paths)}')
+    if runtime_build_artifact_paths:
+        facts.append(f'- runtime build artifact paths = {", ".join(runtime_build_artifact_paths)}')
+    if required_build_commands:
+        facts.append(f'- minimum required build commands = {", ".join(required_build_commands)}')
+    if build_command_candidates:
+        facts.append(f'- build command candidates = {", ".join(build_command_candidates)}')
+    if requires_build_step and build_requirement_reasons:
+        facts.append(f'- runtime requires an application build step because {", ".join(build_requirement_reasons)}')
 
     config_file_hints: List[str] = []
     for candidate in collect_matching_files(repo_dir, [".env.example", "**/*.service", "deploy/**/*"]):
@@ -2252,6 +2586,12 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
         "config_file_hints": normalized_config_file_hints,
         "database_file_hints": normalized_database_file_hints,
         "storage_hints": normalized_storage_hints,
+        "frontend_runtime_root_paths": combined_runtime_root_paths,
+        "runtime_build_artifact_paths": runtime_build_artifact_paths,
+        "required_build_commands": required_build_commands,
+        "build_command_candidates": build_command_candidates,
+        "requires_build_step": requires_build_step,
+        "build_requirement_reasons": build_requirement_reasons,
     }
 
 
@@ -2285,10 +2625,6 @@ def summarize_analysis(analysis: Dict[str, object], source_type: str, project_sl
         "storage_hints": analysis.get("storage_hints", []),
         "selected_service_package": summarized_service_package,
     }
-
-
-def build_deployment_base_path(project_slug: str) -> str:
-    return f"/tools2/{slugify(project_slug)}"
 
 
 def render_athena_managed_tool_block(project_slug: str, host_port: int, proxy_mode: str = "strip_prefix", indent: str = "    ") -> str:
@@ -2501,252 +2837,73 @@ NEXTJS_ENTRY_CANDIDATES = [
 ]
 
 
-NEXTJS_RUNTIME_SHIM_BASENAME = "ka_tool_base_runtime"
-NEXTJS_WINDOW_TYPES_BASENAME = "ka_tool_window"
-
-
-@dataclass
-class SubpathAuditFinding:
-    file: str
-    line: int
-    severity: str
-    code: str
-    message: str
-
-
-@dataclass
-class HtmlUrlReference:
-    tag: str
-    attr: str
-    url: str
-    line: int
+NEXTJS_RUNTIME_SHIM_BASENAME = SUBPATH_NEXTJS_RUNTIME_SHIM_BASENAME
+NEXTJS_WINDOW_TYPES_BASENAME = SUBPATH_NEXTJS_WINDOW_TYPES_BASENAME
 
 
 def is_runtime_root_relative_file(file_path: Path, repo_dir: Path) -> bool:
-    file_resolved = file_path.resolve()
-    for runtime_root in detect_frontend_runtime_roots(repo_dir):
-        try:
-            file_resolved.relative_to(runtime_root)
-        except ValueError:
-            continue
-        return True
-    return False
+    return subpath_is_runtime_root_relative_file(
+        file_path,
+        repo_dir,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+    )
 
 
 def is_server_side_code_file(file_path: Path, repo_dir: Path) -> bool:
-    relative = file_path.relative_to(repo_dir).as_posix()
-    parts = relative.split("/")
-    if relative.startswith(("server/", "backend/", "api/")):
-        return True
-    if any(part in {"scripts", "services"} for part in parts):
-        return True
-    if file_path.suffix == ".py":
-        return True
-    basename = file_path.name
-    if basename in {"server.js", "server.ts", "app.ts", "api.py", "main.py"}:
-        return True
-    if basename == "app.js" and not is_runtime_root_relative_file(file_path, repo_dir):
-        return True
-    return False
+    return subpath_is_server_side_code_file(
+        file_path,
+        repo_dir,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+    )
 
 
 def find_frontend_rewrite_targets(repo_dir: Path) -> List[Path]:
-    patterns = [
-        "*.html",
-        "src/**/*.html",
-        "src/**/*.js",
-        "src/**/*.mjs",
-        "static/**/*.html",
-        "static/**/*.js",
-        "static/**/*.mjs",
-        "public/**/*.html",
-        "public/**/*.js",
-        "public/**/*.mjs",
-        "client/**/*.html",
-        "client/**/*.js",
-        "client/**/*.mjs",
-        "web/**/*.html",
-        "web/**/*.js",
-        "web/**/*.mjs",
-        "audioqas/web/static/**/*.html",
-        "audioqas/web/static/**/*.js",
-    ]
-    targets: List[Path] = []
-    for file_path in collect_matching_files(repo_dir, patterns):
-        relative = file_path.relative_to(repo_dir).as_posix()
-        if relative.startswith(("server/", "backend/", "api/")):
-            continue
-        if is_server_side_code_file(file_path, repo_dir):
-            continue
-        targets.append(file_path)
-    targets.extend(discover_runtime_root_frontend_files(repo_dir, include_code_files=True))
-    for project_root in vite_project_roots(repo_dir):
-        try:
-            relative_root = project_root.relative_to(repo_dir.resolve())
-        except ValueError:
-            continue
-        for pattern in ("index.html", "src/**/*.ts", "src/**/*.tsx", "src/**/*.js", "src/**/*.jsx", "src/**/*.mjs"):
-            for file_path in collect_matching_files(repo_dir, [f"{relative_root.as_posix()}/{pattern}"]):
-                if is_server_side_code_file(file_path, repo_dir):
-                    continue
-                targets.append(file_path)
-    return sorted(set(targets))
+    plan = subpath_build_subpath_plan(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        detect_node_entry_script_paths=detect_node_entry_script_paths,
+        read_text_if_exists=read_text_if_exists,
+        collect_python_frontend_hint_files_fn=collect_python_frontend_hint_files,
+        workspace_frontend_package_dirs_fn=workspace_frontend_package_dirs,
+        vite_project_roots_fn=vite_project_roots,
+        collect_matching_files=collect_matching_files,
+        discover_workspace_packages=discover_workspace_packages,
+    )
+    return subpath_find_plan_rewrite_targets(
+        repo_dir,
+        plan,
+        collect_matching_files=collect_matching_files,
+        discover_runtime_root_frontend_files=lambda path: discover_runtime_root_frontend_files(path, include_code_files=True),
+        is_server_side_code_file=is_server_side_code_file,
+        vite_project_roots=vite_project_roots,
+    )
 
 
 def discover_runtime_root_frontend_files(repo_dir: Path, *, include_code_files: bool) -> List[Path]:
-    patterns = ["**/*.html"]
-    if include_code_files:
-        patterns.extend(["**/*.js", "**/*.mjs"])
-    targets: List[Path] = []
-    seen: Set[Path] = set()
-    for runtime_root in detect_frontend_runtime_roots(repo_dir):
-        try:
-            relative_root = runtime_root.relative_to(repo_dir.resolve())
-        except ValueError:
-            continue
-        if relative_root == Path("."):
-            continue
-        for suffix_pattern in patterns:
-            for file_path in collect_matching_files(repo_dir, [f"{relative_root.as_posix()}/{suffix_pattern}"]):
-                relative = file_path.relative_to(repo_dir).as_posix()
-                if any(part in relative.split("/") for part in ("node_modules", ".next", "dist", "build")):
-                    continue
-                if relative.startswith(("server/", "backend/", "api/")):
-                    continue
-                if is_server_side_code_file(file_path, repo_dir):
-                    continue
-                if file_path not in seen:
-                    targets.append(file_path)
-                    seen.add(file_path)
-    return targets
-
-
-def find_subpath_audit_targets(repo_dir: Path, strategy: Dict[str, str]) -> List[Path]:
-    patterns = [
-        "src/**/*.ts",
-        "src/**/*.tsx",
-        "src/**/*.js",
-        "src/**/*.jsx",
-        "app/**/*.ts",
-        "app/**/*.tsx",
-        "app/**/*.js",
-        "app/**/*.jsx",
-        "pages/**/*.ts",
-        "pages/**/*.tsx",
-        "pages/**/*.js",
-        "pages/**/*.jsx",
-        "components/**/*.ts",
-        "components/**/*.tsx",
-        "components/**/*.js",
-        "components/**/*.jsx",
-        "public/**/*.html",
-        "public/**/*.js",
-        "public/**/*.mjs",
-        "static/**/*.html",
-        "static/**/*.js",
-        "static/**/*.mjs",
-        "client/**/*.html",
-        "client/**/*.js",
-        "client/**/*.mjs",
-        "web/**/*.html",
-        "web/**/*.js",
-        "web/**/*.mjs",
-        "views/**/*.html",
-        "views/**/*.js",
-        "views/**/*.mjs",
-        "templates/**/*.html",
-        "templates/**/*.js",
-        "templates/**/*.mjs",
-        "*.html",
-    ]
-    targets: List[Path] = []
-    framework = strategy.get("framework", "")
-    for file_path in collect_matching_files(repo_dir, patterns):
-        relative = file_path.relative_to(repo_dir).as_posix()
-        if any(part in relative.split("/") for part in ("node_modules", ".next", "dist", "build")):
-            continue
-        if relative.endswith((".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx")):
-            continue
-        if relative.startswith(("server/", "backend/", "api/")):
-            continue
-        if "/pages/api/" in f"/{relative}" or relative.endswith(("/route.ts", "/route.js", "/route.tsx", "/route.jsx")):
-            continue
-        if is_server_side_code_file(file_path, repo_dir):
-            continue
-        if framework == "nextjs" and relative.endswith((".ts", ".tsx", ".js", ".jsx", ".html")):
-            targets.append(file_path)
-            continue
-        if file_path.suffix in {".html", ".js", ".mjs"}:
-            targets.append(file_path)
-    targets.extend(discover_runtime_root_frontend_files(repo_dir, include_code_files=True))
-    if strategy.get("framework") == "vite":
-        for project_root in vite_project_roots(repo_dir):
-            try:
-                relative_root = project_root.relative_to(repo_dir.resolve())
-            except ValueError:
-                continue
-            for pattern in ("index.html", "src/**/*.ts", "src/**/*.tsx", "src/**/*.js", "src/**/*.jsx", "src/**/*.mjs"):
-                for file_path in collect_matching_files(repo_dir, [f"{relative_root.as_posix()}/{pattern}"]):
-                    if is_server_side_code_file(file_path, repo_dir):
-                        continue
-                    targets.append(file_path)
-    return sorted(set(targets))
-
-
-class HtmlUrlExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.references: List[HtmlUrlReference] = []
-
-    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        line, _offset = self.getpos()
-        for attr, value in attrs:
-            if attr in SUBPATH_BROWSER_ATTRS and isinstance(value, str):
-                self.references.append(HtmlUrlReference(tag=tag, attr=attr, url=value, line=line))
-
-
-def is_allowed_root_relative_url(url: str, base_path: str) -> bool:
-    stripped = url.strip()
-    if not stripped or not stripped.startswith("/"):
-        return True
-    if stripped.startswith("//"):
-        return True
-    if stripped.startswith("#"):
-        return True
-    lowered = stripped.lower()
-    if lowered.startswith(("mailto:", "tel:", "data:", "javascript:")):
-        return True
-    if stripped == base_path or stripped.startswith(f"{base_path}/"):
-        return True
-    return False
+    return subpath_discover_runtime_root_frontend_files(
+        repo_dir,
+        include_code_files=include_code_files,
+        collect_matching_files=collect_matching_files,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+    )
 
 
 def is_allowed_vite_root_html_url(url: str, file_path: Path, repo_dir: Path) -> bool:
-    stripped = url.strip()
-    if not stripped.startswith("/src/"):
-        return False
-    if file_path.name != "index.html":
-        return False
-    for project_root in vite_project_roots(repo_dir):
-        try:
-            file_path.resolve().relative_to(project_root)
-        except ValueError:
-            continue
-        source_candidate = project_root / stripped.lstrip("/")
-        return source_candidate.is_file()
-    return False
+    return subpath_is_allowed_vite_root_html_url(
+        url,
+        file_path,
+        repo_dir,
+        vite_project_roots=vite_project_roots,
+    )
 
 
 def is_browser_facing_source(file_path: Path, repo_dir: Path, text: str) -> bool:
-    relative = file_path.relative_to(repo_dir).as_posix()
-    if file_path.suffix == ".html":
-        return True
-    if re.search(r"^\s*['\"]use client['\"]\s*;?\s*$", text, flags=re.MULTILINE):
-        return True
-    if is_runtime_root_relative_file(file_path, repo_dir) and not is_server_side_code_file(file_path, repo_dir):
-        return True
-    parts = set(relative.split("/"))
-    return any(marker in parts for marker in SUBPATH_CLIENT_DIR_MARKERS)
+    return subpath_is_browser_facing_source(
+        file_path,
+        repo_dir,
+        text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+    )
 
 
 def finding_to_error_text(finding: SubpathAuditFinding) -> str:
@@ -2754,175 +2911,44 @@ def finding_to_error_text(finding: SubpathAuditFinding) -> str:
 
 
 def scan_subpath_findings(file_path: Path, framework: str, base_path: str, repo_dir: Path) -> List[SubpathAuditFinding]:
-    text = read_text(file_path)
-    if SUBPATH_ALLOWED_ROOT_COMMENT in text:
-        return []
-    relative = file_path.relative_to(repo_dir).as_posix()
-    findings: List[SubpathAuditFinding] = []
-    browser_facing = is_browser_facing_source(file_path, repo_dir, text)
-
-    if file_path.suffix == ".html":
-        parser = HtmlUrlExtractor()
-        parser.feed(text)
-        for ref in parser.references:
-            if framework == "vite" and is_allowed_vite_root_html_url(ref.url, file_path, repo_dir):
-                continue
-            if is_allowed_root_relative_url(ref.url, base_path):
-                continue
-            findings.append(
-                SubpathAuditFinding(
-                    file=relative,
-                    line=ref.line,
-                    severity="error",
-                    code="root_relative_html_url",
-                    message=f'Root-relative HTML attribute `{ref.attr}="{ref.url}"` is incompatible with deployment subpath `{base_path}`',
-                )
-            )
-        return findings
-
-    if framework == "nextjs":
-        for match in re.finditer(r'<a\b[^>]*\bhref\s*=\s*(["\'])(?P<url>/[^"\']*)\1', text):
-            url = match.group("url")
-            if is_allowed_root_relative_url(url, base_path):
-                continue
-            line = text.count("\n", 0, match.start()) + 1
-            findings.append(
-                SubpathAuditFinding(
-                    file=relative,
-                    line=line,
-                    severity="error",
-                    code="nextjs_raw_anchor_root_href",
-                    message=f'Use Next navigation instead of raw `<a href="{url}">` for subpath deployment `{base_path}`',
-                )
-            )
-        for match in re.finditer(r'<form\b[^>]*\baction\s*=\s*(["\'])(?P<url>/[^"\']*)\1', text):
-            url = match.group("url")
-            if is_allowed_root_relative_url(url, base_path):
-                continue
-            line = text.count("\n", 0, match.start()) + 1
-            findings.append(
-                SubpathAuditFinding(
-                    file=relative,
-                    line=line,
-                    severity="error",
-                    code="nextjs_form_root_action",
-                    message=f'Root-relative form action `{url}` is incompatible with deployment subpath `{base_path}`',
-                )
-            )
-        for field_name in SUBPATH_TEMPLATE_ALLOWLIST_FIELDS:
-            text = re.sub(rf'\b{field_name}\s*:\s*(["\'`])/(.*?)\1', "", text, flags=re.DOTALL)
-
-    if browser_facing:
-        for pattern in SUBPATH_CLIENT_METHOD_PATTERNS:
-            for match in pattern.finditer(text):
-                url = f"/{match.group('path')}"
-                if is_allowed_root_relative_url(url, base_path):
-                    continue
-                line = text.count("\n", 0, match.start()) + 1
-                findings.append(
-                    SubpathAuditFinding(
-                        file=relative,
-                        line=line,
-                        severity="error",
-                        code="root_relative_client_url",
-                        message=f'Root-relative browser URL `{url}` is incompatible with deployment subpath `{base_path}`',
-                    )
-                )
-    return findings
-
-
-def run_static_subpath_audit(repo_dir: Path, project_slug: str, strategy: Dict[str, str]) -> Dict[str, object]:
-    base_path = build_deployment_base_path(project_slug)
-    targets = find_subpath_audit_targets(repo_dir, strategy)
-    findings: List[SubpathAuditFinding] = []
-    for file_path in targets:
-        findings.extend(scan_subpath_findings(file_path, strategy.get("framework", ""), base_path, repo_dir))
-    return {
-        "framework": strategy.get("framework"),
-        "proxy_mode": strategy.get("proxy_mode"),
-        "scanned_files": [path.relative_to(repo_dir).as_posix() for path in targets],
-        "findings": [
-            {
-                "file": item.file,
-                "line": item.line,
-                "severity": item.severity,
-                "code": item.code,
-                "message": item.message,
-            }
-            for item in findings
-        ],
-        "warnings": [],
-    }
-
-
-def auto_fix_subpath_issues(repo_dir: Path, project_slug: str, strategy: Dict[str, str]) -> List[str]:
-    framework = strategy.get("framework")
-    if framework == "nextjs":
-        return auto_fix_nextjs_subpath_issues(repo_dir, project_slug)
-    if strategy.get("adapter") == "static_rewrite":
-        base_path = build_deployment_base_path(project_slug)
-        changed: List[str] = []
-        for file_path in find_subpath_audit_targets(repo_dir, strategy):
-            if rewrite_frontend_subpath_urls(file_path, base_path, repo_dir):
-                changed.append(file_path.relative_to(repo_dir).as_posix())
-        return sorted_unique(changed)
-    return []
+    return subpath_scan_subpath_findings(
+        file_path,
+        framework,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+        vite_project_roots=vite_project_roots,
+    )
 
 
 def is_nextjs_project(repo_dir: Path) -> bool:
-    package = parse_package_json(repo_dir)
-    dependencies = package.get("dependencies") if isinstance(package.get("dependencies"), dict) else {}
-    dev_dependencies = package.get("devDependencies") if isinstance(package.get("devDependencies"), dict) else {}
-    if "next" in dependencies or "next" in dev_dependencies:
-        return True
-    return any((repo_dir / candidate).exists() for candidate in ("next.config.js", "next.config.mjs", "next.config.ts"))
+    return subpath_is_nextjs_project(repo_dir, parse_package_json=parse_package_json)
 
 
 def is_vite_project(repo_dir: Path) -> bool:
-    return bool(vite_project_roots(repo_dir))
+    return subpath_is_vite_project(repo_dir, vite_project_roots_fn=vite_project_roots)
 
 
 def is_create_react_app_project(repo_dir: Path) -> bool:
-    package = parse_package_json(repo_dir)
-    dependencies = package.get("dependencies") if isinstance(package.get("dependencies"), dict) else {}
-    dev_dependencies = package.get("devDependencies") if isinstance(package.get("devDependencies"), dict) else {}
-    return "react-scripts" in dependencies or "react-scripts" in dev_dependencies
+    return subpath_is_create_react_app_project(repo_dir, parse_package_json=parse_package_json)
 
 
 def is_vue_cli_project(repo_dir: Path) -> bool:
-    package = parse_package_json(repo_dir)
-    dependencies = package.get("dependencies") if isinstance(package.get("dependencies"), dict) else {}
-    dev_dependencies = package.get("devDependencies") if isinstance(package.get("devDependencies"), dict) else {}
-    if "@vue/cli-service" in dependencies or "@vue/cli-service" in dev_dependencies:
-        return True
-    return (repo_dir / "vue.config.js").exists()
+    return subpath_is_vue_cli_project(repo_dir, parse_package_json=parse_package_json)
 
 
 def is_express_static_project(repo_dir: Path) -> bool:
-    package = parse_package_json(repo_dir)
-    package_scripts = package.get("scripts", {}) if isinstance(package.get("scripts"), dict) else {}
-    return bool(detect_node_entry_script_paths(repo_dir, package_scripts) and detect_frontend_runtime_roots(repo_dir))
+    return subpath_is_express_static_project(
+        repo_dir,
+        parse_package_json=parse_package_json,
+        detect_node_entry_script_paths=detect_node_entry_script_paths,
+        detect_frontend_runtime_roots_fn=detect_frontend_runtime_roots,
+    )
 
 
 def is_static_html_project(repo_dir: Path) -> bool:
-    return bool(collect_matching_files(repo_dir, ["*.html", "src/**/*.html", "public/**/*.html", "static/**/*.html", "web/**/*.html"]))
-
-
-def detect_subpath_strategy(repo_dir: Path) -> Dict[str, str]:
-    if is_nextjs_project(repo_dir):
-        return {"framework": "nextjs", "proxy_mode": "preserve_prefix", "adapter": "nextjs"}
-    if is_vite_project(repo_dir):
-        proxy_mode = "strip_prefix" if detect_node_entry_script_paths(repo_dir, parse_package_json(repo_dir).get("scripts", {}) if isinstance(parse_package_json(repo_dir).get("scripts"), dict) else {}) and detect_frontend_runtime_roots(repo_dir) else "preserve_prefix"
-        return {"framework": "vite", "proxy_mode": proxy_mode, "adapter": "vite"}
-    if is_vue_cli_project(repo_dir):
-        return {"framework": "vue_cli", "proxy_mode": "preserve_prefix", "adapter": "vue_cli"}
-    if is_create_react_app_project(repo_dir):
-        return {"framework": "cra", "proxy_mode": "preserve_prefix", "adapter": "cra"}
-    if is_express_static_project(repo_dir):
-        return {"framework": "express_static", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"}
-    if is_static_html_project(repo_dir):
-        return {"framework": "static_html", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"}
-    return {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"}
+    return subpath_is_static_html_project(repo_dir, collect_matching_files=collect_matching_files)
 
 
 def nextjs_entry_file(repo_dir: Path) -> Optional[Path]:
@@ -2951,654 +2977,175 @@ def vite_config_file(repo_dir: Path) -> Optional[Path]:
 
 
 def ensure_vite_base_config(repo_dir: Path, project_slug: str) -> List[str]:
-    config_path = vite_config_file(repo_dir)
-    if config_path is None:
-        return []
-    base_path = f"{build_deployment_base_path(project_slug)}/"
-    original = read_text(config_path)
-    rewritten = original
-    if re.search(r"defineConfig\(\s*\{\s*\}", rewritten):
-        rewritten = re.sub(
-            r"defineConfig\(\s*\{\s*\}",
-            f'defineConfig({{\n  base: "{base_path}",\n}}',
-            rewritten,
-            count=1,
-        )
-    if "base:" not in rewritten:
-        rewritten = re.sub(
-            r"(defineConfig\(\s*\{\n)",
-            rf'\1  base: "{base_path}",' + "\n",
-            rewritten,
-            count=1,
-        )
-        rewritten = re.sub(
-            r"(export\s+default\s+\{\n)",
-            rf'\1  base: "{base_path}",' + "\n",
-            rewritten,
-            count=1,
-        )
-    if rewritten != original:
-        write_text(config_path, rewritten)
-        return [config_path.relative_to(repo_dir).as_posix()]
-    return []
+    return subpath_ensure_vite_base_config(
+        repo_dir,
+        project_slug,
+        vite_config_file=vite_config_file,
+        read_text=read_text,
+        write_text=write_text,
+    )
 
 
 def apply_vite_subpath_adapter(repo_dir: Path, project_slug: str) -> List[str]:
-    changed: List[str] = []
-    changed.extend(ensure_vite_base_config(repo_dir, project_slug))
-    base_path = build_deployment_base_path(project_slug)
-    for file_path in find_frontend_rewrite_targets(repo_dir):
-        if rewrite_frontend_subpath_urls(file_path, base_path, repo_dir):
-            changed.append(file_path.relative_to(repo_dir).as_posix())
-    return sorted_unique(changed)
+    return subpath_apply_vite_subpath_adapter(
+        repo_dir,
+        project_slug,
+        ensure_vite_base_config_fn=ensure_vite_base_config,
+        find_frontend_rewrite_targets=find_frontend_rewrite_targets,
+        rewrite_frontend_subpath_urls=rewrite_frontend_subpath_urls,
+        sorted_unique=sorted_unique,
+    )
 
 
 def ensure_vue_cli_public_path(repo_dir: Path, project_slug: str) -> List[str]:
-    config_path = repo_dir / "vue.config.js"
-    base_path = f"{build_deployment_base_path(project_slug)}/"
-    if not config_path.exists():
-        write_text(config_path, f"module.exports = {{\n  publicPath: '{base_path}',\n}}\n")
-        return [config_path.relative_to(repo_dir).as_posix()]
-    original = read_text(config_path)
-    rewritten = original
-    if re.search(r"module\.exports\s*=\s*\{\s*\}", rewritten):
-        rewritten = re.sub(
-            r"module\.exports\s*=\s*\{\s*\}",
-            f"module.exports = {{\n  publicPath: '{base_path}',\n}}",
-            rewritten,
-            count=1,
-        )
-    if "publicPath:" not in rewritten:
-        rewritten = re.sub(
-            r"(module\.exports\s*=\s*\{\n)",
-            rf"\1  publicPath: '{base_path}'," + "\n",
-            rewritten,
-            count=1,
-        )
-    if rewritten != original:
-        write_text(config_path, rewritten)
-        return [config_path.relative_to(repo_dir).as_posix()]
-    return []
+    return subpath_ensure_vue_cli_public_path(
+        repo_dir,
+        project_slug,
+        read_text=read_text,
+        write_text=write_text,
+    )
 
 
 def ensure_cra_homepage(repo_dir: Path, project_slug: str) -> List[str]:
-    package_path = repo_dir / "package.json"
-    if not package_path.exists():
-        return []
-    package = parse_package_json(repo_dir)
-    desired_homepage = build_deployment_base_path(project_slug)
-    if package.get("homepage") == desired_homepage:
-        return []
-    package["homepage"] = desired_homepage
-    write_text(package_path, json.dumps(package, ensure_ascii=False, indent=2) + "\n")
-    return [package_path.relative_to(repo_dir).as_posix()]
-
-
-def nextjs_runtime_import_path(entry_path: Path, shim_path: Path) -> str:
-    relative = shim_path.relative_to(entry_path.parent).as_posix() if shim_path.parent == entry_path.parent else os.path.relpath(shim_path, entry_path.parent).replace("\\", "/")
-    if relative.endswith(".ts"):
-        relative = relative[:-3]
-    if not relative.startswith("."):
-        relative = f"./{relative}"
-    return relative
-
-
-def ensure_nextjs_runtime_import(entry_path: Path, shim_path: Path) -> bool:
-    original = read_text(entry_path)
-    import_path = nextjs_runtime_import_path(entry_path, shim_path)
-    import_line = f'import "{import_path}"'
-    if import_line in original or f"import '{import_path}'" in original:
-        return False
-    rewritten = f'{import_line}\n{original}'
-    write_text(entry_path, rewritten)
-    return True
-
-
-def remove_nextjs_runtime_import(entry_path: Path) -> bool:
-    original = read_text(entry_path)
-    rewritten = re.sub(
-        rf'^\s*import\s+["\'].*{re.escape(NEXTJS_RUNTIME_SHIM_BASENAME)}["\']\s*;?\s*\n?',
-        "",
-        original,
-        flags=re.MULTILINE,
+    return subpath_ensure_cra_homepage(
+        repo_dir,
+        project_slug,
+        parse_package_json=parse_package_json,
+        write_text=write_text,
     )
-    if rewritten != original:
-        write_text(entry_path, rewritten)
-        return True
-    return False
 
 
 def ensure_nextjs_basepath_config(repo_dir: Path, project_slug: str) -> List[str]:
-    config_path = nextjs_config_file(repo_dir)
-    if config_path is None:
-        return []
-    base_path = build_deployment_base_path(project_slug)
-    original = read_text(config_path)
-    rewritten = original
-    if re.search(r"const\s+nextConfig(?:\s*:\s*NextConfig)?\s*=\s*\{\s*\}", rewritten):
-        rewritten = re.sub(
-            r"const\s+nextConfig(\s*:\s*NextConfig)?\s*=\s*\{\s*\}",
-            f'const nextConfig\\1 = {{\n  basePath: "{base_path}",\n  assetPrefix: "{base_path}",\n}}',
-            rewritten,
-            count=1,
-        )
-    if "basePath:" not in rewritten:
-        rewritten = re.sub(
-            r"(const\s+nextConfig\s*:\s*NextConfig\s*=\s*\{\n)",
-            rf'\1  basePath: "{base_path}",' + "\n",
-            rewritten,
-            count=1,
-        )
-        rewritten = re.sub(
-            r"(const\s+nextConfig\s*=\s*\{\n)",
-            rf'\1  basePath: "{base_path}",' + "\n",
-            rewritten,
-            count=1,
-        )
-    if "assetPrefix:" not in rewritten:
-        rewritten = re.sub(
-            r"(const\s+nextConfig\s*:\s*NextConfig\s*=\s*\{\n)",
-            rf'\1  assetPrefix: "{base_path}",' + "\n",
-            rewritten,
-            count=1,
-        )
-        rewritten = re.sub(
-            r"(const\s+nextConfig\s*=\s*\{\n)",
-            rf'\1  assetPrefix: "{base_path}",' + "\n",
-            rewritten,
-            count=1,
-        )
-    if rewritten != original:
-        write_text(config_path, rewritten)
-        return [config_path.relative_to(repo_dir).as_posix()]
-    return []
-
-
-def rewrite_nextjs_source_calls(file_path: Path, repo_dir: Path) -> bool:
-    return False
+    return subpath_ensure_nextjs_basepath_config(
+        repo_dir,
+        project_slug,
+        nextjs_config_file=nextjs_config_file,
+        read_text=read_text,
+        write_text=write_text,
+    )
 
 
 def ensure_next_link_import(text: str) -> str:
-    if re.search(r"""^\s*import\s+Link\s+from\s+['"]next/link['"]\s*$""", text, flags=re.MULTILINE):
-        return text
-    return insert_import_after_directives(text, 'import Link from "next/link"')
-
-
-def ensure_with_tool_base_import(text: str, entry_path: Path, helper_path: Path) -> str:
-    import_path = nextjs_runtime_import_path(entry_path, helper_path)
-    import_line = f'import {{ withToolBase }} from "{import_path}"'
-    if import_line in text or f"import {{ withToolBase }} from '{import_path}'" in text:
-        return text
-    return insert_import_after_directives(text, import_line)
+    return subpath_ensure_next_link_import(text)
 
 
 def insert_import_after_directives(text: str, import_line: str) -> str:
-    lines = text.splitlines(keepends=True)
-    insert_at = 0
-    directive_pattern = re.compile(r'^\s*["\']use (client|server)["\']\s*;?\s*$')
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if directive_pattern.match(stripped):
-            insert_at = index + 1
-            continue
-        break
-    lines.insert(insert_at, f"{import_line}\n")
-    return "".join(lines)
-
-
-def rewrite_nextjs_jsx_anchor_hrefs(text: str) -> str:
-    rewritten = text
-    anchor_pattern = re.compile(
-        r'<a(?P<attrs>\s+[^>]*?\bhref\s*=\s*(?P<quote>["\'])(?P<href>/[^"\']*)(?P=quote)[^>]*)>(?P<body>.*?)</a>',
-        re.DOTALL,
-    )
-
-    def replace_anchor(match: re.Match[str]) -> str:
-        attrs = match.group("attrs")
-        href = match.group("href")
-        body = match.group("body")
-        rewritten_attrs = re.sub(
-            r'\bhref\s*=\s*(["\'])/[^"\']*(\1)',
-            f'href="{href}"',
-            attrs,
-            count=1,
-        )
-        return f"<Link{rewritten_attrs}>{body}</Link>"
-
-    rewritten = anchor_pattern.sub(replace_anchor, rewritten)
-    return rewritten
-
-
-def rewrite_nextjs_fetch_calls(text: str) -> str:
-    rewritten = text
-    rewritten = re.sub(
-        r'fetch\(\s*(["\'`])(/[^"\'`]*)(\1)\s*\)',
-        r'fetch(withToolBase("\2"))',
-        rewritten,
-    )
-    rewritten = re.sub(
-        r'fetch\(\s*(["\'`])(/[^"\'`]*)(\1)\s*,',
-        r'fetch(withToolBase("\2"),',
-        rewritten,
-    )
-    rewritten = re.sub(
-        r'axios\.(get|post|put|delete|patch)\(\s*(["\'`])(/[^"\'`]*)(\2)',
-        r'axios.\1(withToolBase("\3")',
-        rewritten,
-    )
-    rewritten = re.sub(
-        r'url:\s*(["\'`])(/[^"\'`]*)(\1)',
-        r'url: withToolBase("\2")',
-        rewritten,
-    )
-    return rewritten
+    return subpath_insert_import_after_directives(text, import_line)
 
 
 def ensure_nextjs_helper_module(entry_path: Path, repo_dir: Path, project_slug: str) -> List[str]:
-    shim_path = repo_dir / f"{NEXTJS_RUNTIME_SHIM_BASENAME}.ts"
-    base_path = build_deployment_base_path(project_slug)
-    shim_text = (
-        f'  const basePath = "{base_path}"\n'
-        "\n"
-        "export function withToolBase(path: string): string {\n"
-        "    if (!path) return path\n"
-        "    if (/^(https?:)?\\/\\//.test(path)) return path\n"
-        "    if (path === basePath || path.startsWith(`${basePath}/`)) return path\n"
-        "    if (path.startsWith('/')) return `${basePath}${path}`\n"
-        "    return `${basePath}/${path.replace(/^\\/+/, '')}`\n"
-        "}\n"
+    return subpath_ensure_nextjs_helper_module(
+        entry_path,
+        repo_dir,
+        project_slug,
+        read_text_if_exists=read_text_if_exists,
+        write_text=write_text,
     )
-    changed: List[str] = []
-    original_shim = read_text_if_exists(shim_path)
-    if original_shim != shim_text:
-        write_text(shim_path, shim_text)
-        changed.append(shim_path.relative_to(repo_dir).as_posix())
-    return changed
 
 
 def auto_fix_nextjs_subpath_issues(repo_dir: Path, project_slug: str) -> List[str]:
-    changed: List[str] = []
-    entry_path = nextjs_entry_file(repo_dir)
-    if entry_path is not None:
-        helper_changes = ensure_nextjs_helper_module(entry_path, repo_dir, project_slug)
-        changed.extend(helper_changes)
-    source_patterns = [
-        "src/**/*.ts",
-        "src/**/*.tsx",
-        "src/**/*.jsx",
-        "src/**/*.js",
-        "pages/**/*.ts",
-        "pages/**/*.tsx",
-        "pages/**/*.jsx",
-        "pages/**/*.js",
-        "app/**/*.ts",
-        "app/**/*.tsx",
-        "app/**/*.jsx",
-        "app/**/*.js",
-        "components/**/*.ts",
-        "components/**/*.tsx",
-        "components/**/*.jsx",
-        "components/**/*.js",
-    ]
-    helper_path = repo_dir / f"{NEXTJS_RUNTIME_SHIM_BASENAME}.ts"
-    for file_path in collect_matching_files(repo_dir, source_patterns):
-        original = read_text(file_path)
-        rewritten = original
-        if re.search(r'<a\b[^>]*\bhref\s*=\s*(["\'])/[^"\']*\1', rewritten):
-            rewritten = ensure_next_link_import(rewritten)
-            rewritten = rewrite_nextjs_jsx_anchor_hrefs(rewritten)
-        request_rewritten = rewrite_nextjs_fetch_calls(rewritten)
-        if request_rewritten != rewritten:
-            rewritten = ensure_with_tool_base_import(request_rewritten, file_path, helper_path)
-        else:
-            rewritten = request_rewritten
-        if rewritten != original:
-            write_text(file_path, rewritten)
-            changed.append(file_path.relative_to(repo_dir).as_posix())
-    return sorted_unique(changed)
+    return subpath_auto_fix_nextjs_subpath_issues(
+        repo_dir,
+        project_slug,
+        nextjs_entry_file=nextjs_entry_file,
+        collect_matching_files=collect_matching_files,
+        read_text=read_text,
+        read_text_if_exists=read_text_if_exists,
+        write_text=write_text,
+        sorted_unique=sorted_unique,
+    )
 
 
 def apply_nextjs_subpath_adapter(repo_dir: Path, project_slug: str) -> List[str]:
-    changed: List[str] = []
-    changed.extend(ensure_nextjs_basepath_config(repo_dir, project_slug))
-    legacy_types = repo_dir / f"{NEXTJS_WINDOW_TYPES_BASENAME}.d.ts"
-    if legacy_types.exists():
-        legacy_types.unlink()
-        changed.append(legacy_types.relative_to(repo_dir).as_posix())
-    changed.extend(auto_fix_nextjs_subpath_issues(repo_dir, project_slug))
-    return sorted_unique(changed)
-
-
-def inject_tool_base_runtime(text: str, base_path: str) -> str:
-    marker = f'window.__TOOL_BASE_PATH__ = "{base_path}";'
-    if marker in text:
-        return text
-    script = (
-        "<script>\n"
-        f'window.__TOOL_BASE_PATH__ = "{base_path}";\n'
-        'window.__TOOL_ORIGIN_URL__ = window.__TOOL_BASE_PATH__ ? (window.location.origin + window.__TOOL_BASE_PATH__) : window.location.origin;\n'
-        "window.withToolBase = function(path) {\n"
-        "  if (!path) return path;\n"
-        "  var base = window.__TOOL_BASE_PATH__ || \"\";\n"
-        "  if (!base) return path;\n"
-        "  if (/^(https?:)?\\/\\//.test(path)) return path;\n"
-        "  if (path.startsWith(base + \"/\") || path === base) return path;\n"
-        "  if (path.startsWith(\"/\")) return base + path;\n"
-        "  return base + \"/\" + path.replace(/^\\/+/, \"\");\n"
-        "};\n"
-        "</script>\n"
+    return subpath_apply_nextjs_subpath_adapter(
+        repo_dir,
+        project_slug,
+        ensure_nextjs_basepath_config_fn=ensure_nextjs_basepath_config,
+        auto_fix_nextjs_subpath_issues_fn=auto_fix_nextjs_subpath_issues,
     )
-    if "</head>" in text:
-        return text.replace("<script>", f"{script}<script>", 1) if "<script>" in text else text.replace("</head>", f"{script}</head>", 1)
-    return script + text
 
 
 def frontend_runtime_root(repo_dir: Path, file_path: Path, runtime_roots: Optional[List[Path]] = None) -> Path:
-    if runtime_roots:
-        file_resolved = file_path.resolve()
-        matching_roots = []
-        for root in runtime_roots:
-            try:
-                file_resolved.relative_to(root)
-            except ValueError:
-                continue
-            matching_roots.append(root)
-        if matching_roots:
-            return max(matching_roots, key=lambda path: len(path.parts))
-
-    relative = file_path.relative_to(repo_dir)
-    parts = relative.parts
-    if not parts:
-        return repo_dir
-    for anchor in ("src", "static", "public", "client", "web"):
-        if anchor in parts:
-            return repo_dir / anchor
-    return repo_dir
-
-
-def split_url_suffix(url: str) -> Tuple[str, str]:
-    match = re.match(r"^([^?#]*)(.*)$", url)
-    if not match:
-        return url, ""
-    return match.group(1), match.group(2)
-
-
-def looks_like_templated_value(value: str) -> bool:
-    return any(token in value for token in ("{{", "}}", "<%", "%>", "${"))
-
-
-def should_rewrite_relative_html_asset(raw_url: str) -> bool:
-    asset_path, _suffix = split_url_suffix(raw_url.strip())
-    if not asset_path:
-        return False
-    lowered = asset_path.lower()
-    if asset_path.startswith(("/", "#")):
-        return False
-    if re.match(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?//", asset_path):
-        return False
-    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", asset_path):
-        return False
-    if looks_like_templated_value(asset_path):
-        return False
-    suffix = Path(asset_path).suffix.lower()
-    return suffix in HTML_RELATIVE_ASSET_EXTENSIONS
-
-
-def should_prefix_root_relative_html_url(attr: str, raw_url: str, file_path: Path, repo_dir: Path) -> bool:
-    asset_path, _suffix = split_url_suffix(raw_url.strip())
-    if not asset_path.startswith("/"):
-        return False
-    if asset_path.startswith("//") or looks_like_templated_value(asset_path):
-        return False
-    lowered = asset_path.lower()
-    if lowered.startswith(("mailto:", "tel:", "data:", "javascript:")):
-        return False
-    if attr == "src" and asset_path.startswith("/src/") and file_path.name == "index.html":
-        for project_root in vite_project_roots(repo_dir):
-            try:
-                file_path.resolve().relative_to(project_root)
-            except ValueError:
-                continue
-            return False
-    return True
-
-
-def resolve_repo_relative_asset_url(
-    repo_dir: Path,
-    file_path: Path,
-    raw_url: str,
-    runtime_roots: Optional[List[Path]] = None,
-) -> Optional[str]:
-    if not should_rewrite_relative_html_asset(raw_url):
-        return None
-    asset_path, suffix = split_url_suffix(raw_url.strip())
-    content_root = frontend_runtime_root(repo_dir, file_path, runtime_roots)
-    candidate = (file_path.parent / asset_path).resolve()
-    try:
-        candidate.relative_to(content_root.resolve())
-    except ValueError:
-        return None
-    if not candidate.is_file():
-        return None
-    relative_to_root = candidate.relative_to(content_root.resolve()).as_posix()
-    return f"/{relative_to_root}{suffix}"
-
-
-def rewrite_html_relative_asset_urls(
-    text: str,
-    repo_dir: Path,
-    file_path: Path,
-    runtime_roots: Optional[List[Path]] = None,
-) -> str:
-    attr_pattern = re.compile(r'(?P<prefix>\b(?:src|href)=["\'])(?P<url>[^"\']+)(?P<suffix>["\'])')
-
-    def replace_attr(match: re.Match[str]) -> str:
-        original_url = match.group("url")
-        rewritten_url = resolve_repo_relative_asset_url(repo_dir, file_path, original_url, runtime_roots)
-        if rewritten_url is None:
-            return match.group(0)
-        return f'{match.group("prefix")}{rewritten_url}{match.group("suffix")}'
-
-    return attr_pattern.sub(replace_attr, text)
+    return subpath_frontend_runtime_root(repo_dir, file_path, runtime_roots)
 
 
 def rewrite_origin_based_subpath_logic(text: str) -> str:
-    rewritten = text
-    rewritten = re.sub(
-        r'((?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*ORIGIN[A-Za-z0-9_$]*\s*=\s*)(?!window\.__TOOL_ORIGIN_URL__ \|\| )([^;]+);',
-        r'\1(window.__TOOL_ORIGIN_URL__ || (\2));',
-        rewritten,
-    )
-    rewritten = rewritten.replace(
-        "return origin;",
-        "return window.__TOOL_ORIGIN_URL__ || origin;",
-    )
-    rewritten = rewritten.replace(
-        "${origin}",
-        "${window.__TOOL_ORIGIN_URL__ || origin}",
-    )
-    rewritten = rewritten.replace(
-        "${window.location.origin}",
-        "${window.__TOOL_ORIGIN_URL__ || window.location.origin}",
-    )
-    rewritten = rewritten.replace(
-        'window.location.href = SETUP_PAGE_URL;',
-        'window.location.href = (Reflect.get(window, "withToolBase")?.(SETUP_PAGE_URL) ?? SETUP_PAGE_URL);',
-    )
-    rewritten = rewritten.replace(
-        "window.location.href = $(e.target).attr('data-href');",
-        "window.location.href = (Reflect.get(window, \"withToolBase\")?.($(e.target).attr('data-href')) ?? $(e.target).attr('data-href'));",
-    )
-    rewritten = rewritten.replace(
-        "window.location.href = href;",
-        "window.location.href = (Reflect.get(window, \"withToolBase\")?.(href) ?? href);",
-    )
-    rewritten = rewritten.replace(
-        'window.location.href = target;',
-        'window.location.href = (Reflect.get(window, "withToolBase")?.(target) ?? target);',
-    )
-    rewritten = rewritten.replace(
-        'window.location.href = url;',
-        'window.location.href = (Reflect.get(window, "withToolBase")?.(url) ?? url);',
-    )
-    return rewritten
-
-
-def wrap_runtime_tool_base_expr(path_expr: str) -> str:
-    return f'(Reflect.get(window, "withToolBase")?.({path_expr}) ?? {path_expr})'
-
-
-def rewrite_vite_fetch_template_calls(text: str) -> str:
-    rewritten = text
-    rewritten = re.sub(
-        r'fetch\(\s*`/(?P<path>[^`$][^`]*)`\s*\)',
-        lambda match: f"fetch({wrap_runtime_tool_base_expr('`/' + match.group('path') + '`')})",
-        rewritten,
-    )
-    rewritten = re.sub(
-        r'fetch\(\s*`/(?P<prefix>[^`]*\$\{[^`]+\}[^`]*)`\s*\)',
-        lambda match: f"fetch({wrap_runtime_tool_base_expr('`/' + match.group('prefix') + '`')})",
-        rewritten,
-    )
-    rewritten = re.sub(
-        r'fetch\(\s*`/(?P<prefix>[^`]*\$\{[^`]+\}[^`]*)`\s*,',
-        lambda match: f"fetch({wrap_runtime_tool_base_expr('`/' + match.group('prefix') + '`')},",
-        rewritten,
-    )
-    rewritten = re.sub(
-        r'new\s+EventSource\(\s*`/(?P<prefix>[^`]*\$\{[^`]+\}[^`]*)`\s*\)',
-        lambda match: f"new EventSource({wrap_runtime_tool_base_expr('`/' + match.group('prefix') + '`')})",
-        rewritten,
-    )
-    return rewritten
+    return subpath_rewrite_origin_based_subpath_logic(text)
 
 
 def rewrite_frontend_subpath_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
-    original = read_text(file_path)
-    rewritten = original
-    runtime_roots = detect_frontend_runtime_roots(repo_dir)
-    if file_path.suffix in {".html", ".js", ".mjs", ".ts", ".tsx", ".jsx"}:
-        # Make rewrites idempotent before applying any new replacements.
-        rewritten = re.sub(
-            r'window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)',
-            r'window.withToolBase(\1)',
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'(?<!\.)withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)',
-            r'withToolBase(\1)',
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'fetch\(\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)\s*\)',
-            r'fetch(window.withToolBase(\1))',
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'url:\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)',
-            r'url: window.withToolBase(\1)',
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'axios\.(get|post|put|delete|patch)\(\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)',
-            r'axios.\1(window.withToolBase(\2)',
-            rewritten,
-        )
-        # Direct request calls using absolute root paths.
-        rewritten = re.sub(
-            r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*\)',
-            lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))})",
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*,',
-            lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))},",
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'axios\.(get|post|put|delete|patch)\(\s*(["\'`]/[^"\'`]*["\'`])',
-            lambda match: f"axios.{match.group(1)}({wrap_runtime_tool_base_expr(match.group(2))}",
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'uploadWithProgress\(\s*(["\'`]/[^"\'`]*["\'`])',
-            lambda match: f"uploadWithProgress({wrap_runtime_tool_base_expr(match.group(1))}",
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'new\s+EventSource\(\s*(["\'`]/[^"\'`]*["\'`])\s*\)',
-            lambda match: f"new EventSource({wrap_runtime_tool_base_expr(match.group(1))})",
-            rewritten,
-        )
-        # Request-target assignments that are later fed into fetch/axios.
-        rewritten = re.sub(
-            r'(\b(?:endpoint|url|path|apiPath|requestPath)\s*=\s*)(["\'`]/[^"\'`]*["\'`])',
-            lambda match: f"{match.group(1)}{wrap_runtime_tool_base_expr(match.group(2))}",
-            rewritten,
-        )
-        # Object field request urls.
-        rewritten = re.sub(
-            r'url:\s*(["\'`]/[^"\'`]*["\'`])',
-            lambda match: f"url: {wrap_runtime_tool_base_expr(match.group(1))}",
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'(?<!window\.withToolBase\()(["\'`])/static-preview\1',
-            wrap_runtime_tool_base_expr('"/static-preview"'),
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'\breturn\s+(["\'`]/[^"\'`]*["\'`])',
-            lambda match: f"return {wrap_runtime_tool_base_expr(match.group(1))}",
-            rewritten,
-        )
-        rewritten = re.sub(
-            r'\breturn\s+(`\/[^`]*\$\{[^`]+\}[^`]*`)',
-            lambda match: f"return {wrap_runtime_tool_base_expr(match.group(1))}",
-            rewritten,
-        )
-        rewritten = rewrite_vite_fetch_template_calls(rewritten)
-        rewritten = rewrite_origin_based_subpath_logic(rewritten)
-        if file_path.suffix == ".html":
-            rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
-            html_attr_pattern = re.compile(r'(?P<attr>src|href|action)=["\'](?P<url>/(?!/)[^"\']*)["\']')
-
-            def replace_root_relative_attr(match: re.Match[str]) -> str:
-                attr = match.group("attr")
-                url = match.group("url")
-                if not should_prefix_root_relative_html_url(attr, url, file_path, repo_dir):
-                    return match.group(0)
-                return f'{attr}="{base_path}{url}"'
-
-            rewritten = html_attr_pattern.sub(replace_root_relative_attr, rewritten)
-            rewritten = inject_tool_base_runtime(rewritten, base_path)
-    if rewritten != original:
-        write_text(file_path, rewritten)
-        return True
-    return False
+    return subpath_rewrite_frontend_subpath_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+        detect_frontend_runtime_root_groups=detect_frontend_runtime_root_groups,
+        vite_project_roots=vite_project_roots,
+    )
 
 
-def apply_subpath_rewrites(repo_dir: Path, project_slug: Optional[str]) -> List[str]:
-    if not isinstance(project_slug, str) or not project_slug.strip():
-        return []
-    strategy = detect_subpath_strategy(repo_dir)
-    adapter = strategy["adapter"]
-    if adapter == "nextjs":
-        return apply_nextjs_subpath_adapter(repo_dir, project_slug)
-    if adapter == "vite":
-        return apply_vite_subpath_adapter(repo_dir, project_slug)
-    if adapter == "vue_cli":
-        return ensure_vue_cli_public_path(repo_dir, project_slug)
-    if adapter == "cra":
-        return ensure_cra_homepage(repo_dir, project_slug)
-    base_path = build_deployment_base_path(project_slug)
-    changed: List[str] = []
-    for file_path in find_frontend_rewrite_targets(repo_dir):
-        if rewrite_frontend_subpath_urls(file_path, base_path, repo_dir):
-            changed.append(file_path.relative_to(repo_dir).as_posix())
-    return changed
+def rewrite_frontend_html_attribute_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
+    return subpath_rewrite_frontend_html_attribute_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+        detect_frontend_runtime_root_groups=detect_frontend_runtime_root_groups,
+        vite_project_roots=vite_project_roots,
+    )
+
+
+def rewrite_frontend_html_link_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
+    return subpath_rewrite_frontend_html_link_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+        detect_frontend_runtime_root_groups=detect_frontend_runtime_root_groups,
+        vite_project_roots=vite_project_roots,
+    )
+
+
+def rewrite_frontend_html_script_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
+    return subpath_rewrite_frontend_html_script_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+        detect_frontend_runtime_root_groups=detect_frontend_runtime_root_groups,
+        vite_project_roots=vite_project_roots,
+    )
+
+
+def rewrite_frontend_html_form_action_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
+    return subpath_rewrite_frontend_html_form_action_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+        detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+        detect_frontend_runtime_root_groups=detect_frontend_runtime_root_groups,
+        vite_project_roots=vite_project_roots,
+    )
+
+
+def rewrite_frontend_client_request_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
+    return subpath_rewrite_frontend_client_request_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+    )
 
 
 def render_nginx_add_conf(project_slug: str, host_port: int, proxy_mode: str = "strip_prefix") -> str:
@@ -3703,6 +3250,10 @@ def prepare_shared_repo(
         staging_dir = shared_repo_dir.parent / f"{shared_repo_dir.name}.tmp-{utc_now_stamp()}"
         remove_path(staging_dir)
         clone_git_source(source, ref, staging_dir, fetch_log_path, None)
+        for generated_name in ("Dockerfile", "PROJECT_ONBOARDING.md"):
+            generated_path = staging_dir / generated_name
+            if generated_path.exists() and not is_git_tracked_file(staging_dir, generated_path):
+                remove_path(generated_path)
         remove_path(shared_repo_dir)
         staging_dir.replace(shared_repo_dir)
 
@@ -3727,10 +3278,18 @@ def sync_generated_outputs_to_shared_repo(source_repo_dir: Path, shared_repo_dir
     return synced
 
 
-def determine_generation_mode(existing_dockerfile: bool, existing_onboarding: bool) -> Tuple[bool, str]:
-    if existing_dockerfile and existing_onboarding:
+def determine_generation_mode(
+    existing_dockerfile: bool,
+    existing_onboarding: bool,
+    *,
+    existing_dockerfile_tracked: bool = True,
+    existing_onboarding_tracked: bool = True,
+) -> Tuple[bool, str]:
+    reusable_dockerfile = existing_dockerfile and existing_dockerfile_tracked
+    reusable_onboarding = existing_onboarding and existing_onboarding_tracked
+    if reusable_dockerfile and reusable_onboarding:
         return True, "both"
-    if existing_dockerfile and not existing_onboarding:
+    if reusable_dockerfile and not reusable_onboarding:
         return False, "onboarding_only"
     return False, "both"
 
@@ -3744,6 +3303,10 @@ def build_runtime_rules(analysis: Dict[str, object]) -> str:
     port = analysis["detected_port"]
     has_nextjs_ts_config = bool(analysis.get("has_nextjs_ts_config"))
     package_manager = analysis.get("package_manager")
+    required_build_commands = analysis.get("required_build_commands", [])
+    build_command_candidates = analysis.get("build_command_candidates", [])
+    requires_build_step = bool(analysis.get("requires_build_step"))
+    runtime_build_artifact_paths = analysis.get("runtime_build_artifact_paths", [])
     local_official_images = list_local_official_docker_images()
 
     runtime_rules: List[str] = [
@@ -3784,6 +3347,20 @@ def build_runtime_rules(analysis: Dict[str, object]) -> str:
             )
         if node_entry_command:
             runtime_rules.append(f'- 当前优先入口命令候选是 `{node_entry_command}`')
+        if isinstance(required_build_commands, list) and required_build_commands:
+            runtime_rules.append(
+                f'- 当前最低必需构建命令是：`{"`, `".join(str(item) for item in required_build_commands)}`'
+            )
+        if isinstance(build_command_candidates, list) and build_command_candidates:
+            runtime_rules.append(f'- 当前可直接采用的构建命令候选是：`{"`, `".join(str(item) for item in build_command_candidates)}`')
+        if isinstance(required_build_commands, list) and required_build_commands:
+            runtime_rules.append("- 对 workspace / monorepo，只执行生成运行时必需产物的最小构建集合；不要为了保险把所有候选 build 命令都用 `&&` 串起来全部执行，除非已有直接证据证明它们都必需")
+        if requires_build_step:
+            runtime_rules.append("- 当前项目运行时依赖预构建产物，Dockerfile 必须包含明确的应用构建步骤，不能只安装依赖后直接启动")
+        if isinstance(runtime_build_artifact_paths, list) and runtime_build_artifact_paths:
+            runtime_rules.append(
+                f'- 已识别到运行时依赖这些构建产物路径：`{"`, `".join(str(item) for item in runtime_build_artifact_paths)}`；必须确保这些路径在容器启动前已生成'
+            )
         if has_nextjs_ts_config:
             runtime_rules.extend(
                 [
@@ -3825,6 +3402,28 @@ def build_source_context_rules(source_type: str, source: str, ref: Optional[str]
     return "\n".join(source_context_rules)
 
 
+def build_validation_feedback_block(findings: List[str], warnings: Optional[List[str]] = None) -> str:
+    lines = [
+        "## 上一次生成未通过校验",
+        "",
+        "你必须修复以下问题后再输出最终文件：",
+    ]
+    for item in findings:
+        lines.append(f"- {item}")
+    warning_items = [item for item in (warnings or []) if item]
+    if warning_items:
+        lines.extend(["", "同时尽量消除这些告警："])
+        for item in warning_items:
+            lines.append(f"- {item}")
+    lines.extend(
+        [
+            "",
+            "不要解释原因，不要输出 diff；直接修改仓库中的目标文件，使其通过这些校验。",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def read_prompt_template() -> str:
     content = read_text(GENERATION_RULES_PATH)
     marker = "<!-- PROMPT_BODY_START -->"
@@ -3839,6 +3438,8 @@ def build_codex_prompt(
     ref: Optional[str],
     repo_dir: Path,
     generation_mode: str = "both",
+    validation_findings: Optional[List[str]] = None,
+    validation_warnings: Optional[List[str]] = None,
 ) -> str:
     analysis = collect_repo_analysis(repo_dir, source_type, source, ref)
     template = read_prompt_template()
@@ -3855,7 +3456,10 @@ def build_codex_prompt(
     prompt = template
     for placeholder, value in replacements.items():
         prompt = prompt.replace(placeholder, value)
-    return prompt.strip()
+    feedback_block = ""
+    if validation_findings:
+        feedback_block = "\n\n" + build_validation_feedback_block(validation_findings, validation_warnings)
+    return (prompt.strip() + feedback_block).strip()
 
 
 def diagnose_codex_failure(output: str) -> Optional[str]:
@@ -3910,11 +3514,21 @@ def invoke_codex_generation(
     source: str,
     ref: Optional[str],
     generation_mode: str = "both",
+    validation_findings: Optional[List[str]] = None,
+    validation_warnings: Optional[List[str]] = None,
     runner_log_path: Optional[Path] = None,
 ) -> None:
     if not command_exists("codex"):
         raise RuntimeError("codex CLI not found in PATH")
-    prompt = build_codex_prompt(source_type, source, ref, repo_dir, generation_mode)
+    prompt = build_codex_prompt(
+        source_type,
+        source,
+        ref,
+        repo_dir,
+        generation_mode,
+        validation_findings=validation_findings,
+        validation_warnings=validation_warnings,
+    )
     env = dict(os.environ)
     env["CODEX_HOME"] = str(codex_home)
     args = [
@@ -3988,12 +3602,16 @@ def validate_generated_files(
     if "CMD [" not in docker_text and "ENTRYPOINT [" not in docker_text:
         dockerfile_findings.append("Dockerfile is missing JSON-form CMD or ENTRYPOINT")
     dockerfile_findings.extend(validate_multistage_copy_sources(repo_dir, docker_text))
+    if re.search(r"^\s*EXPOSE\s+UNKNOWN\b", docker_text, re.MULTILINE):
+        dockerfile_findings.append("Dockerfile uses UNKNOWN in EXPOSE for a runtime-critical port; omit EXPOSE when the port is not confirmed")
+    if re.search(r"^\s*ENV\s+PORT\s*=\s*UNKNOWN\b", docker_text, re.MULTILINE):
+        dockerfile_findings.append("Dockerfile sets PORT=UNKNOWN; omit the PORT default until a concrete port is confirmed")
     if not re.search(r"^##?\s*4[.\s]+运行参数\b", onboarding_text, re.MULTILINE):
         findings.append("PROJECT_ONBOARDING.md is missing section 4")
-    if re.search(r"\b(TODO|UNKNOWN|NEEDS_CONFIRMATION)\b", onboarding_text):
+    if re.search(r"\b(TODO|UNKNOWN)\b", onboarding_text):
         warnings.append("PROJECT_ONBOARDING.md still contains unresolved confirmation items")
-    if re.search(r"\b(TODO|UNKNOWN|NEEDS_CONFIRMATION)\b", docker_text):
-        warnings.append("Dockerfile contains TODO/UNKNOWN/NEEDS_CONFIRMATION markers")
+    if re.search(r"\b(TODO|UNKNOWN)\b", docker_text):
+        warnings.append("Dockerfile contains TODO/UNKNOWN markers")
 
     if analysis:
         package_scripts = analysis.get("package_scripts", [])
@@ -4003,11 +3621,14 @@ def validate_generated_files(
         has_build_step = dockerfile_has_build_step(docker_text)
         package_manager = analysis.get("package_manager")
         has_nextjs_ts_config = bool(analysis.get("has_nextjs_ts_config"))
+        requires_build_step = bool(analysis.get("requires_build_step"))
 
-        if "build" in package_scripts:
+        if requires_build_step and "build" in package_scripts:
             if not has_build_step:
                 dockerfile_findings.append("Dockerfile is missing an application build step even though package.json.scripts.build exists")
-        if isinstance(node_entry_command, str) and "dist/" in node_entry_command and not has_build_step:
+        if requires_build_step and not has_build_step:
+            dockerfile_findings.append("Dockerfile start command appears to require built artifacts, but no build step was detected")
+        elif isinstance(node_entry_command, str) and "dist/" in node_entry_command and not has_build_step:
             dockerfile_findings.append("Dockerfile start command appears to require built artifacts, but no build step was detected")
         if package_manager == "pnpm" and "pnpm" in docker_text and "corepack enable" not in docker_text and "pnpm install" not in docker_text:
             warnings.append("Dockerfile references pnpm but does not clearly enable or install pnpm in the image")
@@ -4065,7 +3686,7 @@ def parse_onboarding_run_spec(onboarding_path: Path) -> Dict[str, object]:
         "persistence_paths": [],
         "health_path_hint": "/",
     }
-    ignored_tokens = {"UNKNOWN", "NEEDS_CONFIRMATION", "TBD", "EXPOSE"}
+    ignored_tokens = {"UNKNOWN", "NEEDS_CONFIRMATION", "TBD", "EXPOSE", "NONE"}
     spec["environment_variables"] = sorted_unique(
         token
         for token in re.findall(r"`([A-Z][A-Z0-9_]+)`", text)
@@ -4084,7 +3705,7 @@ def parse_onboarding_run_spec(onboarding_path: Path) -> Dict[str, object]:
     for value in persistence_matches:
         for item in re.split(r"[，,]", value):
             normalized = item.strip()
-            if normalized and normalized not in {"UNKNOWN", "NEEDS_CONFIRMATION", "TBD - 由管理员构建"}:
+            if normalized and normalized not in {"UNKNOWN", "NEEDS_CONFIRMATION", "TBD - 由管理员构建", "NONE"}:
                 persistence_paths.append(normalized)
     spec["persistence_paths"] = sorted_unique(persistence_paths)
     health_match = re.search(r"health[^`\s]*[:：]?\s*`?(/[^`\s]*)`?", text, re.IGNORECASE)
@@ -4106,25 +3727,6 @@ def derive_runtime_env_vars(
     if isinstance(env_file_hint, str) and env_file_hint:
         env_args.extend(["--env-file", env_file_hint])
     return env_args
-
-
-def normalize_runtime_mount_specs(
-    persistence_paths: Optional[List[str]],
-    runtime_data_dir: Optional[Path],
-) -> List[Tuple[Path, str]]:
-    if not persistence_paths or runtime_data_dir is None:
-        return []
-    ensure_dir(runtime_data_dir)
-    mounts: List[Tuple[Path, str]] = []
-    for path_value in persistence_paths:
-        normalized = path_value.strip()
-        if not normalized:
-            continue
-        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", normalized.strip("/")) or "data"
-        host_mount = runtime_data_dir / safe_name
-        ensure_dir(host_mount)
-        mounts.append((host_mount, normalized.rstrip("/")))
-    return mounts
 
 
 def inspect_image_id(image_name: str, repo_dir: Path, podman_env: Dict[str, str]) -> Optional[str]:
@@ -4188,10 +3790,11 @@ def merge_run_spec(
 ) -> Dict[str, object]:
     mapped_host_port: Optional[int] = None
     mapped_container_port: Optional[int] = None
-    mapping = load_project_ports_map()
+    port_configs = load_project_port_configs()
     runtime_overrides = load_project_runtime_overrides(project_slug)
-    if project_slug in mapping:
-        host_text, container_text = mapping[project_slug].split(":", 1)
+    project_port_config = port_configs.get(project_slug)
+    if isinstance(project_port_config, dict) and is_valid_port_mapping(project_port_config.get("port")):
+        host_text, container_text = str(project_port_config["port"]).split(":", 1)
         mapped_host_port = int(host_text)
         mapped_container_port = int(container_text)
 
@@ -4266,9 +3869,7 @@ def run_container(
     log_path: Path,
     podman_env: Dict[str, str],
     env_args: Optional[List[str]] = None,
-    persistence_paths: Optional[List[str]] = None,
     extra_volume_args: Optional[List[str]] = None,
-    runtime_data_dir: Optional[Path] = None,
     runner_log_path: Optional[Path] = None,
 ) -> CommandResult:
     args = [
@@ -4286,8 +3887,6 @@ def run_container(
     if extra_volume_args:
         for volume_arg in extra_volume_args:
             args.extend(["-v", volume_arg])
-    for host_mount, container_mount in normalize_runtime_mount_specs(persistence_paths, runtime_data_dir):
-        args.extend(["-v", f"{host_mount}:{container_mount}"])
     args.append(image_name)
     return run_command(
         build_podman_command(args, podman_env),
@@ -4391,157 +3990,22 @@ def fetch_http_text(
     raise RuntimeError(f"too many redirects while requesting {path}")
 
 
-def normalize_runtime_url_path(url: str, current_path: str, *, base_origin: Optional[str] = None) -> Optional[str]:
-    stripped = url.strip()
-    if not stripped or stripped.startswith(("#", "mailto:", "tel:", "data:", "javascript:")):
-        return None
-    if stripped.startswith("//"):
-        parsed = urlparse(f"http:{stripped}")
-        if base_origin:
-            base_host = urlparse(base_origin).netloc.lower()
-            if parsed.netloc and parsed.netloc.lower() != base_host:
-                return None
-        return parsed.path or None
-    if re.match(r"^https?://", stripped):
-        parsed = urlparse(stripped)
-        if base_origin:
-            base_host = urlparse(base_origin).netloc.lower()
-            if parsed.netloc and parsed.netloc.lower() != base_host:
-                return None
-        return parsed.path or None
-    if stripped.startswith("/"):
-        return stripped
-    base_url = f"{base_origin or 'http://local'}{current_path}"
-    parsed = urlparse(urljoin(base_url, stripped))
-    return parsed.path or "/"
-
-
-def translate_external_to_upstream_path(external_path: str, base_path: str, proxy_mode: str) -> str:
-    normalized = external_path if external_path.startswith("/") else f"/{external_path}"
-    if proxy_mode != "strip_prefix":
-        return normalized
-    if normalized == base_path:
-        return "/"
-    if normalized.startswith(f"{base_path}/"):
-        remainder = normalized[len(base_path):]
-        return remainder if remainder.startswith("/") else f"/{remainder}"
-    return normalized
-
-
-def translate_upstream_to_external_path(upstream_path: str, base_path: str, proxy_mode: str) -> str:
-    normalized = upstream_path if upstream_path.startswith("/") else f"/{upstream_path}"
-    if proxy_mode != "strip_prefix":
-        return normalized
-    if normalized == "/":
-        return f"{base_path}/"
-    if normalized.startswith("/"):
-        return f"{base_path}{normalized}"
-    return f"{base_path}/{normalized}"
-
-
-def extract_html_urls(html: str) -> List[HtmlUrlReference]:
-    parser = HtmlUrlExtractor()
-    parser.feed(html)
-    return parser.references
-
-
-def runtime_subpath_findings_for_html(html: str, current_path: str, base_path: str, *, base_origin: Optional[str] = None) -> List[Dict[str, object]]:
-    findings: List[Dict[str, object]] = []
-    for ref in extract_html_urls(html):
-        normalized = normalize_runtime_url_path(ref.url, current_path, base_origin=base_origin)
-        if normalized is None or is_allowed_root_relative_url(normalized, base_path):
-            continue
-        findings.append(
-            {
-                "path": current_path,
-                "line": ref.line,
-                "tag": ref.tag,
-                "attr": ref.attr,
-                "url": ref.url,
-                "message": f'Runtime HTML emits root-relative `{ref.attr}="{ref.url}"` outside deployment subpath `{base_path}`',
-            }
-        )
-    return findings
-
-
-def collect_runtime_follow_links(html: str, current_path: str, base_path: str, limit: int = 5) -> List[str]:
-    paths: List[str] = []
-    for ref in extract_html_urls(html):
-        if ref.attr != "href":
-            continue
-        normalized = normalize_runtime_url_path(ref.url, current_path, base_origin=f"https://{DEFAULT_EXTERNAL_ACCESS_HOST}")
-        if normalized is None:
-            continue
-        if normalized == current_path:
-            continue
-        if normalized == base_path or normalized.startswith(f"{base_path}/"):
-            paths.append(normalized)
-        if len(paths) >= limit:
-            break
-    return sorted_unique(paths)
-
-
 def run_runtime_subpath_audit(
     host_port: int,
     project_slug: str,
     proxy_mode: str,
+    entry_path_hint: Optional[str] = None,
+    entry_path_candidates: Optional[List[str]] = None,
 ) -> Dict[str, object]:
-    base_path = build_deployment_base_path(project_slug)
-    base_origin = f"https://{DEFAULT_EXTERNAL_ACCESS_HOST}"
-    external_entry_path = base_path if proxy_mode == "preserve_prefix" else f"{base_path}/"
-    entry_path = translate_external_to_upstream_path(external_entry_path, base_path, proxy_mode)
-    checked_paths: List[str] = []
-    findings: List[Dict[str, object]] = []
-    warnings: List[str] = []
-
-    status, headers, html, final_path = fetch_http_text(host_port, entry_path)
-    external_final_path = translate_upstream_to_external_path(final_path, base_path, proxy_mode)
-    checked_paths.append(external_final_path)
-    if status >= 400:
-        findings.append(
-            {
-                "path": external_final_path,
-                "line": 1,
-                "tag": "document",
-                "attr": "status",
-                "url": external_final_path,
-                "message": f"Runtime subpath audit received HTTP {status} for {external_final_path}",
-            }
-        )
-        return {"checked_paths": checked_paths, "findings": findings, "warnings": warnings}
-    content_type = headers.get("content-type", "")
-    if "html" not in content_type and "<html" not in html.lower():
-        warnings.append(f"Runtime subpath audit skipped HTML extraction for {external_final_path} because response is not HTML.")
-        return {"checked_paths": checked_paths, "findings": findings, "warnings": warnings}
-
-    findings.extend(runtime_subpath_findings_for_html(html, external_final_path, base_path, base_origin=base_origin))
-    for candidate in collect_runtime_follow_links(html, external_entry_path, base_path):
-        upstream_candidate = translate_external_to_upstream_path(candidate, base_path, proxy_mode)
-        status, headers, child_html, child_final_path = fetch_http_text(host_port, upstream_candidate)
-        external_child_final_path = translate_upstream_to_external_path(child_final_path, base_path, proxy_mode)
-        checked_paths.append(external_child_final_path)
-        if status >= 400:
-            findings.append(
-                {
-                    "path": external_child_final_path,
-                    "line": 1,
-                    "tag": "document",
-                    "attr": "status",
-                    "url": external_child_final_path,
-                    "message": f"Runtime subpath audit received HTTP {status} for {external_child_final_path} (upstream {upstream_candidate})",
-                }
-            )
-            continue
-        child_content_type = headers.get("content-type", "")
-        if "html" not in child_content_type and "<html" not in child_html.lower():
-            continue
-        findings.extend(runtime_subpath_findings_for_html(child_html, external_child_final_path, base_path, base_origin=base_origin))
-
-    return {
-        "checked_paths": sorted_unique(checked_paths),
-        "findings": findings,
-        "warnings": warnings,
-    }
+    return subpath_run_runtime_subpath_audit(
+        host_port,
+        project_slug,
+        proxy_mode,
+        entry_path_hint,
+        entry_path_candidates,
+        external_access_host=DEFAULT_EXTERNAL_ACCESS_HOST,
+        fetch_http_text=fetch_http_text,
+    )
 
 
 def derive_image_name(source_type: str, source: str, job_id: str) -> str:
@@ -4676,6 +4140,7 @@ def main() -> int:
     runner_log_path = output_dir / "runner.log"
     result: Optional[Dict[str, object]] = None
     artifacts: Dict[str, object] = {}
+    failure_stage = "init"
     local_official_images = list_local_official_docker_images_from_env()
     podman_env = dict(os.environ)
 
@@ -4743,6 +4208,7 @@ def main() -> int:
         if args.source_type == "git":
             result["status"] = "FETCHING_SOURCE"
             write_json(result_path, result)
+            failure_stage = "fetch"
         repo_dir, reused_shared_repo, carried_forward_outputs = prepare_shared_repo(
             args.source_type,
             args.source,
@@ -4751,6 +4217,7 @@ def main() -> int:
             shared_repo_dir,
             shared_repo_metadata_path,
         )
+        failure_stage = "post_fetch"
         repo_dir = prepare_job_repo_from_shared(shared_repo_dir, work_repo_dir)
         artifacts["job_work_repo"] = str(repo_dir)
         result["artifacts"] = artifacts
@@ -4761,45 +4228,249 @@ def main() -> int:
         analysis = collect_repo_analysis(repo_dir, args.source_type, args.source, args.ref)
         result["analysis_summary"] = summarize_analysis(analysis, args.source_type, project_slug)
         result["repo_dir"] = str(repo_dir)
-        strategy = detect_subpath_strategy(repo_dir)
-        proxy_mode = strategy["proxy_mode"]
-        rewritten_files = apply_subpath_rewrites(repo_dir, project_slug)
+        subpath_prepare = subpath_prepare_subpath_sources(
+            repo_dir,
+            project_slug,
+            build_subpath_plan=build_runtime_subpath_plan,
+            detect_runtime_root_evidence=build_runtime_root_evidence,
+            apply_subpath_rewrites=lambda repo_dir_arg, slug_arg, plan_arg: subpath_apply_subpath_rewrites(
+                repo_dir_arg,
+                slug_arg,
+                plan=plan_arg,
+                apply_framework_config_adapters=lambda plan, slug: subpath_apply_framework_config_adapters(
+                    plan,
+                    slug,
+                    parse_package_json=parse_package_json,
+                    read_text=read_text,
+                    write_text=write_text,
+                ),
+                apply_nextjs_subpath_adapter_fn=apply_nextjs_subpath_adapter,
+                apply_vite_subpath_adapter_fn=apply_vite_subpath_adapter,
+                ensure_vue_cli_public_path_fn=ensure_vue_cli_public_path,
+                ensure_cra_homepage_fn=ensure_cra_homepage,
+                find_frontend_rewrite_targets=find_frontend_rewrite_targets,
+                rewrite_frontend_subpath_urls=rewrite_frontend_subpath_urls,
+            ),
+            run_static_subpath_audit=lambda repo_dir_arg, slug_arg, plan_arg: subpath_run_static_subpath_audit(
+                repo_dir_arg,
+                slug_arg,
+                plan_arg,
+                collect_matching_files=collect_matching_files,
+                detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+                vite_project_roots=vite_project_roots,
+                read_text=read_text,
+            ),
+            auto_fix_subpath_issues=lambda repo_dir_arg, slug_arg, plan_arg: subpath_auto_fix_subpath_issues(
+                repo_dir_arg,
+                slug_arg,
+                plan_arg,
+                auto_fix_nextjs_subpath_issues_fn=auto_fix_nextjs_subpath_issues,
+                find_subpath_audit_targets=lambda repo_dir_inner, plan_inner: subpath_find_subpath_audit_targets(
+                    repo_dir_inner,
+                    plan_inner,
+                    collect_matching_files=collect_matching_files,
+                    detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+                    vite_project_roots=vite_project_roots,
+                ),
+                rewrite_frontend_subpath_urls=rewrite_frontend_subpath_urls,
+                sorted_unique=sorted_unique,
+            ),
+            auto_fix_findings=lambda repo_dir_arg, slug_arg, findings_arg, plan_arg: subpath_auto_fix_findings(
+                repo_dir_arg,
+                slug_arg,
+                findings_arg,
+                plan_arg,
+                auto_fix_nextjs_subpath_issues_fn=auto_fix_nextjs_subpath_issues,
+                find_subpath_audit_targets=lambda repo_dir_inner, plan_inner: subpath_find_subpath_audit_targets(
+                    repo_dir_inner,
+                    plan_inner,
+                    collect_matching_files=collect_matching_files,
+                    detect_frontend_runtime_roots=detect_frontend_runtime_roots,
+                    vite_project_roots=vite_project_roots,
+                ),
+                rewrite_frontend_subpath_urls=rewrite_frontend_subpath_urls,
+                rewrite_frontend_html_attribute_urls=rewrite_frontend_html_attribute_urls,
+                rewrite_frontend_html_link_urls=rewrite_frontend_html_link_urls,
+                rewrite_frontend_html_script_urls=rewrite_frontend_html_script_urls,
+                rewrite_frontend_html_form_action_urls=rewrite_frontend_html_form_action_urls,
+                rewrite_frontend_client_request_urls=rewrite_frontend_client_request_urls,
+                rewrite_frontend_request_api_urls=lambda file_path, base_path, repo_dir: subpath_rewrite_frontend_request_api_urls(
+                    file_path,
+                    base_path,
+                    repo_dir,
+                    read_text=read_text,
+                    write_text=write_text,
+                ),
+                rewrite_frontend_navigation_urls=lambda file_path, base_path, repo_dir: subpath_rewrite_frontend_navigation_urls(
+                    file_path,
+                    base_path,
+                    repo_dir,
+                    read_text=read_text,
+                    write_text=write_text,
+                ),
+                rewrite_frontend_eventsource_urls=lambda file_path, base_path, repo_dir: subpath_rewrite_frontend_eventsource_urls(
+                    file_path,
+                    base_path,
+                    repo_dir,
+                    read_text=read_text,
+                    write_text=write_text,
+                ),
+                rewrite_frontend_return_value_urls=lambda file_path, base_path, repo_dir: subpath_rewrite_frontend_return_value_urls(
+                    file_path,
+                    base_path,
+                    repo_dir,
+                    read_text=read_text,
+                    write_text=write_text,
+                ),
+                sorted_unique=sorted_unique,
+            ),
+            sorted_unique=sorted_unique,
+        )
+        proxy_mode = str(subpath_prepare["proxy_mode"])
+        rewritten_files = list(subpath_prepare["rewritten_files"])
         if rewritten_files:
             artifacts["rewritten_frontend_files"] = rewritten_files
             artifacts["subpath_proxy_mode"] = proxy_mode
             result["artifacts"] = artifacts
             append_warning(result, f"Applied subpath rewrites for tool deployment path to {len(rewritten_files)} frontend files.")
-        static_subpath_audit = run_static_subpath_audit(repo_dir, project_slug, strategy)
-        static_audit_attempts: List[Dict[str, object]] = [static_subpath_audit]
-        static_findings = static_subpath_audit.get("findings", [])
-        if isinstance(static_findings, list) and static_findings:
-            auto_fixed_files = auto_fix_subpath_issues(repo_dir, project_slug, strategy)
-            if auto_fixed_files:
-                append_warning(result, f"Auto-fixed {len(auto_fixed_files)} subpath source files before deployment.")
-                static_subpath_audit = run_static_subpath_audit(repo_dir, project_slug, strategy)
-                static_audit_attempts.append(static_subpath_audit)
-                static_findings = static_subpath_audit.get("findings", [])
-                rewritten_files = sorted_unique(rewritten_files + auto_fixed_files)
-                artifacts["rewritten_frontend_files"] = rewritten_files
+        auto_fixed_files = list(subpath_prepare["auto_fixed_files"])
+        if auto_fixed_files:
+            append_warning(result, f"Auto-fixed {len(auto_fixed_files)} subpath source files before deployment.")
+        static_subpath_audit = subpath_prepare["static_subpath_audit"]
+        static_audit_attempts: List[Dict[str, object]] = list(subpath_prepare["static_audit_attempts"])
+        static_findings = list(subpath_prepare["static_findings"])
+        subpath_declaration = read_subpath_declaration(repo_dir)
+        if auto_fixed_files:
+            artifacts["rewritten_frontend_files"] = rewritten_files
+        rewrite_report = subpath_prepare.get("rewrite_report")
+        if isinstance(rewrite_report, dict):
+            artifacts["subpath_rewrite_report"] = rewrite_report
+        if subpath_prepare.get("plan") is not None:
+            artifacts["subpath_plan"] = json_safe(subpath_prepare["plan"])
+        if subpath_prepare.get("detection_evidence") is not None:
+            artifacts["subpath_detection_evidence"] = json_safe(subpath_prepare["detection_evidence"])
+        if subpath_declaration is not None:
+            artifacts["subpath_declaration"] = json_safe(subpath_declaration)
+            declaration_summary = summarize_subpath_declaration(subpath_declaration)
+            if declaration_summary is not None:
+                artifacts["subpath_declaration_summary"] = declaration_summary
+        summary = result.get("analysis_summary")
+        if isinstance(summary, dict):
+            if subpath_declaration is not None:
+                summary["subpath_declaration"] = subpath_declaration
+                declaration_summary = summarize_subpath_declaration(subpath_declaration)
+                if declaration_summary is not None:
+                    summary["subpath_declaration_summary"] = declaration_summary
+            plan_payload = subpath_prepare.get("plan")
+            if plan_payload is not None and hasattr(plan_payload, "projects"):
+                summary["subpath_plan"] = {
+                    "project_count": len(getattr(plan_payload, "projects", ()) or ()),
+                    "default_project": getattr(plan_payload, "default_project", None),
+                }
+                default_project = next(
+                    (
+                        project
+                        for project in getattr(plan_payload, "projects", ())
+                        if getattr(project, "project_id", None) == getattr(plan_payload, "default_project", None)
+                    ),
+                    (getattr(plan_payload, "projects", ()) or [None])[0],
+                )
+                if default_project is not None:
+                    summary["subpath_default_project"] = {
+                        "project_id": getattr(default_project, "project_id", None),
+                        "framework": getattr(default_project, "framework", None),
+                        "proxy_mode": getattr(default_project, "proxy_mode", None),
+                        "adapter": getattr(default_project, "adapter", None),
+                        "source_adapter": getattr(default_project, "source_adapter", None),
+                    }
+            elif isinstance(plan_payload, dict):
+                projects = plan_payload.get("projects", [])
+                default_project_id = plan_payload.get("default_project")
+                if isinstance(projects, list):
+                    summary["subpath_plan"] = {
+                        "project_count": len(projects),
+                        "default_project": default_project_id,
+                    }
+                    default_project = next(
+                        (
+                            project
+                            for project in projects
+                            if isinstance(project, dict) and project.get("project_id") == default_project_id
+                        ),
+                        projects[0] if projects and isinstance(projects[0], dict) else None,
+                    )
+                    if isinstance(default_project, dict):
+                        summary["subpath_default_project"] = {
+                            "project_id": default_project.get("project_id"),
+                            "framework": default_project.get("framework"),
+                            "proxy_mode": default_project.get("proxy_mode"),
+                            "adapter": default_project.get("adapter"),
+                            "source_adapter": default_project.get("source_adapter"),
+                        }
+            detection_evidence = subpath_prepare.get("detection_evidence")
+            if isinstance(detection_evidence, list):
+                summary["subpath_detection_evidence"] = {
+                    "count": len(detection_evidence),
+                    "sources": sorted({str(item.source) for item in detection_evidence if hasattr(item, "source")}),
+                }
+            summary["subpath_static_audit_summary"] = {
+                "scanned_files_count": len(static_subpath_audit.get("scanned_files", [])) if isinstance(static_subpath_audit, dict) else 0,
+                "findings_count": len(static_subpath_audit.get("findings", [])) if isinstance(static_subpath_audit, dict) else 0,
+                "findings_by_code": {
+                    code: len([item for item in static_subpath_audit.get("findings", []) if isinstance(item, dict) and item.get("code") == code])
+                    for code in sorted({str(item.get("code", "")) for item in static_subpath_audit.get("findings", []) if isinstance(item, dict)})
+                } if isinstance(static_subpath_audit, dict) else {},
+            }
+            if isinstance(rewrite_report, dict):
+                applied_codes_by_reason = rewrite_report.get("applied_codes_by_reason", {})
+                unchanged_codes_by_reason = rewrite_report.get("unchanged_codes_by_reason", {})
+                unchanged_codes_by_reason_and_file = rewrite_report.get("unchanged_codes_by_reason_and_file", {})
+                top_unchanged_files = []
+                if isinstance(unchanged_codes_by_reason_and_file, dict):
+                    file_counts: Dict[str, int] = {}
+                    for _reason, file_map in unchanged_codes_by_reason_and_file.items():
+                        if not isinstance(file_map, dict):
+                            continue
+                        for file_name, codes in file_map.items():
+                            if isinstance(file_name, str) and isinstance(codes, list):
+                                file_counts[file_name] = file_counts.get(file_name, 0) + len(codes)
+                    top_unchanged_files = [
+                        {"file": file_name, "count": count}
+                        for file_name, count in sorted(file_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+                    ]
+                summary["subpath_rewrite_report_summary"] = {
+                    "changed_files_count": len(rewrite_report.get("changed_files", [])),
+                    "applied_codes": rewrite_report.get("applied_codes", []),
+                    "applied_reason_counts": {
+                        reason: len(codes)
+                        for reason, codes in applied_codes_by_reason.items()
+                    } if isinstance(applied_codes_by_reason, dict) else {},
+                    "applied_files_count_by_reason": {
+                        reason: len(
+                            {
+                                file_name
+                                for file_name, codes in rewrite_report.get("applied_codes_by_file", {}).items()
+                                if isinstance(file_name, str)
+                                and isinstance(codes, list)
+                                and any(code in codes for code in (applied_codes_by_reason.get(reason, []) if isinstance(applied_codes_by_reason, dict) else []))
+                            }
+                        )
+                        for reason in applied_codes_by_reason.keys()
+                    } if isinstance(applied_codes_by_reason, dict) else {},
+                    "unchanged_codes_by_reason": unchanged_codes_by_reason,
+                    "unchanged_reason_counts": {
+                        reason: len(codes)
+                        for reason, codes in unchanged_codes_by_reason.items()
+                    } if isinstance(unchanged_codes_by_reason, dict) else {},
+                    "top_unchanged_files": top_unchanged_files,
+                }
         artifacts["subpath_static_audit"] = static_subpath_audit
         artifacts["subpath_static_audit_attempts"] = static_audit_attempts
         result["artifacts"] = artifacts
         extend_warnings(result, static_subpath_audit.get("warnings", []))
         if isinstance(static_findings, list) and static_findings:
             result["status"] = "SUBPATH_STATIC_AUDIT_FAILED"
-            result["errors"] = [
-                finding_to_error_text(
-                    SubpathAuditFinding(
-                        file=str(item.get("file", "")),
-                        line=int(item.get("line", 1)),
-                        severity=str(item.get("severity", "error")),
-                        code=str(item.get("code", "")),
-                        message=str(item.get("message", "")),
-                    )
-                )
-                for item in static_findings
-                if isinstance(item, dict)
-            ]
+            result["errors"] = subpath_findings_to_error_texts(static_findings)
             emit_final_result(result, result_path)
             return 1
         append_text(
@@ -4813,18 +4484,31 @@ def main() -> int:
         result["status"] = "SOURCE_READY"
         write_json(result_path, result)
 
-        existing_dockerfile = (repo_dir / "Dockerfile").exists()
-        existing_onboarding = (repo_dir / "PROJECT_ONBOARDING.md").exists()
-        prebuilt_outputs, generation_mode = determine_generation_mode(existing_dockerfile, existing_onboarding)
+        existing_dockerfile_path = repo_dir / "Dockerfile"
+        existing_onboarding_path = repo_dir / "PROJECT_ONBOARDING.md"
+        existing_dockerfile = existing_dockerfile_path.exists()
+        existing_onboarding = existing_onboarding_path.exists()
+        existing_dockerfile_tracked = args.source_type != "git" or (
+            existing_dockerfile and is_git_tracked_file(repo_dir, existing_dockerfile_path)
+        )
+        existing_onboarding_tracked = args.source_type != "git" or (
+            existing_onboarding and is_git_tracked_file(repo_dir, existing_onboarding_path)
+        )
+        prebuilt_outputs, generation_mode = determine_generation_mode(
+            existing_dockerfile,
+            existing_onboarding,
+            existing_dockerfile_tracked=existing_dockerfile_tracked,
+            existing_onboarding_tracked=existing_onboarding_tracked,
+        )
         if prebuilt_outputs:
             if reused_shared_repo:
                 extend_warnings(result, [
                     f"Reused shared repo workspace under automation/jobs/{project_slug}/repo.",
-                    "Reused existing Dockerfile and PROJECT_ONBOARDING.md from source repository; skipped codex generation.",
+                    "Reused tracked Dockerfile and PROJECT_ONBOARDING.md from source repository; skipped codex generation.",
                 ])
             else:
                 extend_warnings(result, [
-                    "Reused existing Dockerfile and PROJECT_ONBOARDING.md from source repository; skipped codex generation."
+                    "Reused tracked Dockerfile and PROJECT_ONBOARDING.md from source repository; skipped codex generation."
                 ])
         else:
             if reused_shared_repo:
@@ -4839,7 +4523,7 @@ def main() -> int:
             result["artifacts"] = artifacts
             write_json(result_path, result)
             if generation_mode == "onboarding_only":
-                append_warning(result, "Reused existing Dockerfile from source repository; only generated PROJECT_ONBOARDING.md.")
+                append_warning(result, "Reused tracked Dockerfile from source repository; only generated PROJECT_ONBOARDING.md.")
             invoke_codex_generation(
                 repo_dir=repo_dir,
                 codex_home=codex_home,
@@ -4865,7 +4549,41 @@ def main() -> int:
             args.ref,
             generation_mode,
         )
+        retried_after_validation = False
+        if findings and not prebuilt_outputs:
+            retried_after_validation = True
+            append_text(
+                runner_log_path,
+                f"[{datetime.now(timezone.utc).isoformat()}] validation_retry findings={json_dumps_safe(findings)} warnings={json_dumps_safe(warnings)}\n",
+            )
+            invoke_codex_generation(
+                repo_dir=repo_dir,
+                codex_home=codex_home,
+                log_path=Path(artifacts["codex_log"]),
+                summary_path=Path(artifacts["codex_summary"]),
+                source_type=args.source_type,
+                source=args.source,
+                ref=args.ref,
+                generation_mode=generation_mode,
+                validation_findings=findings,
+                validation_warnings=warnings,
+                runner_log_path=runner_log_path,
+            )
+            generated_files = []
+            for name in ("Dockerfile", "PROJECT_ONBOARDING.md"):
+                if (repo_dir / name).exists():
+                    generated_files.append(str(repo_dir / name))
+            result["generated_files"] = generated_files
+            findings, warnings = validate_generated_files(
+                repo_dir,
+                args.source_type,
+                args.source,
+                args.ref,
+                generation_mode,
+            )
         extend_warnings(result, warnings)
+        if retried_after_validation and not findings:
+            append_warning(result, "Initial generated files failed local validation once; regenerated with validation feedback and recovered.")
         if findings:
             result["errors"] = findings
             result["status"] = "VALIDATION_FAILED"
@@ -4933,6 +4651,53 @@ def main() -> int:
             runner_log_path,
             f"[{datetime.now(timezone.utc).isoformat()}] build_succeeded image={image_name}\n",
         )
+        plan_payload = artifacts.get("subpath_plan")
+        if isinstance(plan_payload, dict):
+            try:
+                subpath_plan_obj = subpath_plan_from_payload(plan_payload, repo_dir)
+                if subpath_plan_obj is None:
+                    raise ValueError("invalid subpath plan payload")
+                build_output_audit = subpath_run_build_output_subpath_audit(
+                    repo_dir,
+                    project_slug,
+                    subpath_plan_obj,
+                    policy_overrides=subpath_declaration.get("build_output_policy") if isinstance(subpath_declaration, dict) else None,
+                    collect_matching_files=collect_matching_files,
+                    read_text=read_text,
+                )
+                artifacts["subpath_build_output_audit"] = build_output_audit
+                summary = result.get("analysis_summary")
+                if isinstance(summary, dict):
+                    build_summary = build_output_audit.get("summary")
+                    if isinstance(build_summary, dict):
+                        summary["subpath_build_output_audit_summary"] = build_summary
+                build_summary = build_output_audit.get("summary", {})
+                enforcement_candidates = build_summary.get("enforcement_candidates", {}) if isinstance(build_summary, dict) else {}
+                enforce_codes = {
+                    str(item.get("code", "")).strip()
+                    for item in build_output_audit.get("findings", [])
+                    if isinstance(item, dict)
+                    and isinstance(enforcement_candidates, dict)
+                    and enforcement_candidates.get(str(item.get("code", "")).strip()) == "enforce"
+                }
+                if enforce_codes:
+                    result["status"] = "SUBPATH_BUILD_OUTPUT_AUDIT_FAILED"
+                    result["errors"] = [
+                        str(item.get("message", ""))
+                        for item in build_output_audit.get("findings", [])
+                        if isinstance(item, dict) and str(item.get("code", "")).strip() in enforce_codes
+                    ]
+                    result["artifacts"] = artifacts
+                    emit_final_result(result, result_path)
+                    return 1
+                if build_output_audit.get("findings"):
+                    findings_by_code = build_summary.get("findings_by_code", {}) if isinstance(build_summary, dict) else {}
+                    code_summary = ", ".join(f"{key}={value}" for key, value in findings_by_code.items()) if isinstance(findings_by_code, dict) else ""
+                    suffix = f" ({code_summary})" if code_summary else ""
+                    append_warning(result, f"Build output subpath audit found {len(build_output_audit['findings'])} findings after build{suffix}.")
+                result["artifacts"] = artifacts
+            except Exception as exc:
+                append_warning(result, f"Build output subpath audit skipped due to error: {exc}")
         write_json(result_path, result)
 
         if not args.run:
@@ -5006,9 +4771,7 @@ def main() -> int:
             log_path=Path(artifacts["run_log"]),
             podman_env=podman_env,
             env_args=env_args,
-            persistence_paths=run_spec.get("persistence_paths") if isinstance(run_spec.get("persistence_paths"), list) else [],
             extra_volume_args=extra_volume_args,
-            runtime_data_dir=runtime_data_dir,
             runner_log_path=runner_log_path,
         )
         if run_result.returncode != 0:
@@ -5040,10 +4803,33 @@ def main() -> int:
             emit_final_result(result, result_path)
             return 1
 
-        runtime_subpath_audit = run_runtime_subpath_audit(host_port, project_slug, proxy_mode)
+        runtime_plan = None
+        if isinstance(plan_payload, dict):
+            runtime_plan = subpath_plan_from_payload(plan_payload, repo_dir)
+        runtime_phase = subpath_runtime_subpath_phase(
+            host_port,
+            project_slug,
+            proxy_mode,
+            plan=runtime_plan,
+            run_runtime_subpath_audit=run_runtime_subpath_audit,
+        )
+        runtime_subpath_audit = runtime_phase["runtime_subpath_audit"]
         artifacts["subpath_runtime_audit"] = runtime_subpath_audit
+        summary = result.get("analysis_summary")
+        if isinstance(summary, dict):
+            summary["subpath_runtime_audit_summary"] = {
+                "checked_paths": len(runtime_subpath_audit.get("checked_paths", [])) if isinstance(runtime_subpath_audit, dict) else 0,
+                "findings": len(runtime_subpath_audit.get("findings", [])) if isinstance(runtime_subpath_audit, dict) else 0,
+                "warnings": len(runtime_subpath_audit.get("warnings", [])) if isinstance(runtime_subpath_audit, dict) else 0,
+                "skipped_by_capability": bool(runtime_subpath_audit.get("skipped_by_capability")) if isinstance(runtime_subpath_audit, dict) else False,
+                "default_runtime_project": runtime_subpath_audit.get("default_runtime_project") if isinstance(runtime_subpath_audit, dict) else None,
+                "entry_path_candidates": len(runtime_subpath_audit.get("entry_path_candidates", [])) if isinstance(runtime_subpath_audit, dict) else 0,
+                "audited_projects": len(runtime_subpath_audit.get("audited_projects", [])) if isinstance(runtime_subpath_audit, dict) else 0,
+                "projects_with_findings": len(runtime_subpath_audit.get("projects_with_findings", [])) if isinstance(runtime_subpath_audit, dict) else 0,
+                "project_summaries": runtime_subpath_audit.get("project_summaries", []) if isinstance(runtime_subpath_audit, dict) else [],
+            }
         extend_warnings(result, runtime_subpath_audit.get("warnings", []))
-        runtime_findings = runtime_subpath_audit.get("findings", [])
+        runtime_findings = runtime_phase["runtime_findings"]
         if isinstance(runtime_findings, list) and runtime_findings:
             result["status"] = "SUBPATH_RUNTIME_AUDIT_FAILED"
             result["errors"] = [str(item.get("message", "")) for item in runtime_findings if isinstance(item, dict)]
@@ -5115,7 +4901,7 @@ def main() -> int:
             }
             print(json_dumps_safe(final_payload))
             return 1
-        if args and args.source_type == "git" and result.get("status") in {"INITIALIZED", "FETCHING_SOURCE"}:
+        if args and args.source_type == "git" and failure_stage == "fetch":
             result["status"] = "FETCH_FAILED"
             result["errors"] = ["git clone failed"]
             diagnosis = diagnose_git_failure(error_text)

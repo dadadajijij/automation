@@ -17,6 +17,127 @@
   "mount_points": [
     "/"
   ],
+  "service_checks": {
+    "enabled": true,
+    "project_ports_file": "../project-ports.json",
+    "host_services": [
+      {
+        "name": "ka_tools",
+        "display_name": "ka_tools",
+        "type": "host",
+        "host": "127.0.0.1",
+        "port": 3000,
+        "protocol": "http",
+        "success_status_codes": [
+          200,
+          204,
+          302,
+          401
+        ],
+        "health_paths": [
+          "/api/health",
+          "/"
+        ]
+      }
+    ],
+    "container_services": {
+      "exclude_names": [
+        "ka-tools"
+      ],
+      "default_host": "127.0.0.1",
+      "default_timeout_seconds": 3,
+      "default_protocol": "auto",
+      "default_health_paths": [
+        "/api/health",
+        "/health",
+        "/"
+      ],
+      "base_path_templates": [
+        "/tools2/{service_name}",
+        "/tools2/{service_name}/"
+      ],
+      "default_success_status_codes": [
+        200,
+        204,
+        301,
+        302,
+        307,
+        308
+      ],
+      "per_service_overrides": {
+        "audioqas": {
+          "protocol": "http",
+          "success_status_codes": [
+            200,
+            204
+          ],
+          "health_paths": [
+            "/api/health",
+            "/"
+          ]
+        },
+        "agora-token-generator": {
+          "protocol": "http",
+          "success_status_codes": [
+            200,
+            204
+          ],
+          "health_paths": [
+            "/api/health",
+            "/"
+          ]
+        },
+        "api-examples-web": {
+          "protocol": "http",
+          "success_status_codes": [
+            200,
+            204
+          ],
+          "health_paths": [
+            "/",
+            "/static-preview"
+          ]
+        },
+        "agora-rest-api-debugger": {
+          "protocol": "http",
+          "success_status_codes": [
+            200,
+            204
+          ],
+          "health_paths": [
+            "/tools2/agora-rest-api-debugger",
+            "/tools2/agora-rest-api-debugger/",
+            "/tools2/agora-rest-api-debugger/media-api"
+          ]
+        },
+        "loga": {
+          "protocol": "http",
+          "success_status_codes": [
+            200,
+            204
+          ],
+          "health_paths": [
+            "/",
+            "/health"
+          ]
+        },
+        "mos-video-compare": {
+          "protocol": "http",
+          "success_status_codes": [
+            200,
+            204
+          ],
+          "health_paths": [
+            "/api/health",
+            "/"
+          ]
+        },
+        "decrypt-online": {
+          "protocol": "tcp"
+        }
+      }
+    }
+  },
   "notifications": {
     "enabled": true,
     "wecom_webhook": ""

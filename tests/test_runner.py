@@ -5,9 +5,24 @@ import json
 from unittest import mock
 
 import runner
+from subpath.apply import apply_subpath_rewrites as subpath_apply_subpath_rewrites, auto_fix_subpath_issues as subpath_auto_fix_subpath_issues
+from subpath.static_audit import run_static_subpath_audit as subpath_run_static_subpath_audit
 
 
 class RunnerProjectSlugTests(unittest.TestCase):
+    def _build_plan(self, repo_dir: Path):
+        return runner.subpath_build_subpath_plan(
+            repo_dir,
+            parse_package_json=runner.parse_package_json,
+            detect_node_entry_script_paths=runner.detect_node_entry_script_paths,
+            read_text_if_exists=runner.read_text_if_exists,
+            collect_python_frontend_hint_files_fn=runner.collect_python_frontend_hint_files,
+            workspace_frontend_package_dirs_fn=runner.workspace_frontend_package_dirs,
+            vite_project_roots_fn=runner.vite_project_roots,
+            collect_matching_files=runner.collect_matching_files,
+            discover_workspace_packages=runner.discover_workspace_packages,
+        )
+
     def test_json_safe_converts_path_set_and_dataclass(self) -> None:
         payload = {
             "path": Path("/tmp/demo"),
@@ -188,6 +203,22 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertTrue((shared_repo_dir / "Dockerfile").exists())
             self.assertEqual((shared_repo_dir / "Dockerfile").read_text(encoding="utf-8"), "FROM node:22-alpine\n")
 
+    def test_is_git_tracked_file_distinguishes_generated_untracked_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            runner.run_command(["git", "init"], cwd=repo_dir)
+            runner.run_command(["git", "config", "user.email", "test@example.com"], cwd=repo_dir)
+            runner.run_command(["git", "config", "user.name", "Test User"], cwd=repo_dir)
+            tracked = repo_dir / "README.md"
+            untracked = repo_dir / "Dockerfile"
+            tracked.write_text("# demo\n", encoding="utf-8")
+            untracked.write_text("FROM node:22-alpine\n", encoding="utf-8")
+            runner.run_command(["git", "add", "README.md"], cwd=repo_dir)
+            runner.run_command(["git", "commit", "-m", "init"], cwd=repo_dir)
+
+            self.assertTrue(runner.is_git_tracked_file(repo_dir, tracked))
+            self.assertFalse(runner.is_git_tracked_file(repo_dir, untracked))
+
     def test_determine_generation_mode_only_generates_onboarding_when_dockerfile_exists(self) -> None:
         prebuilt_outputs, generation_mode = runner.determine_generation_mode(True, False)
         self.assertFalse(prebuilt_outputs)
@@ -196,6 +227,16 @@ class RunnerProjectSlugTests(unittest.TestCase):
     def test_determine_generation_mode_skips_codex_only_when_both_outputs_exist(self) -> None:
         prebuilt_outputs, generation_mode = runner.determine_generation_mode(True, True)
         self.assertTrue(prebuilt_outputs)
+        self.assertEqual(generation_mode, "both")
+
+    def test_determine_generation_mode_ignores_untracked_git_generated_outputs(self) -> None:
+        prebuilt_outputs, generation_mode = runner.determine_generation_mode(
+            True,
+            True,
+            existing_dockerfile_tracked=False,
+            existing_onboarding_tracked=False,
+        )
+        self.assertFalse(prebuilt_outputs)
         self.assertEqual(generation_mode, "both")
 
     def test_raw_runner_invocation_log_line_contains_original_argv(self) -> None:
@@ -209,26 +250,155 @@ class RunnerProjectSlugTests(unittest.TestCase):
         self.assertIn("path=/usr/bin:/bin", line)
         self.assertIn("codex_path=/home/devops/.nvm/versions/node/v24.16.0/bin/codex", line)
 
+    def test_build_runtime_rules_for_node_stays_compact_but_keeps_critical_constraints(self) -> None:
+        rules = runner.build_runtime_rules(
+            {
+                "service_runtime": "node",
+                "python_entry_command": None,
+                "node_entry_command": "node scripts/server.js",
+                "requires_python": None,
+                "package_scripts": ["dev", "build"],
+                "detected_port": 3000,
+                "has_nextjs_ts_config": False,
+                "package_manager": "npm",
+                "build_command_candidates": [],
+                "requires_build_step": False,
+                "runtime_build_artifact_paths": [],
+            }
+        )
+        self.assertIn("这是 Node 运行时项目时", rules)
+        self.assertIn("npm ci", rules)
+        self.assertIn("JSON-form CMD", rules)
+        self.assertIn("EXPOSE 3000", rules)
+
+    def test_build_runtime_rules_mentions_required_build_and_candidates(self) -> None:
+        rules = runner.build_runtime_rules(
+            {
+                "service_runtime": "node",
+                "python_entry_command": None,
+                "node_entry_command": "npm run start --workspace=backend",
+                "requires_python": None,
+                "package_scripts": ["build", "start"],
+                "detected_port": 44002,
+                "has_nextjs_ts_config": False,
+                "package_manager": "npm",
+                "required_build_commands": ["npm run build --workspace=frontend"],
+                "build_command_candidates": ["npm run build --workspace=frontend"],
+                "requires_build_step": True,
+                "runtime_build_artifact_paths": ["frontend/dist"],
+            }
+        )
+        self.assertIn("最低必需构建命令", rules)
+        self.assertIn("构建命令候选", rules)
+        self.assertIn("npm run build --workspace=frontend", rules)
+        self.assertIn("不要为了保险把所有候选 build 命令都用 `&&` 串起来全部执行", rules)
+        self.assertIn("运行时依赖预构建产物", rules)
+        self.assertIn("frontend/dist", rules)
+
+    def test_detect_node_entrypoint_reads_script_target_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            server_path = repo_dir / "server.js"
+            server_path.write_text("const PORT = process.env.PORT || 3010;\n", encoding="utf-8")
+
+            entry_path, command, entry_text = runner.detect_node_entrypoint(
+                repo_dir,
+                {"start": "node server.js"},
+            )
+
+            self.assertEqual(entry_path, server_path)
+            self.assertEqual(command, "node server.js")
+            self.assertEqual(entry_text, "const PORT = process.env.PORT || 3010;\n")
+
+    def test_detect_port_from_text_recognizes_node_port_fallback_constant(self) -> None:
+        text = "const PORT = process.env.PORT || 3010;\napp.listen(PORT, () => {})\n"
+        self.assertEqual(runner.detect_port_from_text(text), 3010)
+
+    def test_build_codex_prompt_includes_repo_facts_lines(self) -> None:
+        with mock.patch.object(
+            runner,
+            "collect_repo_analysis",
+            return_value={
+                "service_runtime": "node",
+                "python_entry_command": None,
+                "node_entry_command": "node scripts/server.js",
+                "requires_python": None,
+                "package_scripts": ["dev"],
+                "detected_port": 3000,
+                "has_nextjs_ts_config": False,
+                "package_manager": "npm",
+                "build_command_candidates": [],
+                "requires_build_step": False,
+                "runtime_build_artifact_paths": [],
+                "facts": [
+                    '- source.url: `https://example.com/demo.git`',
+                    '- runtime: `node`',
+                    '- node_entry: `node scripts/server.js`',
+                ],
+            },
+        ):
+            prompt = runner.build_codex_prompt(
+                "git",
+                "https://example.com/demo.git",
+                "main",
+                Path("/tmp/demo"),
+            )
+
+        self.assertIn("- runtime: `node`", prompt)
+        self.assertIn("- node_entry: `node scripts/server.js`", prompt)
+
+    def test_build_codex_prompt_appends_validation_feedback_block(self) -> None:
+        with mock.patch.object(
+            runner,
+            "collect_repo_analysis",
+            return_value={
+                "service_runtime": "node",
+                "python_entry_command": None,
+                "node_entry_command": "node scripts/server.js",
+                "requires_python": None,
+                "package_scripts": ["build", "start"],
+                "detected_port": 3000,
+                "has_nextjs_ts_config": False,
+                "package_manager": "npm",
+                "build_command_candidates": ["npm run build"],
+                "requires_build_step": True,
+                "runtime_build_artifact_paths": ["dist"],
+                "facts": ['- runtime: `node`'],
+            },
+        ):
+            prompt = runner.build_codex_prompt(
+                "git",
+                "https://example.com/demo.git",
+                "main",
+                Path("/tmp/demo"),
+                validation_findings=["Dockerfile is missing an application build step even though package.json.scripts.build exists"],
+                validation_warnings=["PROJECT_ONBOARDING.md still contains unresolved confirmation items"],
+            )
+
+        self.assertIn("上一次生成未通过校验", prompt)
+        self.assertIn("Dockerfile is missing an application build step", prompt)
+        self.assertIn("PROJECT_ONBOARDING.md still contains unresolved confirmation items", prompt)
+
     def test_resolve_project_port_mapping_allocates_next_host_port_from_8003(self) -> None:
         mapping = {
-            "ka-tools": "3000:3000",
-            "audioqas": "8001:8000",
-            "agora-token-generator": "8002:3010",
+            "ka-tools": {"port": "3000:3000"},
+            "audioqas": {"port": "8001:8000"},
+            "agora-token-generator": {"port": "8002:3010"},
         }
-        with mock.patch.object(runner, "load_project_ports_map", return_value=dict(mapping)):
-            saved: dict[str, str] = {}
+        with mock.patch.object(runner, "load_project_port_configs", return_value=dict(mapping)):
+            saved: dict[str, dict[str, object]] = {}
 
-            def capture(updated: dict[str, str]) -> None:
+            def capture(updated: dict[str, dict[str, object]]) -> None:
                 saved.update(updated)
 
-            with mock.patch.object(runner, "save_project_ports_map", side_effect=capture):
+            with mock.patch.object(runner, "save_project_port_configs", side_effect=capture):
                 host_port, container_port = runner.resolve_project_port_mapping("next-tool", 9000)
 
         self.assertEqual(host_port, 8003)
         self.assertEqual(container_port, 9000)
-        self.assertEqual(saved["next-tool"], "8003:9000")
+        self.assertEqual(saved["next-tool"]["port"], "8003:9000")
 
-    def test_load_project_ports_map_supports_object_entries(self) -> None:
+    def test_load_project_port_configs_returns_only_object_entries_with_valid_ports(self) -> None:
         payload = {
             "audioqas": {
                 "port": "8001:8000",
@@ -240,19 +410,28 @@ class RunnerProjectSlugTests(unittest.TestCase):
                 "env_file": "/host/.env.local",
                 "volumes": ["/host/data:/app/data"],
             },
+            "broken-tool": "8008:8080",
         }
         with mock.patch.object(runner, "read_json", return_value=payload):
-            mapping = runner.load_project_ports_map()
+            mapping = runner.load_project_port_configs()
 
         self.assertEqual(
             mapping,
             {
-                "audioqas": "8001:8000",
-                "ka-tools": "3000:3000",
+                "audioqas": {
+                    "port": "8001:8000",
+                    "volumes": ["/host/cache:/model-cache"],
+                    "env": {"HF_HOME": "/model-cache/huggingface"},
+                },
+                "ka-tools": {
+                    "port": "3000:3000",
+                    "env_file": "/host/.env.local",
+                    "volumes": ["/host/data:/app/data"],
+                },
             },
         )
 
-    def test_save_project_ports_map_preserves_existing_runtime_overrides(self) -> None:
+    def test_save_project_port_configs_preserves_existing_runtime_overrides(self) -> None:
         payload = {
             "audioqas": {
                 "port": "8001:8000",
@@ -272,13 +451,24 @@ class RunnerProjectSlugTests(unittest.TestCase):
 
         with mock.patch.object(runner, "read_json", return_value=payload):
             with mock.patch.object(runner, "write_text", side_effect=capture):
-                runner.save_project_ports_map({"audioqas": "8101:8000", "next-tool": "8003:9000"})
+                runner.save_project_port_configs(
+                    {
+                        "audioqas": {
+                            "port": "8101:8000",
+                            "volumes": ["/host/cache:/model-cache"],
+                            "env": {"HF_HOME": "/model-cache/huggingface"},
+                        },
+                        "next-tool": {
+                            "port": "8003:9000",
+                        },
+                    }
+                )
 
         written = json.loads(saved_text["content"])
         self.assertEqual(written["audioqas"]["port"], "8101:8000")
         self.assertEqual(written["audioqas"]["volumes"], ["/host/cache:/model-cache"])
         self.assertEqual(written["audioqas"]["env"], {"HF_HOME": "/model-cache/huggingface"})
-        self.assertEqual(written["next-tool"], "8003:9000")
+        self.assertEqual(written["next-tool"]["port"], "8003:9000")
 
     def test_load_project_runtime_overrides_supports_env_file(self) -> None:
         payload = {
@@ -361,7 +551,7 @@ class RunnerProjectSlugTests(unittest.TestCase):
             "env_file": "/host/.env.local",
             "volumes": ["/host/cache:/model-cache"],
         }
-        with mock.patch.object(runner, "load_project_ports_map", return_value={"audioqas": "8001:8000"}):
+        with mock.patch.object(runner, "load_project_port_configs", return_value={"audioqas": {"port": "8001:8000"}}):
             with mock.patch.object(runner, "load_project_runtime_overrides", return_value=overrides):
                 run_spec = runner.merge_run_spec(
                     project_slug="audioqas",
@@ -376,6 +566,45 @@ class RunnerProjectSlugTests(unittest.TestCase):
         self.assertEqual(run_spec["project_env_file"], "/host/.env.local")
         self.assertEqual(run_spec["project_volumes"], ["/host/cache:/model-cache"])
 
+    def test_run_container_uses_only_explicit_project_volume_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            log_path = repo_dir / "run.log"
+            with mock.patch.object(runner, "run_command", return_value=runner.CommandResult(args=[], returncode=0, stdout="ok")) as run_command_mock:
+                runner.run_container(
+                    repo_dir=repo_dir,
+                    image_name="localhost/example:latest",
+                    host_port=8001,
+                    container_port=8000,
+                    container_name="example",
+                    log_path=log_path,
+                    podman_env={},
+                    extra_volume_args=["/host/cache:/model-cache"],
+                )
+
+        called_args = run_command_mock.call_args.args[0]
+        self.assertIn("-v", called_args)
+        self.assertIn("/host/cache:/model-cache", called_args)
+
+    def test_run_container_does_not_derive_volume_mounts_from_onboarding_persistence_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            log_path = repo_dir / "run.log"
+            with mock.patch.object(runner, "run_command", return_value=runner.CommandResult(args=[], returncode=0, stdout="ok")) as run_command_mock:
+                runner.run_container(
+                    repo_dir=repo_dir,
+                    image_name="localhost/example:latest",
+                    host_port=8001,
+                    container_port=8000,
+                    container_name="example",
+                    log_path=log_path,
+                    podman_env={},
+                    extra_volume_args=[],
+                )
+
+        called_args = run_command_mock.call_args.args[0]
+        self.assertNotIn("web/uploads", called_args)
+
     def test_find_frontend_rewrite_targets_includes_src_javascript(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
@@ -384,183 +613,6 @@ class RunnerProjectSlugTests(unittest.TestCase):
             target_file.write_text("const ORIGIN_URL = window.location.origin;\n", encoding="utf-8")
             targets = runner.find_frontend_rewrite_targets(repo_dir)
             self.assertIn(target_file, targets)
-
-    def test_frontend_runtime_root_uses_src_as_static_root(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            target_file = repo_dir / "src" / "index.html"
-            target_file.parent.mkdir(parents=True)
-            target_file.write_text('<link rel="stylesheet" href="./assets/app.css">\n', encoding="utf-8")
-            self.assertEqual(runner.frontend_runtime_root(repo_dir, target_file), repo_dir / "src")
-
-    def test_detect_frontend_runtime_roots_from_express_static_entry(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            scripts_dir = repo_dir / "scripts"
-            src_dir = repo_dir / "src"
-            scripts_dir.mkdir(parents=True)
-            src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"scripts": {"dev": "node ./scripts/server.js"}}) + "\n",
-                encoding="utf-8",
-            )
-            (scripts_dir / "server.js").write_text(
-                '\n'.join([
-                    'const express = require("express");',
-                    'const path = require("path");',
-                    'const dir = path.join(__dirname, "../src");',
-                    'const app = express();',
-                    'app.use(express.static(dir));',
-                ]),
-                encoding="utf-8",
-            )
-            roots = runner.detect_frontend_runtime_roots(repo_dir)
-            self.assertIn(src_dir.resolve(), roots)
-
-    def test_detect_frontend_runtime_roots_from_fastapi_template_and_static_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            app_dir = repo_dir / "app"
-            views_dir = repo_dir / "views"
-            static_dir = repo_dir / "static"
-            app_dir.mkdir(parents=True)
-            views_dir.mkdir()
-            static_dir.mkdir()
-            (app_dir / "main.py").write_text(
-                "\n".join(
-                    [
-                        "from pathlib import Path",
-                        "from fastapi import FastAPI",
-                        "from fastapi.staticfiles import StaticFiles",
-                        "from fastapi.templating import Jinja2Templates",
-                        "",
-                        "BASE_DIR = Path(__file__).resolve().parent.parent",
-                        "templates = Jinja2Templates(directory=str(BASE_DIR / 'views'))",
-                        "app = FastAPI()",
-                        "app.mount('/static', StaticFiles(directory=str(BASE_DIR / 'static')), name='static')",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            roots = runner.detect_frontend_runtime_roots(repo_dir)
-
-            self.assertIn(views_dir.resolve(), roots)
-            self.assertIn(static_dir.resolve(), roots)
-
-    def test_detect_frontend_runtime_roots_from_flask_template_and_static_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            templates_dir = repo_dir / "templates"
-            static_dir = repo_dir / "static"
-            templates_dir.mkdir()
-            static_dir.mkdir()
-            (repo_dir / "server.py").write_text(
-                "\n".join(
-                    [
-                        "from flask import Flask",
-                        "",
-                        "app = Flask(__name__, template_folder='templates', static_folder='static')",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            roots = runner.detect_frontend_runtime_roots(repo_dir)
-
-            self.assertIn(templates_dir.resolve(), roots)
-            self.assertIn(static_dir.resolve(), roots)
-
-    def test_detect_frontend_runtime_roots_from_fastify_static_root_option(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            backend_src_dir = repo_dir / "backend" / "src"
-            frontend_dist_dir = repo_dir / "frontend" / "dist"
-            backend_src_dir.mkdir(parents=True)
-            frontend_dist_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"scripts": {"start": "node ./backend/src/index.js"}}) + "\n",
-                encoding="utf-8",
-            )
-            (backend_src_dir / "index.js").write_text(
-                "\n".join(
-                    [
-                        "import path from 'path'",
-                        "const frontendDist = path.resolve(__dirname, '../../frontend/dist')",
-                        "await fastify.register(fastifyStatic, {",
-                        "  root: frontendDist,",
-                        "  prefix: '/'",
-                        "})",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            roots = runner.detect_frontend_runtime_roots(repo_dir)
-
-            self.assertIn(frontend_dist_dir.resolve(), roots)
-
-    def test_detect_frontend_runtime_roots_from_npm_workspace_frontend_package(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_src_dir = repo_dir / "frontend" / "src"
-            frontend_src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "demo-workspaces",
-                        "private": True,
-                        "workspaces": ["frontend", "backend"],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (repo_dir / "frontend" / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "frontend",
-                        "private": True,
-                        "dependencies": {"react": "^18.0.0"},
-                        "devDependencies": {"vite": "^5.0.0"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            roots = runner.detect_frontend_runtime_roots(repo_dir)
-
-            self.assertIn(frontend_src_dir.resolve(), roots)
-
-    def test_src_index_html_relative_assets_rewrite_without_src_prefix(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            html_path = repo_dir / "src" / "index.html"
-            asset_path = repo_dir / "src" / "assets" / "app.css"
-            html_path.parent.mkdir(parents=True)
-            asset_path.parent.mkdir(parents=True)
-            asset_path.write_text("body {}\n", encoding="utf-8")
-            html_path.write_text('<link rel="stylesheet" href="./assets/app.css">\n', encoding="utf-8")
-            changed = runner.rewrite_frontend_subpath_urls(html_path, "/tools2/demo", repo_dir)
-            self.assertTrue(changed)
-            rewritten = html_path.read_text(encoding="utf-8")
-            self.assertIn('href="/tools2/demo/assets/app.css"', rewritten)
-            self.assertNotIn('/tools2/demo/src/assets/app.css', rewritten)
-
-    def test_rewrite_origin_based_subpath_logic_wraps_origin_and_setup_redirect(self) -> None:
-        original = '\n'.join([
-            'const ORIGIN_URL = window.location.origin;',
-            'return origin;',
-            'window.location.href = SETUP_PAGE_URL;',
-        ])
-        rewritten = runner.rewrite_origin_based_subpath_logic(original)
-        self.assertIn("window.__TOOL_ORIGIN_URL__", rewritten)
-        self.assertIn("return window.__TOOL_ORIGIN_URL__ || origin;", rewritten)
-        self.assertIn('Reflect.get(window, "withToolBase")?.(SETUP_PAGE_URL) ?? SETUP_PAGE_URL', rewritten)
 
     def test_find_frontend_rewrite_targets_excludes_typescript_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -676,424 +728,6 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertIn(html_path, targets)
             self.assertIn(entry_path, targets)
 
-    def test_find_subpath_audit_targets_includes_tsx_for_nextjs(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            src_dir = repo_dir / "src" / "components"
-            src_dir.mkdir(parents=True)
-            tsx_path = src_dir / "widget.tsx"
-            tsx_path.write_text("export default function App() { return null }\n", encoding="utf-8")
-            (repo_dir / "package.json").write_text(
-                json.dumps({"dependencies": {"next": "^15.1.0"}}) + "\n",
-                encoding="utf-8",
-            )
-
-            targets = runner.find_subpath_audit_targets(repo_dir, {"framework": "nextjs", "proxy_mode": "preserve_prefix", "adapter": "nextjs"})
-
-            self.assertIn(tsx_path, targets)
-
-    def test_find_subpath_audit_targets_include_runtime_root_html(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            scripts_dir = repo_dir / "scripts"
-            demo_dir = repo_dir / "Demo"
-            scripts_dir.mkdir(parents=True)
-            demo_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"scripts": {"dev": "node ./scripts/server.js"}}) + "\n",
-                encoding="utf-8",
-            )
-            (scripts_dir / "server.js").write_text(
-                '\n'.join([
-                    'const express = require("express");',
-                    'const path = require("path");',
-                    'const dir = path.join(__dirname, "../Demo");',
-                    'const app = express();',
-                    'app.use(express.static(dir));',
-                ]),
-                encoding="utf-8",
-            )
-            html_path = demo_dir / "index.html"
-            html_path.write_text("<html></html>\n", encoding="utf-8")
-
-            targets = runner.find_subpath_audit_targets(repo_dir, {"framework": "express_static", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
-
-            self.assertIn(html_path, targets)
-
-    def test_find_subpath_audit_targets_include_fastapi_views_and_static_js(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            app_dir = repo_dir / "app"
-            views_dir = repo_dir / "views"
-            static_dir = repo_dir / "static"
-            app_dir.mkdir(parents=True)
-            views_dir.mkdir()
-            static_dir.mkdir()
-            (app_dir / "main.py").write_text(
-                "\n".join(
-                    [
-                        "from pathlib import Path",
-                        "from fastapi import FastAPI",
-                        "from fastapi.staticfiles import StaticFiles",
-                        "from fastapi.templating import Jinja2Templates",
-                        "",
-                        "BASE_DIR = Path(__file__).resolve().parent.parent",
-                        "views = Jinja2Templates(directory=str(BASE_DIR / 'views'))",
-                        "app = FastAPI()",
-                        "app.mount('/static', StaticFiles(directory=str(BASE_DIR / 'static')), name='static')",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            html_path = views_dir / "index.html"
-            js_path = static_dir / "app.js"
-            html_path.write_text('<script src="/static/app.js"></script>\n', encoding="utf-8")
-            js_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
-
-            targets = runner.find_subpath_audit_targets(repo_dir, {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
-
-            self.assertIn(html_path, targets)
-            self.assertIn(js_path, targets)
-
-    def test_scan_nextjs_flags_raw_anchor_root_href(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            file_path = repo_dir / "src" / "app" / "layout.tsx"
-            file_path.parent.mkdir(parents=True)
-            file_path.write_text('<a href="/media-api">Media</a>\n', encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "nextjs", "/tools2/demo-next", repo_dir)
-
-            self.assertEqual(len(findings), 1)
-            self.assertIn("subpath deployment", findings[0].message)
-
-    def test_scan_nextjs_allows_next_link_href(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            file_path = repo_dir / "src" / "app" / "page.tsx"
-            file_path.parent.mkdir(parents=True)
-            file_path.write_text("import Link from 'next/link'\n<Link href=\"/media-api\">Media</Link>\n", encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "nextjs", "/tools2/demo-next", repo_dir)
-
-            self.assertEqual(findings, [])
-
-    def test_scan_client_fetch_flags_root_relative_api(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            file_path = repo_dir / "src" / "components" / "widget.tsx"
-            file_path.parent.mkdir(parents=True)
-            file_path.write_text("'use client'\nfetch('/api/token')\n", encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "nextjs", "/tools2/demo-next", repo_dir)
-
-            self.assertEqual(len(findings), 1)
-            self.assertIn("/api/token", findings[0].message)
-
-    def test_scan_generic_runtime_root_js_flags_root_relative_api(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            static_dir = repo_dir / "static"
-            static_dir.mkdir()
-            file_path = static_dir / "app.js"
-            file_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "generic", "/tools2/demo", repo_dir)
-
-            self.assertEqual(len(findings), 1)
-            self.assertIn("/api/analyze-upload", findings[0].message)
-
-    def test_scan_generic_runtime_root_js_flags_root_relative_eventsource(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            static_dir = repo_dir / "static"
-            static_dir.mkdir()
-            file_path = static_dir / "sse.js"
-            file_path.write_text("new EventSource('/api/jobs/123/progress')\n", encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "generic", "/tools2/demo", repo_dir)
-
-            self.assertEqual(len(findings), 1)
-            self.assertIn("/api/jobs/123/progress", findings[0].message)
-
-    def test_rewrite_frontend_subpath_urls_for_vite_index_keeps_src_entry_and_prefixes_icon(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            src_dir = frontend_dir / "src"
-            src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "frontend",
-                        "private": True,
-                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
-                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
-            html_path = frontend_dir / "index.html"
-            html_path.write_text(
-                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
-                encoding="utf-8",
-            )
-
-            changed = runner.rewrite_frontend_subpath_urls(html_path, "/tools2/demo-workspaces", repo_dir)
-            rewritten = html_path.read_text(encoding="utf-8")
-
-            self.assertTrue(changed)
-            self.assertIn('href="/tools2/demo-workspaces/vite.svg"', rewritten)
-            self.assertIn('src="/src/main.tsx"', rewritten)
-
-    def test_scan_subpath_findings_allows_vite_index_src_entry(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            src_dir = frontend_dir / "src"
-            src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "frontend",
-                        "private": True,
-                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
-                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
-            (src_dir / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
-            html_path = frontend_dir / "index.html"
-            html_path.write_text('<script type="module" src="/src/main.tsx"></script>\n', encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(html_path, "vite", "/tools2/demo-workspaces", repo_dir)
-
-            self.assertEqual(findings, [])
-
-    def test_rewrite_frontend_subpath_urls_rewrites_vite_template_fetch(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            src_dir = frontend_dir / "src" / "api"
-            src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "frontend",
-                        "private": True,
-                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
-                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            file_path = src_dir / "jobs.ts"
-            file_path.write_text("fetch(`/api/jobs/${jobId}`)\n", encoding="utf-8")
-
-            changed = runner.rewrite_frontend_subpath_urls(file_path, "/tools2/demo-workspaces", repo_dir)
-            rewritten = file_path.read_text(encoding="utf-8")
-
-            self.assertTrue(changed)
-            self.assertIn('Reflect.get(window, "withToolBase")?.(`/api/jobs/${jobId}`) ?? `/api/jobs/${jobId}`', rewritten)
-
-    def test_rewrite_frontend_subpath_urls_rewrites_eventsource_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            src_hooks_dir = frontend_dir / "src" / "hooks"
-            src_hooks_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "frontend",
-                        "private": True,
-                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
-                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            file_path = src_hooks_dir / "useJobSSE.ts"
-            file_path.write_text(
-                "new EventSource('/api/jobs/123/progress')\nnew EventSource(`/api/jobs/${jobId}/progress`)\n",
-                encoding="utf-8",
-            )
-
-            changed = runner.rewrite_frontend_subpath_urls(file_path, "/tools2/demo-workspaces", repo_dir)
-            rewritten = file_path.read_text(encoding="utf-8")
-
-            self.assertTrue(changed)
-            self.assertIn('new EventSource((Reflect.get(window, "withToolBase")?.(\'/api/jobs/123/progress\') ?? \'/api/jobs/123/progress\'))', rewritten)
-            self.assertIn('new EventSource((Reflect.get(window, "withToolBase")?.(`/api/jobs/${jobId}/progress`) ?? `/api/jobs/${jobId}/progress`))', rewritten)
-
-    def test_rewrite_frontend_subpath_urls_rewrites_returned_api_path(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            src_api_dir = frontend_dir / "src" / "api"
-            src_api_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "frontend",
-                        "private": True,
-                        "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
-                        "devDependencies": {"vite": "^5.0.0", "@vitejs/plugin-react": "^4.0.0"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            file_path = src_api_dir / "jobs.ts"
-            file_path.write_text("export function downloadUrl(jobId: string): string { return `/api/jobs/${jobId}/download` }\n", encoding="utf-8")
-
-            changed = runner.rewrite_frontend_subpath_urls(file_path, "/tools2/demo-workspaces", repo_dir)
-            rewritten = file_path.read_text(encoding="utf-8")
-
-            self.assertTrue(changed)
-            self.assertIn('return (Reflect.get(window, "withToolBase")?.(`/api/jobs/${jobId}/download`) ?? `/api/jobs/${jobId}/download`)', rewritten)
-
-    def test_scan_path_template_string_is_not_flagged(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            file_path = repo_dir / "src" / "app" / "page.tsx"
-            file_path.parent.mkdir(parents=True)
-            file_path.write_text("const config = { pathTemplate: '/api/token' }\n", encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "nextjs", "/tools2/demo-next", repo_dir)
-
-            self.assertEqual(findings, [])
-
-    def test_scan_allow_root_comment_suppresses_finding(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            file_path = repo_dir / "src" / "app" / "layout.tsx"
-            file_path.parent.mkdir(parents=True)
-            file_path.write_text("// ka-subpath-allow-root\n<a href=\"/media-api\">Media</a>\n", encoding="utf-8")
-
-            findings = runner.scan_subpath_findings(file_path, "nextjs", "/tools2/demo-next", repo_dir)
-
-            self.assertEqual(findings, [])
-
-    def test_runtime_subpath_audit_flags_unprefixed_anchor(self) -> None:
-        html = '<html><body><a href="/media-api">Media</a></body></html>'
-
-        findings = runner.runtime_subpath_findings_for_html(html, "/tools2/demo-next", "/tools2/demo-next")
-
-        self.assertEqual(len(findings), 1)
-        self.assertIn('/media-api', findings[0]["message"])
-
-    def test_runtime_subpath_audit_allows_relative_links_under_strip_prefix(self) -> None:
-        html = '<html><head><link rel="stylesheet" href="./assets/app.css"></head><body><a href="./basic/index.html">Demo</a></body></html>'
-
-        findings = runner.runtime_subpath_findings_for_html(html, "/tools2/demo/", "/tools2/demo")
-
-        self.assertEqual(findings, [])
-
-    def test_runtime_subpath_audit_allows_prefixed_urls(self) -> None:
-        html = '<html><body><a href="/tools2/demo-next/media-api">Media</a></body></html>'
-
-        findings = runner.runtime_subpath_findings_for_html(html, "/tools2/demo-next", "/tools2/demo-next")
-
-        self.assertEqual(findings, [])
-
-    def test_runtime_subpath_audit_ignores_external_absolute_links(self) -> None:
-        html = '<html><body><a href="https://doc.shengwang.cn/">Docs</a></body></html>'
-
-        findings = runner.runtime_subpath_findings_for_html(
-            html,
-            "/tools2/demo-next",
-            "/tools2/demo-next",
-            base_origin="https://athena.agoralab.co",
-        )
-
-        self.assertEqual(findings, [])
-
-    def test_runtime_subpath_audit_still_checks_same_host_absolute_links(self) -> None:
-        html = '<html><body><a href="https://athena.agoralab.co/media-api">Media</a></body></html>'
-
-        findings = runner.runtime_subpath_findings_for_html(
-            html,
-            "/tools2/demo-next",
-            "/tools2/demo-next",
-            base_origin="https://athena.agoralab.co",
-        )
-
-        self.assertEqual(len(findings), 1)
-        self.assertIn("/media-api", findings[0]["message"])
-
-    def test_translate_external_to_upstream_path_strips_prefix(self) -> None:
-        self.assertEqual(
-            runner.translate_external_to_upstream_path("/tools2/loga/static/style.css", "/tools2/loga", "strip_prefix"),
-            "/static/style.css",
-        )
-        self.assertEqual(
-            runner.translate_external_to_upstream_path("/tools2/loga/", "/tools2/loga", "strip_prefix"),
-            "/",
-        )
-
-    def test_translate_external_to_upstream_path_preserves_prefix_when_requested(self) -> None:
-        self.assertEqual(
-            runner.translate_external_to_upstream_path("/tools2/demo-next/media-api", "/tools2/demo-next", "preserve_prefix"),
-            "/tools2/demo-next/media-api",
-        )
-
-    def test_runtime_subpath_audit_strip_prefix_requests_upstream_paths(self) -> None:
-        responses = {
-            "/": (200, {"content-type": "text/html"}, '<html><head><link rel="stylesheet" href="/tools2/loga/static/style.css"></head></html>', "/"),
-            "/static/style.css": (200, {"content-type": "text/css"}, "body {}", "/static/style.css"),
-        }
-
-        with mock.patch.object(runner, "fetch_http_text", side_effect=lambda host_port, path, **kwargs: responses[path]):
-            audit = runner.run_runtime_subpath_audit(8005, "loga", "strip_prefix")
-
-        self.assertEqual(audit["findings"], [])
-        self.assertEqual(audit["checked_paths"], ["/tools2/loga/", "/tools2/loga/static/style.css"])
-
-    def test_runtime_subpath_audit_strip_prefix_resolves_relative_urls_from_external_base(self) -> None:
-        responses = {
-            "/": (200, {"content-type": "text/html"}, '<html><head><link rel="stylesheet" href="./assets/app.css"></head><body><a href="./basic/index.html">Demo</a></body></html>', "/"),
-            "/assets/app.css": (200, {"content-type": "text/css"}, "body {}", "/assets/app.css"),
-            "/basic/index.html": (200, {"content-type": "text/html"}, "<html><body>ok</body></html>", "/basic/index.html"),
-        }
-
-        with mock.patch.object(runner, "fetch_http_text", side_effect=lambda host_port, path, **kwargs: responses[path]):
-            audit = runner.run_runtime_subpath_audit(8005, "demo", "strip_prefix")
-
-        self.assertEqual(audit["findings"], [])
-        self.assertEqual(
-            audit["checked_paths"],
-            ["/tools2/demo/", "/tools2/demo/assets/app.css", "/tools2/demo/basic/index.html"],
-        )
-
     def test_apply_subpath_rewrites_nextjs_adds_basepath_and_autofix_runtime_urls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)
@@ -1139,7 +773,24 @@ class RunnerProjectSlugTests(unittest.TestCase):
             (repo_dir / "ka_tool_base_runtime.ts").write_text("legacy shim\n", encoding="utf-8")
             (repo_dir / "ka_tool_window.d.ts").write_text("legacy types\n", encoding="utf-8")
 
-            changed = runner.apply_subpath_rewrites(repo_dir, "demo-next")
+            changed = subpath_apply_subpath_rewrites(
+                repo_dir,
+                "demo-next",
+                plan=self._build_plan(repo_dir),
+                apply_framework_config_adapters=lambda plan, slug: runner.subpath_apply_framework_config_adapters(
+                    plan,
+                    slug,
+                    parse_package_json=runner.parse_package_json,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                apply_nextjs_subpath_adapter_fn=runner.apply_nextjs_subpath_adapter,
+                apply_vite_subpath_adapter_fn=runner.apply_vite_subpath_adapter,
+                ensure_vue_cli_public_path_fn=runner.ensure_vue_cli_public_path,
+                ensure_cra_homepage_fn=runner.ensure_cra_homepage,
+                find_frontend_rewrite_targets=runner.find_frontend_rewrite_targets,
+                rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
+            )
 
             self.assertIn("next.config.ts", changed)
             self.assertIn("src/app/layout.tsx", changed)
@@ -1180,8 +831,42 @@ class RunnerProjectSlugTests(unittest.TestCase):
             layout_path = src_app_dir / "layout.tsx"
             layout_path.write_text("export default function RootLayout() { return null }\n", encoding="utf-8")
 
-            first = runner.apply_subpath_rewrites(repo_dir, "demo-next")
-            second = runner.apply_subpath_rewrites(repo_dir, "demo-next")
+            first = subpath_apply_subpath_rewrites(
+                repo_dir,
+                "demo-next",
+                plan=self._build_plan(repo_dir),
+                apply_framework_config_adapters=lambda plan, slug: runner.subpath_apply_framework_config_adapters(
+                    plan,
+                    slug,
+                    parse_package_json=runner.parse_package_json,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                apply_nextjs_subpath_adapter_fn=runner.apply_nextjs_subpath_adapter,
+                apply_vite_subpath_adapter_fn=runner.apply_vite_subpath_adapter,
+                ensure_vue_cli_public_path_fn=runner.ensure_vue_cli_public_path,
+                ensure_cra_homepage_fn=runner.ensure_cra_homepage,
+                find_frontend_rewrite_targets=runner.find_frontend_rewrite_targets,
+                rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
+            )
+            second = subpath_apply_subpath_rewrites(
+                repo_dir,
+                "demo-next",
+                plan=self._build_plan(repo_dir),
+                apply_framework_config_adapters=lambda plan, slug: runner.subpath_apply_framework_config_adapters(
+                    plan,
+                    slug,
+                    parse_package_json=runner.parse_package_json,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                apply_nextjs_subpath_adapter_fn=runner.apply_nextjs_subpath_adapter,
+                apply_vite_subpath_adapter_fn=runner.apply_vite_subpath_adapter,
+                ensure_vue_cli_public_path_fn=runner.ensure_vue_cli_public_path,
+                ensure_cra_homepage_fn=runner.ensure_cra_homepage,
+                find_frontend_rewrite_targets=runner.find_frontend_rewrite_targets,
+                rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
+            )
 
             self.assertTrue(first)
             self.assertEqual(second, [])
@@ -1189,28 +874,6 @@ class RunnerProjectSlugTests(unittest.TestCase):
             config_text = (repo_dir / "next.config.ts").read_text(encoding="utf-8")
             self.assertEqual(config_text.count('basePath: "/tools2/demo-next"'), 1)
             self.assertEqual(config_text.count('assetPrefix: "/tools2/demo-next"'), 1)
-
-    def test_nextjs_helper_module_exports_pure_function(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            src_app_dir = repo_dir / "src" / "app"
-            src_app_dir.mkdir(parents=True)
-            entry_path = src_app_dir / "layout.tsx"
-            entry_path.write_text("export default function RootLayout() { return null }\n", encoding="utf-8")
-
-            changed = runner.ensure_nextjs_helper_module(entry_path, repo_dir, "demo-next")
-            helper_text = (repo_dir / "ka_tool_base_runtime.ts").read_text(encoding="utf-8")
-
-            self.assertTrue(changed)
-            self.assertIn("export function withToolBase", helper_text)
-            self.assertNotIn("window.withToolBase", helper_text)
-
-    def test_insert_import_after_directives_preserves_use_client_first(self) -> None:
-        original = "'use client'\n\nexport default function Demo() { return null }\n"
-
-        rewritten = runner.insert_import_after_directives(original, 'import Link from "next/link"')
-
-        self.assertTrue(rewritten.startswith("'use client'\nimport Link from \"next/link\"\n"))
 
     def test_auto_fix_nextjs_subpath_issues_allows_static_audit_to_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1238,9 +901,40 @@ class RunnerProjectSlugTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            initial = runner.run_static_subpath_audit(repo_dir, "demo-next", {"framework": "nextjs", "proxy_mode": "preserve_prefix", "adapter": "nextjs"})
-            changed = runner.auto_fix_subpath_issues(repo_dir, "demo-next", {"framework": "nextjs", "proxy_mode": "preserve_prefix", "adapter": "nextjs"})
-            after = runner.run_static_subpath_audit(repo_dir, "demo-next", {"framework": "nextjs", "proxy_mode": "preserve_prefix", "adapter": "nextjs"})
+            plan = self._build_plan(repo_dir)
+            initial = subpath_run_static_subpath_audit(
+                repo_dir,
+                "demo-next",
+                plan,
+                collect_matching_files=runner.collect_matching_files,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+                read_text=runner.read_text,
+            )
+            changed = subpath_auto_fix_subpath_issues(
+                repo_dir,
+                "demo-next",
+                plan,
+                auto_fix_nextjs_subpath_issues_fn=runner.auto_fix_nextjs_subpath_issues,
+                find_subpath_audit_targets=lambda repo_dir_arg, plan_arg: runner.subpath_find_subpath_audit_targets(
+                    repo_dir_arg,
+                    plan_arg,
+                    collect_matching_files=runner.collect_matching_files,
+                    detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                    vite_project_roots=runner.vite_project_roots,
+                ),
+                rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
+                sorted_unique=runner.sorted_unique,
+            )
+            after = subpath_run_static_subpath_audit(
+                repo_dir,
+                "demo-next",
+                plan,
+                collect_matching_files=runner.collect_matching_files,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+                read_text=runner.read_text,
+            )
 
             self.assertTrue(initial["findings"])
             self.assertTrue(changed)
@@ -1280,9 +974,40 @@ class RunnerProjectSlugTests(unittest.TestCase):
             )
             js_path.write_text("fetch('/api/analyze-upload')\n", encoding="utf-8")
 
-            initial = runner.run_static_subpath_audit(repo_dir, "demo-fastapi", {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
-            changed = runner.auto_fix_subpath_issues(repo_dir, "demo-fastapi", {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
-            after = runner.run_static_subpath_audit(repo_dir, "demo-fastapi", {"framework": "generic", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
+            plan = self._build_plan(repo_dir)
+            initial = subpath_run_static_subpath_audit(
+                repo_dir,
+                "demo-fastapi",
+                plan,
+                collect_matching_files=runner.collect_matching_files,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+                read_text=runner.read_text,
+            )
+            changed = subpath_auto_fix_subpath_issues(
+                repo_dir,
+                "demo-fastapi",
+                plan,
+                auto_fix_nextjs_subpath_issues_fn=runner.auto_fix_nextjs_subpath_issues,
+                find_subpath_audit_targets=lambda repo_dir_arg, plan_arg: runner.subpath_find_subpath_audit_targets(
+                    repo_dir_arg,
+                    plan_arg,
+                    collect_matching_files=runner.collect_matching_files,
+                    detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                    vite_project_roots=runner.vite_project_roots,
+                ),
+                rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
+                sorted_unique=runner.sorted_unique,
+            )
+            after = subpath_run_static_subpath_audit(
+                repo_dir,
+                "demo-fastapi",
+                plan,
+                collect_matching_files=runner.collect_matching_files,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+                read_text=runner.read_text,
+            )
 
             self.assertTrue(initial["findings"])
             self.assertIn("views/index.html", changed)
@@ -1322,201 +1047,80 @@ class RunnerProjectSlugTests(unittest.TestCase):
             )
             api_path.write_text("fetch('/api/jobs')\nfetch(`/api/jobs/${jobId}`)\n", encoding="utf-8")
 
-            initial = runner.run_static_subpath_audit(repo_dir, "decrypt-online", {"framework": "vite", "proxy_mode": "strip_prefix", "adapter": "vite"})
-            changed = runner.auto_fix_subpath_issues(repo_dir, "decrypt-online", {"framework": "vite", "proxy_mode": "strip_prefix", "adapter": "static_rewrite"})
-            after = runner.run_static_subpath_audit(repo_dir, "decrypt-online", {"framework": "vite", "proxy_mode": "strip_prefix", "adapter": "vite"})
+            plan = self._build_plan(repo_dir)
+            initial = subpath_run_static_subpath_audit(
+                repo_dir,
+                "decrypt-online",
+                plan,
+                collect_matching_files=runner.collect_matching_files,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+                read_text=runner.read_text,
+            )
+            report = runner.subpath_auto_fix_findings(
+                repo_dir,
+                "decrypt-online",
+                initial["findings"],
+                plan,
+                auto_fix_nextjs_subpath_issues_fn=runner.auto_fix_nextjs_subpath_issues,
+                find_subpath_audit_targets=lambda repo_dir_arg, plan_arg: runner.subpath_find_subpath_audit_targets(
+                    repo_dir_arg,
+                    plan_arg,
+                    collect_matching_files=runner.collect_matching_files,
+                    detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                    vite_project_roots=runner.vite_project_roots,
+                ),
+                rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
+                rewrite_frontend_html_attribute_urls=runner.rewrite_frontend_html_attribute_urls,
+                rewrite_frontend_html_link_urls=runner.rewrite_frontend_html_link_urls,
+                rewrite_frontend_html_script_urls=runner.rewrite_frontend_html_script_urls,
+                rewrite_frontend_html_form_action_urls=runner.rewrite_frontend_html_form_action_urls,
+                rewrite_frontend_client_request_urls=runner.rewrite_frontend_client_request_urls,
+                rewrite_frontend_request_api_urls=lambda file_path, base_path, repo_dir_arg: runner.subpath_rewrite_frontend_request_api_urls(
+                    file_path,
+                    base_path,
+                    repo_dir_arg,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                rewrite_frontend_navigation_urls=lambda file_path, base_path, repo_dir_arg: runner.subpath_rewrite_frontend_navigation_urls(
+                    file_path,
+                    base_path,
+                    repo_dir_arg,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                rewrite_frontend_eventsource_urls=lambda file_path, base_path, repo_dir_arg: runner.subpath_rewrite_frontend_eventsource_urls(
+                    file_path,
+                    base_path,
+                    repo_dir_arg,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                rewrite_frontend_return_value_urls=lambda file_path, base_path, repo_dir_arg: runner.subpath_rewrite_frontend_return_value_urls(
+                    file_path,
+                    base_path,
+                    repo_dir_arg,
+                    read_text=runner.read_text,
+                    write_text=runner.write_text,
+                ),
+                sorted_unique=runner.sorted_unique,
+            )
+            changed = report["changed_files"]
+            after = subpath_run_static_subpath_audit(
+                repo_dir,
+                "decrypt-online",
+                plan,
+                collect_matching_files=runner.collect_matching_files,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+                read_text=runner.read_text,
+            )
 
             self.assertTrue(initial["findings"])
             self.assertIn("frontend/index.html", changed)
             self.assertIn("frontend/src/api/jobs.ts", changed)
             self.assertEqual(after["findings"], [])
-
-    def test_detect_subpath_strategy_for_vite(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            src_dir = repo_dir / "src" / "api"
-            src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"devDependencies": {"vite": "^5.0.0"}}) + "\n",
-                encoding="utf-8",
-            )
-            (repo_dir / "vite.config.ts").write_text(
-                "import { defineConfig } from 'vite'\nexport default defineConfig({})\n",
-                encoding="utf-8",
-            )
-            (repo_dir / "index.html").write_text(
-                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
-                encoding="utf-8",
-            )
-            (repo_dir / "src" / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
-            (src_dir / "jobs.ts").write_text("fetch('/api/jobs')\n", encoding="utf-8")
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-            changed = runner.apply_subpath_rewrites(repo_dir, "demo-vite")
-
-            self.assertEqual(strategy["framework"], "vite")
-            self.assertEqual(strategy["proxy_mode"], "preserve_prefix")
-            self.assertIn("vite.config.ts", changed)
-            self.assertIn("index.html", changed)
-            self.assertIn("src/api/jobs.ts", changed)
-            self.assertIn('base: "/tools2/demo-vite/"', (repo_dir / "vite.config.ts").read_text(encoding="utf-8"))
-
-    def test_detect_subpath_strategy_for_vite_fastify_static_uses_strip_prefix(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            frontend_dist_dir = frontend_dir / "dist"
-            backend_src_dir = repo_dir / "backend" / "src"
-            frontend_dir.mkdir(parents=True)
-            frontend_dist_dir.mkdir(parents=True)
-            backend_src_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": "decrypt-online",
-                        "private": True,
-                        "workspaces": ["frontend", "backend"],
-                        "scripts": {"start": "npm run start --workspace=backend"},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps({"name": "frontend", "private": True, "devDependencies": {"vite": "^5.0.0"}}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "vite.config.ts").write_text("import { defineConfig } from 'vite'\nexport default defineConfig({})\n", encoding="utf-8")
-            (repo_dir / "backend" / "package.json").write_text(
-                json.dumps({"name": "backend", "private": True, "scripts": {"start": "tsx src/index.ts"}}) + "\n",
-                encoding="utf-8",
-            )
-            (backend_src_dir / "index.ts").write_text(
-                "\n".join(
-                    [
-                        "import path from 'path'",
-                        "const frontendDist = path.resolve(__dirname, '../../frontend/dist')",
-                        "await fastify.register(fastifyStatic, {",
-                        "  root: frontendDist,",
-                        "  prefix: '/'",
-                        "})",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-
-            self.assertEqual(strategy["framework"], "vite")
-            self.assertEqual(strategy["proxy_mode"], "strip_prefix")
-
-    def test_detect_subpath_strategy_for_workspace_vite_project(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            frontend_dir = repo_dir / "frontend"
-            src_api_dir = frontend_dir / "src" / "api"
-            frontend_dir.mkdir(parents=True)
-            src_api_dir.mkdir(parents=True)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"name": "demo-workspaces", "private": True, "workspaces": ["frontend"]}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "package.json").write_text(
-                json.dumps({"name": "frontend", "private": True, "devDependencies": {"vite": "^5.0.0"}}) + "\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "vite.config.ts").write_text(
-                "import { defineConfig } from 'vite'\nexport default defineConfig({})\n",
-                encoding="utf-8",
-            )
-            (frontend_dir / "index.html").write_text(
-                '<!doctype html><html><head><link rel="icon" href="/vite.svg" /></head><body><script type="module" src="/src/main.tsx"></script></body></html>\n',
-                encoding="utf-8",
-            )
-            (frontend_dir / "src" / "main.tsx").write_text("console.log('demo')\n", encoding="utf-8")
-            (src_api_dir / "jobs.ts").write_text("fetch('/api/jobs')\nfetch(`/api/jobs/${jobId}`)\n", encoding="utf-8")
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-            changed = runner.apply_subpath_rewrites(repo_dir, "demo-workspaces")
-
-            self.assertEqual(strategy["framework"], "vite")
-            self.assertEqual(strategy["proxy_mode"], "preserve_prefix")
-            self.assertIn("frontend/vite.config.ts", changed)
-            self.assertIn("frontend/index.html", changed)
-            self.assertIn("frontend/src/api/jobs.ts", changed)
-            self.assertIn('base: "/tools2/demo-workspaces/"', (frontend_dir / "vite.config.ts").read_text(encoding="utf-8"))
-
-    def test_detect_subpath_strategy_for_vue_cli(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"devDependencies": {"@vue/cli-service": "^5.0.0"}}) + "\n",
-                encoding="utf-8",
-            )
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-            changed = runner.apply_subpath_rewrites(repo_dir, "demo-vue")
-
-            self.assertEqual(strategy["framework"], "vue_cli")
-            self.assertEqual(strategy["proxy_mode"], "preserve_prefix")
-            self.assertEqual(changed, ["vue.config.js"])
-            self.assertIn("publicPath: '/tools2/demo-vue/'", (repo_dir / "vue.config.js").read_text(encoding="utf-8"))
-
-    def test_detect_subpath_strategy_for_cra(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            package_path = repo_dir / "package.json"
-            package_path.write_text(
-                json.dumps({"dependencies": {"react-scripts": "^5.0.1"}}) + "\n",
-                encoding="utf-8",
-            )
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-            changed = runner.apply_subpath_rewrites(repo_dir, "demo-cra")
-
-            self.assertEqual(strategy["framework"], "cra")
-            self.assertEqual(strategy["proxy_mode"], "preserve_prefix")
-            self.assertEqual(changed, ["package.json"])
-            self.assertIn('"homepage": "/tools2/demo-cra"', package_path.read_text(encoding="utf-8"))
-
-    def test_detect_subpath_strategy_for_express_static(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            (repo_dir / "package.json").write_text(
-                json.dumps({"scripts": {"dev": "node ./scripts/server.js"}}) + "\n",
-                encoding="utf-8",
-            )
-            scripts_dir = repo_dir / "scripts"
-            src_dir = repo_dir / "src"
-            scripts_dir.mkdir(parents=True)
-            src_dir.mkdir(parents=True)
-            (scripts_dir / "server.js").write_text(
-                '\n'.join([
-                    'const express = require("express");',
-                    'const path = require("path");',
-                    'const dir = path.join(__dirname, "../src");',
-                    'const app = express();',
-                    'app.use(express.static(dir));',
-                ]),
-                encoding="utf-8",
-            )
-            (src_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-
-            self.assertEqual(strategy["framework"], "express_static")
-            self.assertEqual(strategy["proxy_mode"], "strip_prefix")
-
-    def test_detect_subpath_strategy_for_static_html(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir)
-            (repo_dir / "index.html").write_text("<html></html>\n", encoding="utf-8")
-
-            strategy = runner.detect_subpath_strategy(repo_dir)
-
-            self.assertEqual(strategy["framework"], "static_html")
-            self.assertEqual(strategy["proxy_mode"], "strip_prefix")
 
     def test_discover_workspace_packages_reads_pnpm_workspace_members(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1713,6 +1317,79 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertEqual(selected["relative_dir"], "apps/portal")
             self.assertEqual(selected["build_command"], "pnpm --dir apps/portal build")
 
+    def test_collect_repo_analysis_detects_runtime_build_artifacts_for_workspace_frontend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            frontend_dir = repo_dir / "frontend"
+            backend_src_dir = repo_dir / "backend" / "src"
+            frontend_dir.mkdir(parents=True)
+            backend_src_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "decrypt-online",
+                        "private": True,
+                        "workspaces": ["frontend", "backend"],
+                        "scripts": {
+                            "build": "npm run build --workspace=frontend",
+                            "start": "npm run start --workspace=backend",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "package-lock.json").write_text("{}\n", encoding="utf-8")
+            (frontend_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "decrypt-online-frontend",
+                        "private": True,
+                        "scripts": {"build": "vite build"},
+                        "devDependencies": {"vite": "^5.4.3"},
+                        "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (frontend_dir / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite'\nexport default defineConfig({})\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "backend" / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "decrypt-online-backend",
+                        "private": True,
+                        "scripts": {"start": "tsx src/index.ts"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (backend_src_dir / "index.ts").write_text(
+                "\n".join(
+                    [
+                        "import path from 'path'",
+                        "const frontendDist = path.resolve(__dirname, '../../frontend/dist')",
+                        "await fastify.register(fastifyStatic, {",
+                        "  root: frontendDist,",
+                        "  prefix: '/'",
+                        "})",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            analysis = runner.collect_repo_analysis(repo_dir, "git", "https://example.com/demo.git", "main")
+
+            self.assertTrue(analysis["requires_build_step"])
+            self.assertIn("frontend/dist", analysis["runtime_build_artifact_paths"])
+            self.assertEqual(analysis["required_build_commands"], ["npm run build --workspace=frontend"])
+            self.assertIn("npm run build --workspace=frontend", analysis["build_command_candidates"])
+
     def test_summarize_analysis_is_json_serializable_with_workspace_service_package(self) -> None:
         analysis = {
             "service_runtime": "node",
@@ -1826,6 +1503,130 @@ class RunnerProjectSlugTests(unittest.TestCase):
 
             self.assertEqual(findings, [])
             self.assertEqual(warnings, [])
+
+    def test_validate_generated_files_does_not_require_build_step_without_runtime_build_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "api-only-service",
+                        "private": True,
+                        "scripts": {
+                            "build": "tsc",
+                            "start": "tsx src/index.ts",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "package-lock.json").write_text("{}\n", encoding="utf-8")
+            src_dir = repo_dir / "src"
+            src_dir.mkdir()
+            (src_dir / "index.ts").write_text(
+                "console.log('hello')\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        "FROM node:22-alpine",
+                        "WORKDIR /app",
+                        "COPY package.json package-lock.json ./",
+                        "RUN npm ci",
+                        "COPY . .",
+                        'CMD ["tsx", "src/index.ts"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 1 项目基础信息",
+                        "## 2 代码和版本信息",
+                        "## 3 启动信息",
+                        "## 4 运行参数",
+                        "## 5 配置与密钥",
+                        "## 6 存储信息",
+                        "## 7 证据与判断说明",
+                        "## 8 待确认问题",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            findings, warnings = runner.validate_generated_files(
+                repo_dir,
+                source_type="git",
+                source="https://example.com/demo.git",
+                ref="main",
+            )
+
+            self.assertEqual(findings, [])
+            self.assertEqual(warnings, [])
+
+    def test_validate_generated_files_rejects_unknown_runtime_port_in_dockerfile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "demo-service",
+                        "private": True,
+                        "scripts": {"start": "node server.js"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "server.js").write_text("console.log('ok')\n", encoding="utf-8")
+            (repo_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        "FROM node:22-alpine",
+                        "WORKDIR /app",
+                        "COPY . .",
+                        "ENV PORT=UNKNOWN",
+                        "EXPOSE UNKNOWN",
+                        'CMD ["node", "server.js"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 1 项目基础信息",
+                        "## 2 代码和版本信息",
+                        "## 3 启动信息",
+                        "## 4 运行参数",
+                        "## 5 配置与密钥",
+                        "## 6 存储信息",
+                        "## 7 证据与判断说明",
+                        "## 8 待确认问题",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            findings, warnings = runner.validate_generated_files(
+                repo_dir,
+                source_type="git",
+                source="https://example.com/demo.git",
+                ref="main",
+            )
+
+            self.assertIn("Dockerfile uses UNKNOWN in EXPOSE for a runtime-critical port; omit EXPOSE when the port is not confirmed", findings)
+            self.assertIn("Dockerfile sets PORT=UNKNOWN; omit the PORT default until a concrete port is confirmed", findings)
+            self.assertIn("Dockerfile contains TODO/UNKNOWN markers", warnings)
 
     def test_validate_generated_files_accepts_chained_next_build_and_full_app_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1970,6 +1771,52 @@ class RunnerProjectSlugTests(unittest.TestCase):
                 "Dockerfile prunes devDependencies even though next.config.ts requires TypeScript to remain available at runtime",
                 findings,
             )
+
+    def test_parse_onboarding_run_spec_ignores_unknown_placeholder_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            onboarding_path = Path(temp_dir) / "PROJECT_ONBOARDING.md"
+            onboarding_path.write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 4 运行参数",
+                        "- 启动命令：`node scripts/server.js`",
+                        "## 5 配置与密钥",
+                        "- 已确认环境变量：`UNKNOWN`",
+                        "## 6 存储信息",
+                        "- 持久化目录：`UNKNOWN`",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            spec = runner.parse_onboarding_run_spec(onboarding_path)
+
+            self.assertEqual(spec["environment_variables"], [])
+            self.assertEqual(spec["persistence_paths"], [])
+
+    def test_parse_onboarding_run_spec_keeps_backward_compatibility_for_legacy_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            onboarding_path = Path(temp_dir) / "PROJECT_ONBOARDING.md"
+            onboarding_path.write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 5 配置与密钥",
+                        "- 已确认环境变量：`NONE`",
+                        "## 6 存储信息",
+                        "- 持久化目录：`NEEDS_CONFIRMATION, TBD - 由管理员构建, NONE`",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            spec = runner.parse_onboarding_run_spec(onboarding_path)
+
+            self.assertEqual(spec["environment_variables"], [])
+            self.assertEqual(spec["persistence_paths"], [])
 
     def test_build_runtime_rules_mentions_nextjs_ts_runtime_constraints(self) -> None:
         rules = runner.build_runtime_rules(
@@ -2126,7 +1973,7 @@ class RunnerProjectSlugTests(unittest.TestCase):
             )
 
             self.assertEqual(entry_path, app_dir / "main.py")
-            self.assertEqual(entry_command, "python -m app.main")
+            self.assertEqual(entry_command, "python app/main.py")
 
     def test_detect_python_entrypoint_keeps_python_module_for_flask_main_program(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2152,7 +1999,39 @@ class RunnerProjectSlugTests(unittest.TestCase):
             )
 
             self.assertEqual(entry_path, repo_dir / "server.py")
-            self.assertEqual(entry_command, "python -m server")
+            self.assertEqual(entry_command, "python server.py")
+
+    def test_detect_python_entrypoint_prefers_script_for_flask_program_with_local_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            web_dir = repo_dir / "web"
+            analyzer_dir = web_dir / "analyzer"
+            analyzer_dir.mkdir(parents=True)
+            (analyzer_dir / "__init__.py").write_text("def analyze():\n    return 'ok'\n", encoding="utf-8")
+            app_path = web_dir / "app.py"
+            app_path.write_text(
+                "\n".join(
+                    [
+                        "from flask import Flask",
+                        "from analyzer import analyze",
+                        "",
+                        "app = Flask(__name__)",
+                        "",
+                        "if __name__ == \"__main__\":",
+                        "    app.run(host=\"0.0.0.0\", port=5050)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            entry_path, entry_command, _entry_text = runner.detect_python_entrypoint(
+                repo_dir,
+                python_dependencies=["flask"],
+            )
+
+            self.assertEqual(entry_path, app_path)
+            self.assertEqual(entry_command, "python web/app.py")
 
     def test_collect_repo_analysis_prefers_source_entrypoint_for_fastapi_project(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

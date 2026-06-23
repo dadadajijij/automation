@@ -1,97 +1,234 @@
-# Phase 1 Automation
+# Automation Workspace
 
-这个目录负责把源码准备、`Dockerfile` / `PROJECT_ONBOARDING.md` 生成、以及 Podman build/run 串成一条流水线。
+这个仓库当前包含两条主线：
 
-## 文件
+- 部署流水线：[`runner.sh`](./runner.sh) / [`runner.py`](./runner.py)
+- 机器巡检：[`machine_health_check/`](./machine_health_check/)
 
-- `runner.py`：主控脚本
-- `runner.sh`：shell 入口
-- `generation_rules.md`：生成规则
-- `templates/`：文档模板
-- `jobs/`：共享源码工作区和单次执行产物
+其中 [`subpath/`](./subpath/) 是部署流水线内部使用的子路径适配库，相关实现说明在 [`doc/`](./doc/)。
 
-## 支持输入
+## 部署流水线
 
-- 本地目录
-- Git 仓库 URL
+### 当前能力
 
-## 私有仓库认证
+- 输入本地目录或 Git 仓库
+- 复用项目级共享源码副本
+- 生成或补齐 `Dockerfile` / `PROJECT_ONBOARDING.md`
+- 执行子路径识别、源码改写、静态审计、运行时审计
+- 可选执行 `podman build` / `podman run`
+- 为 `/tools2/<project_slug>` 生成 nginx 片段，并在条件满足时尝试同步到 Athena nginx 配置
 
-- SSH 方式：
-  - 如果 `--source` 使用 `git@github.com:owner/repo.git` 这类 SSH URL，则直接复用当前机器已配置的 SSH key / ssh-agent / `GIT_SSH_COMMAND`
-- HTTPS + GitHub Token 方式：
-  - 如果 `--source` 使用 `https://github.com/owner/repo.git` 这类 HTTPS URL，可在执行前传入 `GITHUB_TOKEN`
-  - 对 GitHub HTTPS URL，脚本会先自动尝试等价的 SSH URL；如果 SSH 失败，再回退到 HTTPS + Token
-  - 示例：
+### 入口
+
+外部入口是：
 
 ```bash
-GITHUB_TOKEN=ghp_xxx ./automation/runner.sh --source-type git --source https://github.com/owner/private-repo.git --ref main
+./runner.sh ...
 ```
 
-  - 也兼容 `GH_TOKEN`
-  - 脚本内部会自动启用非交互式 `GIT_ASKPASS` 认证，并强制 `GIT_TERMINAL_PROMPT=0`，避免卡在用户名/密码输入
+`runner.sh` 会先：
 
-## 用法
+- 尝试把 `codex` 放进 `PATH`
+- 预读本机已有的 `docker.io/library/*` 基础镜像并缓存到 `codex-home-cache/local-official-images.txt`
 
-本地目录，只生成文件：
+随后执行：
 
 ```bash
-./automation/runner.sh --source-type local --source /path/to/project
+python3 runner.py "$@"
+```
+
+### 常用命令
+
+只生成文件：
+
+```bash
+./runner.sh --source-type local --source /path/to/project
 ```
 
 Git 仓库，生成文件并构建镜像：
 
 ```bash
-./automation/runner.sh --source-type git --source https://github.com/example/repo.git --build
+./runner.sh --source-type git --source https://github.com/example/repo.git --build
 ```
 
 Git 仓库，生成文件、构建镜像并尝试运行：
 
 ```bash
-./automation/runner.sh --source-type git --source https://github.com/example/repo.git --build --run
+./runner.sh --source-type git --source https://github.com/example/repo.git --build --run
 ```
 
-`RUN_SUCCEEDED` 时会输出访问 URL。runner 会先从共享源码副本复制出一个 job 私有工作副本，再在该私有副本中对前端绝对路径 API/静态资源引用做第一版子路径改写，并在 `automation/jobs/<项目名>/nginx-add.conf` 生成该项目需要新增的 nginx 规则。对外访问路径统一使用 `tools2/<项目名>`。如果本机存在 `/etc/nginx/sites-available/tools.conf`，runner 会在 `RUN_SUCCEEDED` 之后直接读写这个文件：若当前项目已存在 Runner 管理的 `# BEGIN KA TOOL <项目名> ... # END KA TOOL <项目名>` block，则按最新端口和代理模式覆盖；若不存在，则直接追加到文件末尾。写回前会通过 `sudo -n` 先备份出 `/etc/nginx/sites-available/tools_<时间戳>.conf`，随后执行 `nginx -t` 与 reload；失败时只记 warning，不会让工具部署结果回滚为失败。`--tool-id` 现在只是透传记录字段，不再决定是否启用这套平台部署流程。
+指定已有项目端口覆盖时，也可以显式传入宿主机端口：
 
-前端子路径改写只发生在 job 私有工作副本中，不会修改原始上游仓库；当前已覆盖根目录、`src/`、`static/`、`public/`、`client/`、`web/` 等常见前端目录，并会对 `window.location.origin` / `window.location.href` 一类运行时跳转逻辑做部署时补丁，使其优先使用 `window.__TOOL_BASE_PATH__`。
+```bash
+./runner.sh --source-type git --source https://github.com/example/repo.git --build --run --host-port 8010
+```
 
-对于 Node 静态站点项目，runner 还会尝试从入口脚本里自动识别真实静态根目录，例如 `express.static(path.join(__dirname, "../src"))`、`serveStatic(...)`、`koaStatic(...)`，并以识别出的静态根为准做资源路径改写，减少对固定目录命名的依赖。
+### 私有仓库认证
 
-本地源码场景下，项目名优先从源码元数据读取，例如 `package.json` 的 `name` 或 `pyproject.toml` 的 `[project].name`。如果拿不到元数据，则回退到目录名归一化；像 `agora-token-generator 2`、`agora-token-generator-2` 这类本地副本目录会统一识别为 `agora-token-generator`。
+- SSH URL 会直接复用当前机器的 SSH key / `ssh-agent` / `GIT_SSH_COMMAND`
+- GitHub HTTPS URL 会先尝试等价 SSH URL，失败后再回退到 HTTPS + Token
+- HTTPS 场景支持 `GITHUB_TOKEN`，也兼容 `GH_TOKEN`
+- clone 阶段会启用非交互式 `GIT_ASKPASS`，并强制 `GIT_TERMINAL_PROMPT=0`
 
-## 目录结构
+示例：
 
-- `automation/jobs/<项目名>/repo`：按项目隔离的共享源码工作区
-- `automation/jobs/<项目名>/repo-state.json`：按项目隔离的共享源码状态
-- `automation/jobs/<项目名>/<job_id>`：该项目下单次执行产物，主要包含 `output/` 和 `codex-home/`
-- `automation/codex-home-cache`：共享静态 Codex 缓存
-- `automation/project-ports.json`：项目名到端口映射关系，格式为 `"项目名": "宿主机端口:容器端口"`，每个项目只保留一个运行容器
+```bash
+GITHUB_TOKEN=ghp_xxx ./runner.sh --source-type git --source https://github.com/owner/private-repo.git --ref main
+```
 
-## 执行流程
+### 目录结构
 
-1. 准备或复用 `automation/jobs/<项目名>/repo`
-2. 准备最小化 `codex-home` 写入层，并复用共享静态缓存
-3. 使用 `codex exec` 生成 `Dockerfile` 和 `PROJECT_ONBOARDING.md`
-4. 写入 `runner.log`、阶段日志和 `result.json`
-5. 如果指定 `--build`，执行 `podman build`
-6. 如果指定 `--run`，优先结合 `PROJECT_ONBOARDING.md` 和镜像 inspect 自动确定端口并运行容器
+- `jobs/<project_slug>/repo`
+  项目级共享源码副本
+- `jobs/<project_slug>/repo-state.json`
+  共享副本对应的本地内容签名或 Git 源签名
+- `jobs/<project_slug>/<job_id>/work-repo`
+  本次任务实际操作的私有工作副本
+- `jobs/<project_slug>/<job_id>/output/`
+  本次任务的日志与结果
+- `jobs/<project_slug>/nginx-add.conf`
+  当前项目对应的 nginx 片段
+- `codex-home-cache/`
+  共享的 Codex 静态缓存
+- `project-ports.json`
+  项目级运行时覆盖配置
 
-## 运行细节
+### 当前执行逻辑
 
-- 默认 job 目录名为 Unix 时间戳
-- 不同项目会按项目名隔离到 `automation/jobs/<项目名>/...`
-- 本地源码输入在内容未变化时会复用对应项目下的 `automation/jobs/<项目名>/repo`；本地临时解压路径变化本身不会打破复用
-- 当本地源码内容有变化但源码里仍未自带 `Dockerfile` 时，runner 会优先沿用 `automation/jobs/<项目名>/repo` 下已有的 `Dockerfile`，避免再次调用 `codex exec` 重新生成同一份 Dockerfile
-- 如果源码仓库里已经存在 `Dockerfile`，则只补生成 `PROJECT_ONBOARDING.md`，不会重写现有 `Dockerfile`
-- 如果 `Dockerfile` 已存在但 `PROJECT_ONBOARDING.md` 缺失，runner 仍会调用一次 `codex exec`，但只生成 `PROJECT_ONBOARDING.md`
-- `codex exec` 阶段每 10 秒会在 `runner.log` 写一次心跳；超过 10 分钟仍未完成会判定超时，并仅终止当前任务自己拉起的 `codex exec` 进程组
-- Podman 构建和运行默认直接使用宿主机当前的 Podman 环境与默认镜像仓库
-- `--run` 默认按 `project-ports.json` 为每个项目分配固定映射；若项目不在映射表中，会从宿主机端口 `8003` 开始向后查找空位（`8003`、`8004`、`8005` ...）并写回 `"宿主机端口:容器端口"`
-- `--run` 当前以 detached 模式启动容器，宿主机端口仅绑定 `127.0.0.1`，并轮询 `http://127.0.0.1:<host_port>/` 做最小可用性检查
+1. 解析参数，计算 `project_slug` 和 `job_id`，创建 `result.json`
+2. 准备 `codex-home` 写入层和 Podman 环境
+3. 准备或复用 `jobs/<slug>/repo`
+4. 复制共享副本到 `jobs/<slug>/<job_id>/work-repo`
+5. 对工作副本做结构化分析，写入 `analysis_summary`
+6. 执行子路径 prepare 阶段
+   - 构建 `SubpathPlan`
+   - 做框架配置适配和源码改写
+   - 跑静态审计
+   - 有 finding 时尝试 auto-fix，再审一次
+   - 仍有 finding 时直接失败为 `SUBPATH_STATIC_AUDIT_FAILED`
+7. 判断是否复用已有 `Dockerfile` / `PROJECT_ONBOARDING.md`
+   - 两者都存在且对 Git 源是 tracked 文件时，直接复用
+   - 只有 `Dockerfile` 可复用时，只生成 `PROJECT_ONBOARDING.md`
+   - 其他情况同时生成两者
+8. 调用 `codex exec` 生成文件
+   - 生成阶段有最多 2 次上游重试
+   - 本地校验失败时，会带校验反馈再生成一次
+9. 把最终生成的 `Dockerfile` / `PROJECT_ONBOARDING.md` 同步回共享副本
+10. 如指定 `--build`，执行 `podman build`
+11. build 成功后执行 build output subpath audit
+   - 默认是 shadow mode，只记 artifact / warning
+   - 只有 `.ka/subpath.json` 中显式把某类 finding 标成 `enforce` 时才阻断为 `SUBPATH_BUILD_OUTPUT_AUDIT_FAILED`
+12. 如指定 `--run`，合并运行参数并启动容器
+13. 健康检查通过后执行 runtime subpath audit
+14. `RUN_SUCCEEDED` 后写出 nginx 片段，并尽力同步 Athena nginx 配置
 
-## 已知限制
+### 结果与日志
 
-- 当前依赖本机可用的 `codex` 和 `podman`
-- Git 源场景还依赖本机可用的 `git`
-- 某些受限沙箱里 rootless Podman 仍可能因为 `newuidmap` 或 user namespace 限制而失败，这类情况需要在沙箱外重试
-- `--run` 当前只做最小 HTTP 可用性检查，未实现更细粒度的业务级 health check
+每次任务都会在 `jobs/<slug>/<job_id>/output/` 下写结果：
+
+- `result.json`
+  当前完整状态快照；末尾还会写入 `final_result`
+- `runner.log`
+  主流程日志，以及所有外部命令的开始/结束/心跳
+- `fetch.log`
+  Git clone 日志，仅 Git 源场景存在
+- `codex.log`
+  `codex exec` 全量输出
+- `codex-summary.txt`
+  `codex exec --output-last-message` 的最终输出
+- `build.log`
+  `podman build` 输出
+- `run.log`
+  `podman run` 输出
+
+最终 stdout 也会打印一份精简 JSON：
+
+- `COMPLETED_WITHOUT_BUILD`
+- `COMPLETED_WITH_BUILD`
+- `RUN_SUCCEEDED`
+- 失败态及 `errors`
+
+### 运行时端口与环境变量
+
+- `--run` 必须和 `--build` 一起使用
+- 容器端口优先级：
+  - `project-ports.json` 中已有映射
+  - `PROJECT_ONBOARDING.md` 中解析出的确认端口
+  - 镜像 `EXPOSE`
+- 宿主机端口优先级：
+  - `--host-port`
+  - `project-ports.json` 中已有映射
+  - 自动从 `8003` 开始分配空闲端口，并写回 `project-ports.json`
+- `project-ports.json` 还支持：
+  - `env`
+  - `env_file`
+  - `volumes`
+- 运行时容器固定绑定到 `127.0.0.1:<host_port>:<container_port>`
+
+### 子路径与 nginx
+
+平台统一对外暴露路径：
+
+```text
+/tools2/<project_slug>
+```
+
+子路径改写只发生在 `work-repo`，不会修改原始上游目录。当前会把以下内容写入 `result.json` 的 `artifacts` 或 `analysis_summary`：
+
+- `subpath_plan`
+- `subpath_default_project`
+- `subpath_detection_evidence`
+- `subpath_rewrite_report`
+- `subpath_static_audit`
+- `subpath_build_output_audit`
+- `subpath_runtime_audit`
+- `.ka/subpath.json` 生效时的 `subpath_declaration`
+
+`RUN_SUCCEEDED` 后会生成 `jobs/<slug>/nginx-add.conf`。如果本机存在 `/etc/nginx/sites-available/tools.conf`，runner 还会尝试：
+
+- 备份原文件
+- 以 `# BEGIN KA TOOL <slug>` block 形式写入或覆盖
+- 执行 `nginx -t`
+- reload nginx
+
+这一步失败只记 warning，不会回滚已成功的容器运行结果。
+
+### 本地源码与共享副本复用
+
+- 本地源码会根据内容签名复用 `jobs/<slug>/repo`
+- 目录名变化本身不会打破复用
+- 当本地源码内容有变化，但共享副本里已有 `Dockerfile` 且新源码没有自带 `Dockerfile` 时，会把旧 `Dockerfile` 带到新的共享副本里
+- Git 源刷新共享副本时，会删除 clone 出来的未跟踪 `Dockerfile` / `PROJECT_ONBOARDING.md`，避免把上一次生成物误当成源码的一部分
+
+### 依赖与限制
+
+- 依赖本机可用的 `codex`
+- Git 源依赖本机可用的 `git`
+- `--build` / `--run` 依赖本机可用的 `podman`
+- `codex exec` 超时时间当前固定为 600 秒
+- 容器就绪检查当前默认轮询 60 秒
+- 运行成功后的健康检查仍是最小 HTTP 可用性检查，不是业务级 health check
+- 受限沙箱里 rootless Podman 仍可能因为 `newuidmap`、user namespace 或只读运行目录失败；代码会先尝试默认模式，必要时回退到隔离的 Podman storage
+
+## 机器巡检子项目
+
+`machine_health_check/` 是独立的主机巡检工具，负责：
+
+- 采集系统、CPU、内存、磁盘、网络指标
+- 读取 `project-ports.json` 并对宿主机服务 / Podman 容器做健康检查
+- 写 `reports/latest.json` 和 `reports/history/`
+- 可选发送企业微信文本告警
+
+本地执行：
+
+```bash
+cd machine_health_check
+bash scripts/run_check.sh
+```
+
+相关文档：
+
+- [`machine_health_check/docs/solution.md`](./machine_health_check/docs/solution.md)
+- [`machine_health_check/docs/deploy.md`](./machine_health_check/docs/deploy.md)
+- [`doc/SUBPATH.md`](./doc/SUBPATH.md)
+- [`doc/DEPLOYMENT_FLOW.md`](./doc/DEPLOYMENT_FLOW.md)

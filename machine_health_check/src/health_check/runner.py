@@ -4,7 +4,14 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .collectors import collect_cpu, collect_disks, collect_memory, collect_network, collect_system
+from .collectors import (
+    collect_cpu,
+    collect_disks,
+    collect_memory,
+    collect_network,
+    collect_service_checks,
+    collect_system,
+)
 from .evaluators import compare_threshold, worst_status
 from .models import CheckItem, CheckReport
 
@@ -35,12 +42,24 @@ def _format_probe_status(status: str) -> str:
     return mapping.get(status, status)
 
 
+def _format_duration(seconds: float) -> str:
+    total_seconds = int(seconds)
+    days, remainder = divmod(total_seconds, 24 * 3600)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}天")
+    if days or hours:
+        parts.append(f"{hours}小时")
+    if days or hours or minutes:
+        parts.append(f"{minutes}分钟")
+    parts.append(f"{secs}秒")
+    return "".join(parts)
+
+
 def _summarize_interface_stats(interfaces: dict[str, dict[str, int]]) -> str:
-    active_interfaces = [
-        name
-        for name, stats in interfaces.items()
-        if stats["rx_bytes"] > 0 or stats["tx_bytes"] > 0
-    ]
     error_interfaces = [
         name
         for name, stats in interfaces.items()
@@ -52,9 +71,7 @@ def _summarize_interface_stats(interfaces: dict[str, dict[str, int]]) -> str:
 
     if error_interfaces:
         return f"已采集，存在错误/丢包网卡: {', '.join(error_interfaces)}"
-    if active_interfaces:
-        return f"已采集，活跃网卡: {', '.join(active_interfaces)}"
-    return "已采集，当前未发现活跃流量"
+    return "已采集，未发现错误或丢包"
 
 
 def _evaluate_cpu(cpu_data: dict[str, object], thresholds: dict[str, dict[str, float]]) -> CheckItem:
@@ -171,8 +188,7 @@ def _evaluate_network(network_data: dict[str, object]) -> CheckItem:
     if loopback_ping:
         summary_parts.append(
             "本机回环连通性: "
-            f"{_format_probe_status(str(loopback_ping['probe_status']))} "
-            f"({loopback_ping['target']} ping)"
+            f"{_format_probe_status(str(loopback_ping['probe_status']))}"
         )
 
     if public_pings:
@@ -187,12 +203,10 @@ def _evaluate_network(network_data: dict[str, object]) -> CheckItem:
         )
         summary_parts.append(
             "公网 ICMP 连通性: "
-            f"{_format_probe_status(public_status)} "
-            f"({targets} ping)"
+            f"{_format_probe_status(public_status)}"
         )
 
     if tcp_checks:
-        tcp_targets = ", ".join(f"{item['host']}:{item['port']}" for item in tcp_checks)
         tcp_status = worst_status(
             [
                 "critical" if item["probe_status"] == "failed" else
@@ -203,8 +217,7 @@ def _evaluate_network(network_data: dict[str, object]) -> CheckItem:
         )
         summary_parts.append(
             "公网 TCP 出站连通性: "
-            f"{_format_probe_status(tcp_status)} "
-            f"({tcp_targets})"
+            f"{_format_probe_status(tcp_status)}"
         )
 
     summary_parts.append(f"网卡统计: {_summarize_interface_stats(interfaces)}")
@@ -214,15 +227,26 @@ def _evaluate_network(network_data: dict[str, object]) -> CheckItem:
 
 
 def _evaluate_system(system_data: dict[str, object]) -> CheckItem:
+    details = dict(system_data)
+    details["uptime_human"] = _format_duration(float(system_data["uptime_seconds"]))
     return CheckItem(
         name="system",
         status="ok",
         summary=(
             f"主机名 {system_data['hostname']}，"
             f"内核版本 {system_data['kernel']}，"
-            f"运行时长 {system_data['uptime_seconds']} 秒"
+            f"运行时长 {details['uptime_human']}"
         ),
-        details=system_data,
+        details=details,
+    )
+
+
+def _evaluate_services(services_data: dict[str, object]) -> CheckItem:
+    return CheckItem(
+        name="services",
+        status=str(services_data.get("status", "ok")),
+        summary=str(services_data.get("summary", "服务健康检查未执行")),
+        details=services_data,
     )
 
 
@@ -237,6 +261,8 @@ def generate_report(config: dict[str, object]) -> CheckReport:
         ping_targets=list(network_config.get("ping_targets", [])),
         tcp_targets=list(network_config.get("tcp_targets", [])),
     )
+    services_config = dict(config.get("service_checks", {}))
+    services_data = collect_service_checks(services_config)
 
     items = [
         _evaluate_system(system_data),
@@ -244,6 +270,7 @@ def generate_report(config: dict[str, object]) -> CheckReport:
         _evaluate_memory(memory_data, thresholds),
         _evaluate_disks(disk_data, thresholds),
         _evaluate_network(network_data),
+        _evaluate_services(services_data),
     ]
 
     report = CheckReport(
