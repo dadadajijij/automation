@@ -63,11 +63,6 @@ def _parse_host_port(port_mapping: str) -> int | None:
         return None
 
 
-def _parse_host_ports(ports_text: str) -> list[int]:
-    matches = re.findall(r"(?:\d{1,3}(?:\.\d{1,3}){3}|127\.0\.0\.1|\[::1\]|0\.0\.0\.0):(\d+)->", ports_text)
-    return [int(match) for match in matches]
-
-
 def _load_project_ports(project_ports_file: str) -> dict[str, object]:
     path = Path(project_ports_file)
     with path.open("r", encoding="utf-8") as file_obj:

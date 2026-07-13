@@ -484,6 +484,32 @@ class RunnerProjectSlugTests(unittest.TestCase):
         self.assertEqual(overrides["env_file"], "/host/.env.local")
         self.assertEqual(overrides["volumes"], ["/host/data:/app/data"])
 
+    def test_derive_runtime_env_vars_uses_onboarding_env_file_hint_without_project_override(self) -> None:
+        env_args = runner.derive_runtime_env_vars(
+            {
+                "environment_variables": ["PORT"],
+                "env_file_hint": ".env",
+                "project_env_file": None,
+            },
+            host_port=8001,
+            container_port=8000,
+        )
+
+        self.assertEqual(env_args, ["-e", "PORT=8000", "--env-file", ".env"])
+
+    def test_derive_runtime_env_vars_skips_onboarding_env_file_hint_when_project_override_exists(self) -> None:
+        env_args = runner.derive_runtime_env_vars(
+            {
+                "environment_variables": ["PORT"],
+                "env_file_hint": ".env",
+                "project_env_file": "/host/.env.local",
+            },
+            host_port=8001,
+            container_port=8000,
+        )
+
+        self.assertEqual(env_args, ["-e", "PORT=8000"])
+
     def test_run_container_binds_host_port_to_loopback_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)

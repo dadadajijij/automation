@@ -46,14 +46,12 @@ from subpath import (
     SUBPATH_CLIENT_METHOD_PATTERNS,
     SUBPATH_TEMPLATE_ALLOWLIST_FIELDS,
     build_deployment_base_path,
-    collect_runtime_follow_links as subpath_collect_runtime_follow_links,
     collect_python_frontend_hint_files as subpath_collect_python_frontend_hint_files,
     detect_frontend_root_hints_from_python_file as subpath_detect_frontend_root_hints_from_python_file,
     detect_frontend_runtime_roots as subpath_detect_frontend_runtime_roots,
     detect_frontend_runtime_root_groups as subpath_detect_frontend_runtime_root_groups,
     detect_static_root_hints_from_node_entry as subpath_detect_static_root_hints_from_node_entry,
     discover_runtime_root_frontend_files as subpath_discover_runtime_root_frontend_files,
-    find_plan_audit_targets as subpath_find_plan_audit_targets,
     find_subpath_audit_targets as subpath_find_subpath_audit_targets,
     find_plan_rewrite_targets as subpath_find_plan_rewrite_targets,
     findings_to_error_texts as subpath_findings_to_error_texts,
@@ -85,7 +83,6 @@ from subpath import (
     rewrite_origin_based_subpath_logic as subpath_rewrite_origin_based_subpath_logic,
     run_runtime_subpath_audit as subpath_run_runtime_subpath_audit,
     run_static_subpath_audit as subpath_run_static_subpath_audit,
-    runtime_subpath_findings_for_html as subpath_runtime_subpath_findings_for_html,
     runtime_subpath_phase as subpath_runtime_subpath_phase,
     scan_subpath_findings as subpath_scan_subpath_findings,
     vite_project_roots as subpath_vite_project_roots,
@@ -98,7 +95,6 @@ AUTOMATION_DIR = ROOT_DIR / "automation"
 JOBS_DIR = AUTOMATION_DIR / "jobs"
 CODEX_HOME_CACHE_DIR = AUTOMATION_DIR / "codex-home-cache"
 GENERATION_RULES_PATH = AUTOMATION_DIR / "generation_rules.md"
-TEMPLATE_PATH = AUTOMATION_DIR / "templates" / "project_onboarding_template.md"
 PROJECT_PORTS_PATH = AUTOMATION_DIR / "project-ports.json"
 LOCAL_OFFICIAL_IMAGES_CACHE_PATH = CODEX_HOME_CACHE_DIR / "local-official-images.txt"
 DEFAULT_CODEX_HOME_SEED = Path.home() / ".codex"
@@ -2644,15 +2640,6 @@ def tool_block_pattern(project_slug: str) -> re.Pattern[str]:
     )
 
 
-def remove_tool_managed_block(text: str, project_slug: str) -> Tuple[str, bool]:
-    managed_pattern = tool_block_pattern(project_slug)
-    updated = managed_pattern.sub("", text)
-    if updated == text:
-        return text, False
-    updated = re.sub(r"\n{3,}", "\n\n", updated)
-    return updated.strip() + ("\n" if updated.strip() else ""), True
-
-
 def upsert_tool_nginx_into_tools_conf(config_text: str, project_slug: str, host_port: int, proxy_mode: str = "strip_prefix") -> Tuple[str, str]:
     managed_block = render_athena_managed_tool_block(project_slug, host_port, proxy_mode=proxy_mode, indent="")
     existing_match = tool_block_pattern(project_slug).search(config_text)
@@ -2904,10 +2891,6 @@ def is_browser_facing_source(file_path: Path, repo_dir: Path, text: str) -> bool
         text,
         detect_frontend_runtime_roots=detect_frontend_runtime_roots,
     )
-
-
-def finding_to_error_text(finding: SubpathAuditFinding) -> str:
-    return f"{finding.file}:{finding.line} {finding.message}"
 
 
 def scan_subpath_findings(file_path: Path, framework: str, base_path: str, repo_dir: Path) -> List[SubpathAuditFinding]:
@@ -3724,7 +3707,8 @@ def derive_runtime_env_vars(
     if isinstance(env_names, list) and "PORT" in env_names:
         env_args.extend(["-e", f"PORT={container_port}"])
     env_file_hint = run_spec.get("env_file_hint")
-    if isinstance(env_file_hint, str) and env_file_hint:
+    project_env_file = run_spec.get("project_env_file")
+    if not (isinstance(project_env_file, str) and project_env_file) and isinstance(env_file_hint, str) and env_file_hint:
         env_args.extend(["--env-file", env_file_hint])
     return env_args
 

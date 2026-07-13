@@ -1,10 +1,10 @@
 {
   "ka-tools": {
     "port": "3000:3000",
-    "env_file": "/home/devops/ka/data/ka_tools/.env.local",
     "volumes": [
       "/home/devops/ka/data/ka_tools/data:/app/data"
-    ]
+    ],
+    "env_file": "/home/devops/ka/data/ka_tools/.env.local"
   },
   "audioqas": {
     "port": "8001:8000",
@@ -32,5 +32,15 @@
   },
   "decrypt-online": {
     "port": "8007:44002"
+  },
+  "duty": {
+    "port": "8008:30001",
+    "env": {
+      "ADMIN_EMAILS": "hantao@agora.io"
+    }
+  },
+  "ailoganalyze": {
+    "port": "8009:8000",
+    "env_file":"/home/devops/ka/data/ailoganalyze/env"
   }
 }
