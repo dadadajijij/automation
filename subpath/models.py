@@ -17,6 +17,13 @@ SUBPATH_CLIENT_METHOD_PATTERNS = (
     re.compile(r'\bwindow\.location\.assign\(\s*(["\'`])/(?P<path>[^"\'`#?][^"\'`]*)\1\s*\)'),
     re.compile(r'\bwindow\.open\(\s*(["\'`])/(?P<path>[^"\'`#?][^"\'`]*)\1'),
 )
+SUBPATH_API_BASE_CONCAT_PATTERNS = (
+    re.compile(r'\bfetch\(\s*(?P<base>[A-Z][A-Z0-9_]*|window\.location\.origin|location\.origin)\s*\+\s*(["\'`])/(?P<path>api/[^"\'`#?][^"\'`]*)\2'),
+    re.compile(r'\bnew\s+Request\(\s*(?P<base>[A-Z][A-Z0-9_]*|window\.location\.origin|location\.origin)\s*\+\s*(["\'`])/(?P<path>api/[^"\'`#?][^"\'`]*)\2'),
+    re.compile(r'\bnew\s+EventSource\(\s*(?P<base>[A-Z][A-Z0-9_]*|window\.location\.origin|location\.origin)\s*\+\s*(["\'`])/(?P<path>api/[^"\'`#?][^"\'`]*)\2'),
+    re.compile(r'\baxios\.(?:get|post|put|delete|patch)\(\s*(?P<base>[A-Z][A-Z0-9_]*|window\.location\.origin|location\.origin)\s*\+\s*(["\'`])/(?P<path>api/[^"\'`#?][^"\'`]*)\2'),
+    re.compile(r'\baxios\(\s*\{\s*[^}]*\burl\s*:\s*(?P<base>[A-Z][A-Z0-9_]*|window\.location\.origin|location\.origin)\s*\+\s*(["\'`])/(?P<path>api/[^"\'`#?][^"\'`]*)\2', re.DOTALL),
+)
 SUBPATH_TEMPLATE_ALLOWLIST_FIELDS = ("pathTemplate",)
 
 

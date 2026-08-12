@@ -271,6 +271,26 @@ class RunnerProjectSlugTests(unittest.TestCase):
         self.assertIn("JSON-form CMD", rules)
         self.assertIn("EXPOSE 3000", rules)
 
+    def test_build_runtime_rules_for_python_requirements_strategy_mentions_requirements_txt(self) -> None:
+        rules = runner.build_runtime_rules(
+            {
+                "service_runtime": "python",
+                "python_entry_command": "uvicorn app.main:app --host 0.0.0.0",
+                "node_entry_command": None,
+                "requires_python": ">=3.9",
+                "package_scripts": [],
+                "detected_port": 8000,
+                "python_install_strategy": "requirements_txt",
+                "python_install_evidence": [
+                    'README.md confirms manual setup installs dependencies via "pip install -r requirements.txt"',
+                ],
+            }
+        )
+
+        self.assertIn("pip install -r requirements.txt", rules)
+        self.assertNotIn("存在 `pyproject.toml` 时优先使用 `pip install .`", rules)
+        self.assertIn("当前 Python 安装策略判定依据", rules)
+
     def test_build_runtime_rules_mentions_required_build_and_candidates(self) -> None:
         rules = runner.build_runtime_rules(
             {
@@ -818,7 +838,7 @@ class RunnerProjectSlugTests(unittest.TestCase):
                 rewrite_frontend_subpath_urls=runner.rewrite_frontend_subpath_urls,
             )
 
-            self.assertIn("next.config.ts", changed)
+            self.assertTrue(any(str(item).endswith("next.config.ts") for item in changed))
             self.assertIn("src/app/layout.tsx", changed)
             self.assertIn("src/components/api-explorer.tsx", changed)
             self.assertIn("ka_tool_base_runtime.ts", changed)
@@ -2107,6 +2127,367 @@ class RunnerProjectSlugTests(unittest.TestCase):
 
             self.assertEqual(analysis["service_runtime"], "python")
             self.assertEqual(analysis["python_entry_command"], "uvicorn app.main:app --host 0.0.0.0")
+
+    def test_collect_repo_analysis_prefers_requirements_txt_when_start_sh_installs_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "requirements.txt").write_text(
+                "fastapi>=0.115.0\nuvicorn[standard]>=0.32.0\nnumpy>=1.24.0\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "start.sh").write_text(
+                ".venv/bin/pip install -r requirements.txt\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+
+            analysis = runner.collect_repo_analysis(repo_dir, "local", str(repo_dir), None)
+
+            self.assertEqual(analysis["python_install_strategy"], "requirements_txt")
+            self.assertIn('- start.sh installs dependencies from "requirements.txt"', analysis["facts"])
+
+    def test_collect_repo_analysis_prefers_requirements_txt_when_runtime_dependencies_are_missing_from_pyproject(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "requirements.txt").write_text(
+                "\n".join(
+                    [
+                        "fastapi>=0.115.0",
+                        "uvicorn[standard]>=0.32.0",
+                        "numpy>=1.24.0",
+                        "rank-bm25>=0.2.2",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+
+            analysis = runner.collect_repo_analysis(repo_dir, "local", str(repo_dir), None)
+
+            self.assertEqual(analysis["python_install_strategy"], "requirements_txt")
+            self.assertIn("numpy", "\n".join(analysis["python_install_evidence"]))
+            self.assertIn("rank-bm25", "\n".join(analysis["python_install_evidence"]))
+
+    def test_collect_repo_analysis_uses_fallback_install_for_mixed_flat_layout_python_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "requirements.txt").write_text(
+                "fastapi>=0.115.0\nuvicorn[standard]>=0.32.0\n",
+                encoding="utf-8",
+            )
+            backend_dir = repo_dir / "backend"
+            backend_dir.mkdir()
+            (backend_dir / "__init__.py").write_text("", encoding="utf-8")
+            (backend_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+            for directory_name in ("frontend", "knowledge_base", "temp", "wheels"):
+                (repo_dir / directory_name).mkdir()
+
+            analysis = runner.collect_repo_analysis(repo_dir, "local", str(repo_dir), None)
+
+            self.assertEqual(analysis["python_install_strategy"], "fallback_install")
+            self.assertIn("repository root mixes", "\n".join(analysis["python_install_evidence"]))
+
+    def test_collect_repo_analysis_allows_package_install_when_only_pyproject_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+
+            analysis = runner.collect_repo_analysis(repo_dir, "local", str(repo_dir), None)
+
+            self.assertEqual(analysis["python_install_strategy"], "package_install")
+
+    def test_validate_generated_files_rejects_python_package_only_install_for_requirements_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "requirements.txt").write_text(
+                "fastapi>=0.115.0\nuvicorn[standard]>=0.32.0\nnumpy>=1.24.0\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "start.sh").write_text(
+                ".venv/bin/pip install -r requirements.txt\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        "FROM python:3.11-slim",
+                        "WORKDIR /app",
+                        "COPY . /app",
+                        "RUN pip install --no-cache-dir .",
+                        'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 1 项目基础信息",
+                        "## 2 代码和版本信息",
+                        "## 3 启动信息",
+                        "## 4 运行参数",
+                        "## 5 配置与密钥",
+                        "## 6 存储信息",
+                        "## 7 证据与判断说明",
+                        "## 8 待确认问题",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            findings, _warnings = runner.validate_generated_files(
+                repo_dir,
+                source_type="local",
+                source=str(repo_dir),
+                ref=None,
+            )
+
+            self.assertIn(
+                "Dockerfile should install Python dependencies from requirements.txt for this repo; do not rely only on pip install .",
+                findings,
+            )
+
+    def test_validate_generated_files_accepts_requirements_txt_install_for_python_requirements_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "requirements.txt").write_text(
+                "fastapi>=0.115.0\nuvicorn[standard]>=0.32.0\nnumpy>=1.24.0\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "start.sh").write_text(
+                ".venv/bin/pip install -r requirements.txt\n",
+                encoding="utf-8",
+            )
+            app_dir = repo_dir / "app"
+            app_dir.mkdir()
+            (app_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        "FROM python:3.11-slim",
+                        "WORKDIR /app",
+                        "COPY . /app",
+                        "RUN pip install --no-cache-dir -r requirements.txt",
+                        'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 1 项目基础信息",
+                        "## 2 代码和版本信息",
+                        "## 3 启动信息",
+                        "## 4 运行参数",
+                        "## 5 配置与密钥",
+                        "## 6 存储信息",
+                        "## 7 证据与判断说明",
+                        "## 8 待确认问题",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            findings, _warnings = runner.validate_generated_files(
+                repo_dir,
+                source_type="local",
+                source=str(repo_dir),
+                ref=None,
+            )
+
+            self.assertEqual(findings, [])
+
+    def test_validate_generated_files_rejects_python_package_only_install_for_fallback_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "pyproject.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "demo-fastapi"',
+                        "dependencies = [",
+                        '  "fastapi>=0.115.0",',
+                        '  "uvicorn[standard]>=0.32.0",',
+                        "]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "requirements.txt").write_text(
+                "fastapi>=0.115.0\nuvicorn[standard]>=0.32.0\n",
+                encoding="utf-8",
+            )
+            backend_dir = repo_dir / "backend"
+            backend_dir.mkdir()
+            (backend_dir / "__init__.py").write_text("", encoding="utf-8")
+            (backend_dir / "main.py").write_text(
+                "from fastapi import FastAPI\napp = FastAPI()\n",
+                encoding="utf-8",
+            )
+            for directory_name in ("frontend", "knowledge_base", "temp", "wheels"):
+                (repo_dir / directory_name).mkdir()
+            (repo_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        "FROM python:3.11-slim",
+                        "WORKDIR /app",
+                        "COPY . /app",
+                        "RUN pip install --no-cache-dir .",
+                        'CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 1 项目基础信息",
+                        "## 2 代码和版本信息",
+                        "## 3 启动信息",
+                        "## 4 运行参数",
+                        "## 5 配置与密钥",
+                        "## 6 存储信息",
+                        "## 7 证据与判断说明",
+                        "## 8 待确认问题",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            findings, _warnings = runner.validate_generated_files(
+                repo_dir,
+                source_type="local",
+                source=str(repo_dir),
+                ref=None,
+            )
+
+            self.assertIn(
+                "Dockerfile must include a requirements.txt install path for this repo because pip install . is not proven safe",
+                findings,
+            )
 
 
 if __name__ == "__main__":

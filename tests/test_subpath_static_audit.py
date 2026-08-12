@@ -240,6 +240,210 @@ class SubpathStaticAuditTests(unittest.TestCase):
             self.assertTrue(audit["findings"])
             self.assertEqual(audit["findings"][0]["code"], "root_relative_client_url")
 
+    def test_scan_subpath_findings_flags_api_base_concat_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text("const API_BASE = '';\nfetch(API_BASE + '/api/analyze-stream')\n", encoding="utf-8")
+            project = FrontendProjectStrategy(
+                project_id="root",
+                framework="generic",
+                proxy_mode="strip_prefix",
+                adapter="static_rewrite",
+                project_root=repo_dir.resolve(),
+                source_roots=(),
+                runtime_roots=(static_dir.resolve(),),
+                config_files=(),
+                capabilities=("runtime_root", "html_entry", "client_code"),
+                evidence=(),
+            )
+
+            findings = scan_subpath_findings(
+                file_path,
+                project,
+                "/tools2/demo",
+                repo_dir,
+                read_text=runner.read_text,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+            )
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].detail_kind, "request_api")
+            self.assertIn("/api/analyze-stream", findings[0].message)
+
+    def test_scan_subpath_findings_flags_origin_concat_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text("fetch(window.location.origin + '/api/log-metadata')\n", encoding="utf-8")
+            project = FrontendProjectStrategy(
+                project_id="root",
+                framework="generic",
+                proxy_mode="strip_prefix",
+                adapter="static_rewrite",
+                project_root=repo_dir.resolve(),
+                source_roots=(),
+                runtime_roots=(static_dir.resolve(),),
+                config_files=(),
+                capabilities=("runtime_root", "html_entry", "client_code"),
+                evidence=(),
+            )
+
+            findings = scan_subpath_findings(
+                file_path,
+                project,
+                "/tools2/demo",
+                repo_dir,
+                read_text=runner.read_text,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+            )
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].detail_kind, "request_api")
+            self.assertIn("/api/log-metadata", findings[0].message)
+
+    def test_scan_subpath_findings_flags_api_base_concat_axios_url_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text("axios({ method: 'POST', url: API_BASE + '/api/api-tracer' })\n", encoding="utf-8")
+            project = FrontendProjectStrategy(
+                project_id="root",
+                framework="generic",
+                proxy_mode="strip_prefix",
+                adapter="static_rewrite",
+                project_root=repo_dir.resolve(),
+                source_roots=(),
+                runtime_roots=(static_dir.resolve(),),
+                config_files=(),
+                capabilities=("runtime_root", "html_entry", "client_code"),
+                evidence=(),
+            )
+
+            findings = scan_subpath_findings(
+                file_path,
+                project,
+                "/tools2/demo",
+                repo_dir,
+                read_text=runner.read_text,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+            )
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].detail_kind, "request_api")
+            self.assertIn("/api/api-tracer", findings[0].message)
+
+    def test_scan_subpath_findings_allows_safe_tool_base_api_base_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text(
+                'const API_BASE = window.__TOOL_BASE_PATH__ || "";\nfetch(API_BASE + \'/api/analyze-stream\')\n',
+                encoding="utf-8",
+            )
+            project = FrontendProjectStrategy(
+                project_id="root",
+                framework="generic",
+                proxy_mode="strip_prefix",
+                adapter="static_rewrite",
+                project_root=repo_dir.resolve(),
+                source_roots=(),
+                runtime_roots=(static_dir.resolve(),),
+                config_files=(),
+                capabilities=("runtime_root", "html_entry", "client_code"),
+                evidence=(),
+            )
+
+            findings = scan_subpath_findings(
+                file_path,
+                project,
+                "/tools2/demo",
+                repo_dir,
+                read_text=runner.read_text,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+            )
+
+            self.assertEqual(findings, [])
+
+    def test_scan_subpath_findings_allows_safe_tool_origin_concat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text(
+                "fetch((window.__TOOL_ORIGIN_URL__ || window.location.origin) + '/api/log-metadata')\n",
+                encoding="utf-8",
+            )
+            project = FrontendProjectStrategy(
+                project_id="root",
+                framework="generic",
+                proxy_mode="strip_prefix",
+                adapter="static_rewrite",
+                project_root=repo_dir.resolve(),
+                source_roots=(),
+                runtime_roots=(static_dir.resolve(),),
+                config_files=(),
+                capabilities=("runtime_root", "html_entry", "client_code"),
+                evidence=(),
+            )
+
+            findings = scan_subpath_findings(
+                file_path,
+                project,
+                "/tools2/demo",
+                repo_dir,
+                read_text=runner.read_text,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+            )
+
+            self.assertEqual(findings, [])
+
+    def test_scan_subpath_findings_does_not_flag_non_api_origin_concat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            static_dir = repo_dir / "static"
+            static_dir.mkdir()
+            file_path = static_dir / "app.js"
+            file_path.write_text("fetch(window.location.origin + '/login')\n", encoding="utf-8")
+            project = FrontendProjectStrategy(
+                project_id="root",
+                framework="generic",
+                proxy_mode="strip_prefix",
+                adapter="static_rewrite",
+                project_root=repo_dir.resolve(),
+                source_roots=(),
+                runtime_roots=(static_dir.resolve(),),
+                config_files=(),
+                capabilities=("runtime_root", "html_entry", "client_code"),
+                evidence=(),
+            )
+
+            findings = scan_subpath_findings(
+                file_path,
+                project,
+                "/tools2/demo",
+                repo_dir,
+                read_text=runner.read_text,
+                detect_frontend_runtime_roots=runner.detect_frontend_runtime_roots,
+                vite_project_roots=runner.vite_project_roots,
+            )
+
+            self.assertEqual(findings, [])
+
     def test_scan_subpath_findings_marks_detail_kind_for_navigation_and_return(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)

@@ -41,6 +41,12 @@
   },
   "ailoganalyze": {
     "port": "8009:8000",
-    "env_file":"/home/devops/ka/data/ailoganalyze/env"
+    "env_file": "/home/devops/ka/data/ailoganalyze/env"
+  },
+  "abtest": {
+    "port": "8010:8000"
+  },
+  "shangshutai": {
+    "port": "8011:3000"
   }
 }

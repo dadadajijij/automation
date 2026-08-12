@@ -215,6 +215,56 @@ def wrap_runtime_tool_base_expr(path_expr: str) -> str:
     return f'(Reflect.get(window, "withToolBase")?.({path_expr}) ?? {path_expr})'
 
 
+def _safe_api_base_assignment_pattern(var_name: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'((?:const|let|var)\s+{re.escape(var_name)}\s*=\s*)(?P<value>""|\'\'|window\.location\.origin|location\.origin)(\s*;)',
+    )
+
+
+def _uses_api_base_concat(text: str, var_name: str) -> bool:
+    return bool(
+        re.search(
+            rf'\b(?:fetch|axios(?:\.(?:get|post|put|delete|patch))?|Request|EventSource)\b[\s\S]*?\b{re.escape(var_name)}\s*\+\s*(["\'`])/api/',
+            text,
+        )
+        or re.search(rf'\b{re.escape(var_name)}\s*\+\s*(["\'`])/api/', text)
+    )
+
+
+def _rewrite_api_base_assignment_text(text: str) -> str:
+    rewritten = text
+    for var_name in ("API_BASE", "BASE_URL", "API_ROOT", "API_PREFIX"):
+        if not _uses_api_base_concat(rewritten, var_name):
+            continue
+        pattern = _safe_api_base_assignment_pattern(var_name)
+
+        def replace_assignment(match: re.Match[str]) -> str:
+            value = match.group("value")
+            if value in {'""', "''"}:
+                replacement_value = 'window.__TOOL_BASE_PATH__ || ""'
+            else:
+                replacement_value = "window.__TOOL_ORIGIN_URL__ || window.location.origin"
+            return f"{match.group(1)}{replacement_value}{match.group(3)}"
+
+        rewritten = pattern.sub(replace_assignment, rewritten)
+    return rewritten
+
+
+def _rewrite_origin_api_concat_text(text: str) -> str:
+    rewritten = text
+    rewritten = re.sub(
+        r'window\.location\.origin\s*\+\s*(["\'`])/api/(?P<path>[^"\'`]*)\1',
+        lambda match: f'(window.__TOOL_ORIGIN_URL__ || window.location.origin) + "/api/{match.group("path")}"',
+        rewritten,
+    )
+    rewritten = re.sub(
+        r'(?<!\.)location\.origin\s*\+\s*(["\'`])/api/(?P<path>[^"\'`]*)\1',
+        lambda match: f'(window.__TOOL_ORIGIN_URL__ || window.location.origin) + "/api/{match.group("path")}"',
+        rewritten,
+    )
+    return rewritten
+
+
 def rewrite_vite_fetch_template_calls(text: str) -> str:
     rewritten = text
     rewritten = re.sub(
@@ -246,11 +296,17 @@ def _normalize_with_tool_base_nesting(text: str) -> str:
     rewritten = re.sub(r'(?<!\.)withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)', r'withToolBase(\1)', rewritten)
     rewritten = re.sub(r'fetch\(\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)\s*\)', r'fetch(window.withToolBase(\1))', rewritten)
     rewritten = re.sub(r'url:\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)', r'url: window.withToolBase(\1)', rewritten)
+    rewritten = rewritten.replace(
+        "window.__TOOL_ORIGIN_URL__ || (window.__TOOL_ORIGIN_URL__ || window.location.origin)",
+        "window.__TOOL_ORIGIN_URL__ || window.location.origin",
+    )
     return rewritten
 
 
 def _rewrite_request_api_text(text: str) -> str:
     rewritten = _normalize_with_tool_base_nesting(text)
+    rewritten = _rewrite_api_base_assignment_text(rewritten)
+    rewritten = _rewrite_origin_api_concat_text(rewritten)
     rewritten = re.sub(r'axios\.(get|post|put|delete|patch)\(\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)', r'axios.\1(window.withToolBase(\2)', rewritten)
     rewritten = re.sub(r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*\)', lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))})", rewritten)
     rewritten = re.sub(r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*,', lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))},", rewritten)

@@ -1156,6 +1156,155 @@ def parse_pyproject_requires_python(pyproject_text: str) -> Optional[str]:
     return match.group(1).strip()
 
 
+PYTHON_DEV_REQUIREMENT_NAMES = {
+    "black",
+    "coverage",
+    "hypothesis",
+    "mypy",
+    "nox",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "tox",
+}
+
+
+def text_uses_requirements_txt_install(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    direct_install_patterns = [
+        r"(?:python\s+-m\s+)?pip(?:3)?\s+install[^\n\r`]*-r\s+requirements\.txt\b",
+        r"(?:^|[\s`])\.venv/bin/pip\s+install[^\n\r`]*-r\s+requirements\.txt\b",
+    ]
+    for pattern in direct_install_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return "requirements.txt" in text and bool(re.search(r"(?:python\s+-m\s+)?pip(?:3)?\s+install\b", text, re.IGNORECASE))
+
+
+def pyproject_has_explicit_package_config(pyproject_text: Optional[str]) -> bool:
+    if not pyproject_text:
+        return False
+    markers = [
+        r"^\[tool\.setuptools(?:\.|])",
+        r"^\[tool\.poetry(?:\.|])",
+        r"^\[tool\.hatch(?:\.|])",
+        r"^\[tool\.flit(?:\.|])",
+        r"^\[tool\.pdm(?:\.|])",
+    ]
+    if any(re.search(pattern, pyproject_text, re.MULTILINE) for pattern in markers):
+        return True
+    return bool(re.search(r"^\s*(packages|py-modules|package-dir)\s*=", pyproject_text, re.MULTILINE))
+
+
+def detect_python_flat_layout_mix(repo_dir: Path) -> Tuple[bool, List[str], List[str]]:
+    ignored_dirs = {
+        "__pycache__",
+        "build",
+        "dist",
+        "doc",
+        "docs",
+        "example",
+        "examples",
+        "node_modules",
+        "script",
+        "scripts",
+        "test",
+        "tests",
+        "venv",
+    }
+    package_dirs: List[str] = []
+    asset_dirs: List[str] = []
+    for child in sorted(repo_dir.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        if child.name.startswith(".") or child.name in ignored_dirs:
+            continue
+        if (child / "__init__.py").is_file():
+            package_dirs.append(child.name)
+        else:
+            asset_dirs.append(child.name)
+    is_mixed = bool(package_dirs) and len(asset_dirs) >= 2 and (len(package_dirs) + len(asset_dirs)) >= 4
+    return is_mixed, package_dirs, asset_dirs
+
+
+def detect_python_install_strategy(
+    repo_dir: Path,
+    pyproject_text: Optional[str],
+    requirements_text: Optional[str],
+    readme_text: Optional[str],
+    start_sh_text: Optional[str],
+) -> Dict[str, object]:
+    pyproject_exists = bool(pyproject_text)
+    requirements_exists = bool(requirements_text)
+    pyproject_main_dependencies = parse_pyproject_dependencies(pyproject_text) if pyproject_text else []
+    requirements_dependencies = parse_requirements_dependencies(requirements_text) if requirements_text else []
+    runtime_requirements = [
+        name for name in requirements_dependencies
+        if name not in PYTHON_DEV_REQUIREMENT_NAMES
+    ]
+    missing_runtime_dependencies = sorted_unique(
+        name for name in runtime_requirements
+        if name not in pyproject_main_dependencies
+    )
+    readme_uses_requirements = text_uses_requirements_txt_install(readme_text)
+    start_sh_uses_requirements = text_uses_requirements_txt_install(start_sh_text)
+    has_explicit_package_config = pyproject_has_explicit_package_config(pyproject_text)
+    mixed_flat_layout, package_dirs, asset_dirs = detect_python_flat_layout_mix(repo_dir)
+
+    evidence: List[str] = []
+    if readme_uses_requirements:
+        evidence.append('README.md confirms manual setup installs dependencies via "pip install -r requirements.txt"')
+    if start_sh_uses_requirements:
+        evidence.append('start.sh installs dependencies from "requirements.txt"')
+    if missing_runtime_dependencies:
+        evidence.append(
+            "requirements.txt contains runtime dependencies missing from pyproject.toml main dependencies: "
+            + ", ".join(missing_runtime_dependencies)
+        )
+    if mixed_flat_layout and pyproject_exists and not has_explicit_package_config:
+        evidence.append(
+            "repository root mixes package directories with non-package runtime asset directories: "
+            + ", ".join(package_dirs + asset_dirs)
+        )
+
+    strategy = "package_install"
+    validation_mode = "allow_package_install"
+    if requirements_exists and not pyproject_exists:
+        strategy = "requirements_txt"
+        validation_mode = "requires_requirements_txt"
+    elif pyproject_exists and not requirements_exists:
+        strategy = "package_install"
+        validation_mode = "allow_package_install"
+    elif pyproject_exists and requirements_exists:
+        if readme_uses_requirements or start_sh_uses_requirements:
+            strategy = "requirements_txt"
+            validation_mode = "requires_requirements_txt"
+        elif missing_runtime_dependencies:
+            strategy = "requirements_txt"
+            validation_mode = "requires_requirements_txt"
+        elif mixed_flat_layout and not has_explicit_package_config:
+            strategy = "fallback_install"
+            validation_mode = "requires_requirements_fallback"
+
+    if strategy != "package_install":
+        evidence.append('do not assume "pip install ." is safe based on "pyproject.toml" alone')
+
+    return {
+        "strategy": strategy,
+        "validation_mode": validation_mode,
+        "evidence": evidence,
+        "readme_uses_requirements": readme_uses_requirements,
+        "start_sh_uses_requirements": start_sh_uses_requirements,
+        "missing_runtime_dependencies": missing_runtime_dependencies,
+        "mixed_flat_layout": mixed_flat_layout,
+        "package_dirs": package_dirs,
+        "asset_dirs": asset_dirs,
+        "has_explicit_package_config": has_explicit_package_config,
+    }
+
+
 def module_name_for_path(repo_dir: Path, file_path: Path) -> Optional[str]:
     try:
         relative = file_path.relative_to(repo_dir)
@@ -2197,6 +2346,7 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
     requirements_txt = repo_dir / "requirements.txt"
     readme = repo_dir / "README.md"
     run_sh = repo_dir / "run.sh"
+    start_sh = repo_dir / "start.sh"
     package_lock = repo_dir / "package-lock.json"
 
     package = parse_package_json(repo_dir)
@@ -2207,6 +2357,7 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
     pyproject_text = read_text_if_exists(pyproject_toml)
     requirements_text = read_text_if_exists(requirements_txt)
     readme_text = read_text_if_exists(readme)
+    start_sh_text = read_text_if_exists(start_sh)
     detected_node_package_manager = detect_repo_package_manager(repo_dir, package)
     python_dependencies = sorted_unique(
         (parse_pyproject_dependencies(pyproject_text) if pyproject_text else [])
@@ -2404,6 +2555,54 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
         elif requirements_txt.exists():
             package_manager = "pip"
 
+    python_install_strategy = "package_install"
+    python_install_validation_mode = "allow_package_install"
+    python_install_evidence: List[str] = []
+    if service_runtime == "python":
+        python_install_details = detect_python_install_strategy(
+            repo_dir,
+            pyproject_text,
+            requirements_text,
+            readme_text,
+            start_sh_text,
+        )
+        python_install_strategy = str(python_install_details.get("strategy") or "package_install")
+        python_install_validation_mode = str(
+            python_install_details.get("validation_mode") or "allow_package_install"
+        )
+        python_install_evidence = [
+            str(item).strip()
+            for item in python_install_details.get("evidence", [])
+            if isinstance(item, str) and item.strip()
+        ]
+        if python_install_details.get("readme_uses_requirements"):
+            facts.append('- README.md confirms manual setup uses "pip install -r requirements.txt"')
+        if python_install_details.get("start_sh_uses_requirements"):
+            facts.append('- start.sh installs dependencies from "requirements.txt"')
+        missing_runtime_dependencies = python_install_details.get("missing_runtime_dependencies", [])
+        if isinstance(missing_runtime_dependencies, list) and missing_runtime_dependencies:
+            facts.append(
+                "- requirements.txt contains runtime dependencies missing from pyproject.toml main dependencies = "
+                + ", ".join(str(item) for item in missing_runtime_dependencies)
+            )
+        if python_install_details.get("mixed_flat_layout") and not python_install_details.get("has_explicit_package_config"):
+            mixed_dirs = [
+                str(item)
+                for item in [
+                    *(python_install_details.get("package_dirs", []) or []),
+                    *(python_install_details.get("asset_dirs", []) or []),
+                ]
+                if isinstance(item, str) and item.strip()
+            ]
+            if mixed_dirs:
+                facts.append(
+                    "- repository root mixes Python package dirs with non-package runtime asset dirs = "
+                    + ", ".join(mixed_dirs)
+                )
+        facts.append(f'- Python install strategy = "{python_install_strategy}"')
+        if python_install_strategy != "package_install":
+            facts.append('- current Python repo should not assume "pip install ." is safe based on "pyproject.toml" alone')
+
     frontend_runtime_roots: List[Path] = []
     if service_runtime == "node" or package_json.exists():
         frontend_runtime_roots = detect_frontend_runtime_roots(repo_dir)
@@ -2588,6 +2787,9 @@ def collect_repo_analysis(repo_dir: Path, source_type: str, source: str, ref: Op
         "build_command_candidates": build_command_candidates,
         "requires_build_step": requires_build_step,
         "build_requirement_reasons": build_requirement_reasons,
+        "python_install_strategy": python_install_strategy,
+        "python_install_validation_mode": python_install_validation_mode,
+        "python_install_evidence": python_install_evidence,
     }
 
 
@@ -2614,6 +2816,9 @@ def summarize_analysis(analysis: Dict[str, object], source_type: str, project_sl
         "entrypoint_node": analysis.get("node_entry_command"),
         "detected_port": analysis.get("detected_port"),
         "requires_python": analysis.get("requires_python"),
+        "python_install_strategy": analysis.get("python_install_strategy"),
+        "python_install_validation_mode": analysis.get("python_install_validation_mode"),
+        "python_install_evidence": analysis.get("python_install_evidence", []),
         "system_dependencies": analysis.get("system_dependency_hints", []),
         "environment_variables": analysis.get("env_var_names", []),
         "config_file_hints": analysis.get("config_file_hints", []),
@@ -3296,14 +3501,35 @@ def build_runtime_rules(analysis: Dict[str, object]) -> str:
         "- 若当前环境已存在满足项目要求的兼容 `docker.io` 官方基础镜像，优先直接复用；否则再选择兼容的 `docker.io` 官方基础镜像",
     ]
     if service_runtime == "python":
+        python_install_strategy = str(analysis.get("python_install_strategy") or "package_install")
+        python_install_evidence = [
+            str(item).strip()
+            for item in analysis.get("python_install_evidence", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
         runtime_rules.extend(
             [
                 "- 这是 Python 运行时项目时，优先选择兼容的官方 Python 基础镜像",
-                "- 存在 `pyproject.toml` 时优先使用 `pip install .`；只有 `requirements.txt` 时使用 `pip install -r requirements.txt`",
                 "- 已知 Python 启动命令时，使用 JSON-form CMD，优先采用已识别的入口命令",
                 "- 已知端口时写 `EXPOSE`",
             ]
         )
+        if python_install_strategy == "requirements_txt":
+            runtime_rules.append(
+                "- 已确认当前仓库应按 `requirements.txt` 安装依赖；Dockerfile 必须使用 `pip install -r requirements.txt`，不要只写 `pip install .`"
+            )
+        elif python_install_strategy == "fallback_install":
+            runtime_rules.append(
+                "- 当前仓库同时存在 `pyproject.toml` 与 `requirements.txt`，但缺少足够证据证明 `pip install .` 一定可用；Dockerfile 必须包含回退到 `pip install -r requirements.txt` 的安装策略，或直接使用 `pip install -r requirements.txt`"
+            )
+        else:
+            runtime_rules.append(
+                "- 仅在没有相反直接证据时，才使用 `pip install .`；如果仓库还存在 `requirements.txt`，不要仅因存在 `pyproject.toml` 就武断选择 `pip install .`"
+            )
+        if python_install_evidence:
+            runtime_rules.append(
+                f'- 当前 Python 安装策略判定依据：`{"`, `".join(python_install_evidence)}`'
+            )
         python_images = [image for image in local_official_images if image.startswith("docker.io/library/python:")]
         if python_images:
             runtime_rules.append(
@@ -3558,6 +3784,50 @@ def invoke_codex_generation(
     raise RuntimeError(f"codex exec failed:\n{last_output}")
 
 
+def normalize_dockerfile_install_text(docker_text: str) -> str:
+    return re.sub(r"\\\s*\n\s*", " ", docker_text)
+
+
+def dockerfile_uses_requirements_txt_install(docker_text: str) -> bool:
+    normalized = normalize_dockerfile_install_text(docker_text)
+    patterns = [
+        r"(?:python\s+-m\s+)?pip(?:3)?\s+install\b[^\n;&|]*-r\s+requirements\.txt\b",
+        r"\.venv/bin/pip\s+install\b[^\n;&|]*-r\s+requirements\.txt\b",
+    ]
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
+
+
+def dockerfile_uses_python_package_install(docker_text: str) -> bool:
+    normalized = normalize_dockerfile_install_text(docker_text)
+    patterns = [
+        r"(?:python\s+-m\s+)?pip(?:3)?\s+install\b[^\n;&|]*\s(?:\./|\.)(?=$|\s|[;&|])",
+        r"(?:python\s+-m\s+)?pip(?:3)?\s+install\b[^\n;&|]*file:///",
+    ]
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
+
+
+def validate_python_install_strategy(docker_text: str, analysis: Dict[str, object]) -> List[str]:
+    if analysis.get("service_runtime") != "python":
+        return []
+    validation_mode = str(analysis.get("python_install_validation_mode") or "")
+    has_requirements_install = dockerfile_uses_requirements_txt_install(docker_text)
+    has_package_install = dockerfile_uses_python_package_install(docker_text)
+    findings: List[str] = []
+    if validation_mode == "requires_requirements_txt" and not has_requirements_install:
+        findings.append(
+            "Dockerfile should install Python dependencies from requirements.txt for this repo; do not rely only on pip install ."
+        )
+    elif validation_mode == "requires_requirements_fallback" and not has_requirements_install:
+        findings.append(
+            "Dockerfile must include a requirements.txt install path for this repo because pip install . is not proven safe"
+        )
+    elif validation_mode == "allow_package_install" and not (has_package_install or has_requirements_install):
+        findings.append(
+            "Dockerfile does not contain a recognizable Python dependency install step"
+        )
+    return findings
+
+
 def validate_generated_files(
     repo_dir: Path,
     source_type: Optional[str] = None,
@@ -3605,6 +3875,7 @@ def validate_generated_files(
         package_manager = analysis.get("package_manager")
         has_nextjs_ts_config = bool(analysis.get("has_nextjs_ts_config"))
         requires_build_step = bool(analysis.get("requires_build_step"))
+        dockerfile_findings.extend(validate_python_install_strategy(docker_text, analysis))
 
         if requires_build_step and "build" in package_scripts:
             if not has_build_step:

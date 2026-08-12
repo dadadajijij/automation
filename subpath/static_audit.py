@@ -8,6 +8,7 @@ from .models import (
     HtmlUrlExtractor,
     SubpathAuditFinding,
     SUBPATH_ALLOWED_ROOT_COMMENT,
+    SUBPATH_API_BASE_CONCAT_PATTERNS,
     SUBPATH_CLIENT_METHOD_PATTERNS,
     SUBPATH_TEMPLATE_ALLOWLIST_FIELDS,
 )
@@ -29,6 +30,16 @@ def _paths_under_project(paths: List[Path], project: FrontendProjectStrategy) ->
             continue
         scoped.append(path)
     return scoped
+
+
+def has_safe_tool_base_api_base_assignment(text: str, base_expr: str) -> bool:
+    if base_expr in {"window.location.origin", "location.origin"}:
+        return False
+    pattern = re.compile(
+        rf'(?:const|let|var)\s+{re.escape(base_expr)}\s*=\s*'
+        r'(?:window\.__TOOL_BASE_PATH__\s*\|\|\s*(?:""|\'\')|window\.__TOOL_ORIGIN_URL__\s*\|\|\s*window\.location\.origin)\s*;?'
+    )
+    return bool(pattern.search(text))
 
 
 def default_project_for_plan(plan: SubpathPlan) -> Optional[FrontendProjectStrategy]:
@@ -427,6 +438,32 @@ def scan_subpath_findings(
         )
         for pattern, detail_kind in zip(SUBPATH_CLIENT_METHOD_PATTERNS, detail_kinds):
             for match in pattern.finditer(text):
+                url = f"/{match.group('path')}"
+                if is_allowed_root_relative_url(url, base_path):
+                    continue
+                line = text.count("\n", 0, match.start()) + 1
+                findings.append(
+                    SubpathAuditFinding(
+                        file=relative,
+                        line=line,
+                        severity="error",
+                        code="root_relative_client_url",
+                        message=f'Root-relative browser URL `{url}` is incompatible with deployment subpath `{base_path}`',
+                        detail_kind=detail_kind,
+                    )
+                )
+        concat_detail_kinds = (
+            "request_api",
+            "request_api",
+            "eventsource",
+            "request_api",
+            "request_api",
+        )
+        for pattern, detail_kind in zip(SUBPATH_API_BASE_CONCAT_PATTERNS, concat_detail_kinds):
+            for match in pattern.finditer(text):
+                base_expr = match.group("base")
+                if has_safe_tool_base_api_base_assignment(text, base_expr):
+                    continue
                 url = f"/{match.group('path')}"
                 if is_allowed_root_relative_url(url, base_path):
                     continue
