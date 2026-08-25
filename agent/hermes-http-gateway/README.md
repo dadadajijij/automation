@@ -20,6 +20,7 @@
 - 管理页使用单独的管理员登录
 - 新请求没有 `session_id` 时，网关会自动创建一个
 - 同一 `session_id` 会复用同一个 Hermes 会话
+- 同一 `user_id + session_id` 的新请求会替代旧的未完成请求；如果旧请求正在下载附件，会先等附件下载完成并合并到新请求
 - 已存在的 `session_id` 会自动继承原会话的 `user_id` 和 `profile`
 - 只有显式传入的 `user_id` 或 `profile` 与已有会话不一致时才会报错
 
@@ -56,8 +57,34 @@ Hermes 二进制会优先自动寻找：
 ```bash
 curl -X POST http://127.0.0.1:8011/v1/chat \
   -H 'content-type: application/json' \
-  -d '{"user_id":"alice","question":"帮我总结一下今天的重点"}'
+  -d '{"user_id":"alice","question":{"text":"帮我总结一下今天的重点"}}'
 ```
+
+带图片 URL：
+
+```bash
+curl -X POST http://127.0.0.1:8011/v1/chat \
+  -H 'content-type: application/json' \
+  -d '{
+    "question": {
+      "text": "请分析这张图",
+      "attachments": [
+        {
+          "url": "https://example.com/image.png",
+          "type": "image"
+        }
+      ]
+    },
+    "session_id": "demo-session",
+    "user_id": "alice",
+    "profile": "default"
+  }'
+```
+
+`question.attachments[].type=image` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并同时通过 `--image` 和 prompt 里的 `@file:` 图片路径交给 agent。
+`question.attachments[].type=file` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并通过 Hermes 的 `@file:` 引用机制交给 agent。
+有附件时，`question.text` 可以不传或传空字符串；无附件时必须传非空文本。
+图片和文件默认只保留最近 3 天数据。
 
 ### `GET /v1/sessions`
 
@@ -71,24 +98,28 @@ curl 'http://127.0.0.1:8011/v1/sessions?user_id=alice'
 
 ### `GET /v1/sessions/{session_id}/messages`
 
-查看指定会话历史。
-
-### `POST /v1/chat/{session_id}`
-
-向指定会话继续发送消息。
+查看指定会话历史。需要会话内搜索时，在同一个接口上追加 `q`：
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/chat/demo-session \
+curl 'http://127.0.0.1:8011/v1/sessions/demo-session/messages?user_id=alice&q=hello'
+```
+
+### `POST /v1/chat`
+
+创建会话或向指定会话继续发送消息。指定会话时，把 `session_id` 放在请求体里。
+
+```bash
+curl -X POST http://127.0.0.1:8011/v1/chat \
   -H 'content-type: application/json' \
-  -d '{"user_id":"alice","question":"继续聊这个话题"}'
+  -d '{"session_id":"demo-session","user_id":"alice","question":{"text":"继续聊这个话题"}}'
 ```
 
 如果该 `session_id` 已经存在，也可以省略 `user_id` 和 `profile`：
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/chat/demo-session \
+curl -X POST http://127.0.0.1:8011/v1/chat \
   -H 'content-type: application/json' \
-  -d '{"question":"继续聊这个话题"}'
+  -d '{"session_id":"demo-session","question":{"text":"继续聊这个话题"}}'
 ```
 
 ### `GET /v1/users/me`

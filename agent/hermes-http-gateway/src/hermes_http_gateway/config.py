@@ -107,6 +107,12 @@ class Settings:
     source_tag: str
     default_model: str | None
     default_provider: str | None
+    attachment_max_bytes: int
+    attachment_download_timeout_seconds: int
+    attachment_max_images: int
+    attachment_redirect_limit: int
+    attachment_storage_root: Path
+    attachment_retention_days: int
 
 
 def load_settings() -> Settings:
@@ -128,4 +134,10 @@ def load_settings() -> Settings:
         source_tag=os.environ.get("HERMES_SOURCE_TAG", "tool").strip() or "tool",
         default_model=os.environ.get("DEFAULT_MODEL", "").strip() or None,
         default_provider=os.environ.get("DEFAULT_PROVIDER", "").strip() or None,
+        attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 10 * 1024 * 1024),
+        attachment_download_timeout_seconds=_env_int("ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS", 30),
+        attachment_max_images=_env_int("ATTACHMENT_MAX_IMAGES", 8),
+        attachment_redirect_limit=_env_int("ATTACHMENT_REDIRECT_LIMIT", 3),
+        attachment_storage_root=_env_path("ATTACHMENT_STORAGE_ROOT", Path("/tmp/hermes")),
+        attachment_retention_days=_env_int("ATTACHMENT_RETENTION_DAYS", 3),
     )

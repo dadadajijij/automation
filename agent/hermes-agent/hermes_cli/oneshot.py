@@ -206,6 +206,7 @@ def run_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: Optional[str] = None,
+    attachment_root: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -221,6 +222,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        attachment_root: Optional directory that @file:/@folder: references
+            are allowed to read from.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -283,6 +286,7 @@ def run_oneshot(
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                     skills=skills,
+                    attachment_root=attachment_root,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -361,6 +365,7 @@ def _run_agent(
     toolsets: object = None,
     use_config_toolsets: bool = True,
     skills: object = None,
+    attachment_root: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -506,6 +511,29 @@ def _run_agent(
         agent.suppress_status_output = True
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
+
+        if isinstance(prompt, str) and "@" in prompt:
+            from agent.context_references import preprocess_context_references
+            from agent.model_metadata import get_model_context_length
+
+            _ctx_len = get_model_context_length(
+                effective_model,
+                base_url=runtime.get("base_url") or "",
+                api_key=runtime.get("api_key") or "",
+                provider=runtime.get("provider") or "",
+                config_context_length=getattr(agent, "_config_context_length", None),
+            )
+            _ctx_result = preprocess_context_references(
+                prompt,
+                cwd=os.getcwd(),
+                context_length=_ctx_len,
+                allowed_root=attachment_root,
+            )
+            if _ctx_result.blocked:
+                message = "\n".join(_ctx_result.warnings) or "Context injection refused."
+                return message, {"final_response": message, "failed": True}
+            if _ctx_result.expanded:
+                prompt = _ctx_result.message
 
         result = agent.run_conversation(prompt)
         return (result.get("final_response") or "", result)

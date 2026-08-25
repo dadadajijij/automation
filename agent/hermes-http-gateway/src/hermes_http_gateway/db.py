@@ -551,6 +551,24 @@ def append_message(
     return message
 
 
+def delete_message(settings: Settings, *, external_session_id: str, user_id: str, message_id: str) -> None:
+    with _connect(settings.database_url) as conn:
+        conn.execute(
+            """
+            DELETE FROM messages
+            WHERE id = ? AND external_session_id = ? AND user_id = ?
+            """,
+            (message_id, external_session_id, user_id),
+        )
+        conn.execute(
+            """
+            DELETE FROM session_search
+            WHERE message_id = ? AND external_session_id = ? AND user_id = ?
+            """,
+            (message_id, external_session_id, user_id),
+        )
+
+
 def update_conversation(
     settings: Settings,
     *,
@@ -612,11 +630,13 @@ def search_messages(
             """
             SELECT s.user_id, s.external_session_id, c.hermes_session_id, c.hermes_profile,
                    c.title AS conversation_title, s.message_id, s.role, s.kind,
-                   s.created_at, s.title, s.content
+                   s.created_at, s.title, s.content, m.model, m.provider
             FROM session_search s
             JOIN conversations c
               ON c.external_session_id = s.external_session_id
              AND c.user_id = s.user_id
+            LEFT JOIN messages m
+              ON m.id = s.message_id
             WHERE s.user_id = ?
               AND (? IS NULL OR s.external_session_id = ?)
               AND (

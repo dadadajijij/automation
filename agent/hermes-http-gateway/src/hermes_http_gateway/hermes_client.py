@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .locks import clear_session_process, is_session_turn_current, register_session_process
 
 
 class HermesInvocationError(RuntimeError):
@@ -17,6 +18,10 @@ class HermesInvocationError(RuntimeError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+class HermesInvocationCancelled(HermesInvocationError):
+    pass
 
 
 @dataclass(slots=True)
@@ -61,6 +66,53 @@ def _read_usage_file(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _make_usage_path() -> Path:
+    fd, path = tempfile.mkstemp(prefix="hermes-gateway-", suffix=".json")
+    os.close(fd)
+    return Path(path)
+
+
+def _raise_if_cancelled(run_key: str | None, run_generation: int | None) -> None:
+    if run_key is not None and run_generation is not None and not is_session_turn_current(run_key, run_generation):
+        raise HermesInvocationCancelled("Hermes invocation superseded by a newer request")
+
+
+def _run_command(
+    settings: Settings,
+    cmd: list[str],
+    *,
+    run_key: str | None,
+    run_generation: int | None,
+) -> subprocess.CompletedProcess[str]:
+    _raise_if_cancelled(run_key, run_generation)
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(settings.hermes_workdir),
+        env=_base_env(settings),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    registered = register_session_process(run_key, run_generation, process)
+    if not registered:
+        raise HermesInvocationCancelled("Hermes invocation superseded by a newer request")
+    try:
+        stdout, stderr = process.communicate(timeout=settings.timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        process.communicate()
+        raise HermesInvocationError(f"Hermes timed out after {settings.timeout_seconds}s") from exc
+    finally:
+        clear_session_process(run_key, run_generation, process)
+
+    _raise_if_cancelled(run_key, run_generation)
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
 def run_first_turn(
     settings: Settings,
     *,
@@ -68,28 +120,35 @@ def run_first_turn(
     profile: str,
     model: str | None = None,
     provider: str | None = None,
+    image_paths: list[Path] | None = None,
+    attachment_root: Path | None = None,
+    run_key: str | None = None,
+    run_generation: int | None = None,
 ) -> HermesRunResult:
-    usage_path = Path(tempfile.mkstemp(prefix="hermes-gateway-", suffix=".json")[1])
+    usage_path = _make_usage_path()
     cmd = _build_hermes_command(
         settings,
         profile=profile,
         model=model or settings.default_model,
         provider=provider or settings.default_provider,
     )
-    cmd.extend(["-z", prompt, "--usage-file", str(usage_path)])
+    images = image_paths or []
+    if images or attachment_root:
+        cmd.extend(["chat", "-Q", "-q", prompt, "--usage-file", str(usage_path)])
+        if attachment_root:
+            cmd.extend(["--attachment-root", str(attachment_root)])
+        for image_path in images:
+            cmd.extend(["--image", str(image_path)])
+    else:
+        cmd.extend(["-z", prompt, "--usage-file", str(usage_path)])
 
     try:
-        completed = subprocess.run(
+        completed = _run_command(
+            settings,
             cmd,
-            cwd=str(settings.hermes_workdir),
-            env=_base_env(settings),
-            capture_output=True,
-            text=True,
-            timeout=settings.timeout_seconds,
-            check=False,
+            run_key=run_key,
+            run_generation=run_generation,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise HermesInvocationError(f"Hermes timed out after {settings.timeout_seconds}s") from exc
     except FileNotFoundError as exc:
         raise HermesInvocationError(f"Hermes binary not found: {settings.hermes_bin}") from exc
     finally:
@@ -132,29 +191,40 @@ def run_resume_turn(
     profile: str,
     model: str | None = None,
     provider: str | None = None,
+    image_paths: list[Path] | None = None,
+    attachment_root: Path | None = None,
+    run_key: str | None = None,
+    run_generation: int | None = None,
 ) -> HermesRunResult:
+    usage_path = _make_usage_path()
     cmd = _build_hermes_command(
         settings,
         profile=profile,
         model=model or settings.default_model,
         provider=provider or settings.default_provider,
     )
-    cmd.extend(["chat", "--resume", hermes_session_id, "-Q", "-q", prompt])
+    images = image_paths or []
+    cmd.extend(["chat", "--resume", hermes_session_id, "-Q", "-q", prompt, "--usage-file", str(usage_path)])
+    if attachment_root:
+        cmd.extend(["--attachment-root", str(attachment_root)])
+    for image_path in images:
+        cmd.extend(["--image", str(image_path)])
 
     try:
-        completed = subprocess.run(
+        completed = _run_command(
+            settings,
             cmd,
-            cwd=str(settings.hermes_workdir),
-            env=_base_env(settings),
-            capture_output=True,
-            text=True,
-            timeout=settings.timeout_seconds,
-            check=False,
+            run_key=run_key,
+            run_generation=run_generation,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise HermesInvocationError(f"Hermes timed out after {settings.timeout_seconds}s") from exc
     except FileNotFoundError as exc:
         raise HermesInvocationError(f"Hermes binary not found: {settings.hermes_bin}") from exc
+    finally:
+        usage = _read_usage_file(usage_path)
+        try:
+            usage_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     if completed.returncode != 0:
         raise HermesInvocationError(
@@ -164,11 +234,17 @@ def run_resume_turn(
             stderr=completed.stderr,
         )
 
+    session_id = hermes_session_id
+    if isinstance(usage, dict):
+        value = usage.get("session_id")
+        if isinstance(value, str) and value.strip():
+            session_id = value.strip()
+
     return HermesRunResult(
         answer=completed.stdout.strip(),
-        session_id=hermes_session_id,
+        session_id=session_id,
         stdout=completed.stdout,
         stderr=completed.stderr,
         returncode=completed.returncode,
-        usage=None,
+        usage=usage,
     )

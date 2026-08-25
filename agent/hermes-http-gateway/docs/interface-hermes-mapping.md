@@ -15,10 +15,12 @@
 
 | 网关字段 | Hermes 侧 | 说明 |
 |---|---|---|
-| `question` | `prompt` | 本轮输入内容 |
+| `question.text` | `prompt` | 本轮输入文本 |
 | `user_id` | 网关用户隔离 | 新会话不传时默认为 `guest`；已有 `session_id` 不传时继承原会话用户 |
 | `session_id` | 网关内部会话映射 | 不直接传给 Hermes，用来找对应的 `hermes_session_id` 和原会话信息 |
 | `profile` | `-p` | 新会话优先使用请求里的 `profile`；已有 `session_id` 不传时继承原会话 profile |
+| `question.attachments[].type=image` | 重复的 `--image <local_image_path>` + prompt 里的 `@file:<local_image_path>` + `--attachment-root <session_attachment_dir>` | 网关先下载公网图片 URL 到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，再按顺序把本地路径传给 Hermes，并把图片路径追加到 prompt |
+| `question.attachments[].type=file` | prompt 里的 `@file:<local_file_path>` + `--attachment-root <session_attachment_dir>` | 网关先下载公网文件 URL 到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，再把本地路径以 `@file:` 引用追加到 prompt |
 | `user.default_hermes_profile` | `-p` | 请求没传 `profile` 时使用 |
 | `hermes_profile_default` | `-p` | 再往后的默认值 |
 | `default_model` | `-m` | 服务端配置的默认模型，不允许外部请求覆盖 |
@@ -26,33 +28,10 @@
 
 实际行为：
 
-- 首次会话：调用 `hermes ... -z <prompt>`
-- 已有 Hermes 会话：调用 `hermes chat --resume <hermes_session_id> -Q -q <prompt>`
-
-### `POST /v1/chat/{session_id}`
-
-作用：
-明确向指定会话续聊。
-
-映射关系：
-
-- 路径里的 `session_id`：网关内部会话 id
-- body 里的 `user_id`：网关用户隔离字段；已有会话不传时继承原会话用户
-- body 里的 `profile`：已有会话不传时继承原会话 profile
-- `body.session_id`：如果传了，必须和路径一致
-- 其余字段映射规则与 `POST /v1/chat` 相同
-
-冲突规则：
-
-- 已有 `session_id` 且显式传入的 `user_id` 和原会话不同：返回 `409`
-- 已有 `session_id` 且显式传入的 `profile` 和原会话不同：返回 `409`
-- 已有 `session_id` 但省略 `user_id` / `profile`：不会报错，自动使用原会话保存的信息
-
-Hermes 实际调用：
-
-```bash
-hermes chat --resume <hermes_session_id> -Q -q <prompt>
-```
+- 首次纯文本会话：调用 `hermes ... -z <prompt> --usage-file <usage_json_path>`
+- 首次图片或文件会话：调用 `hermes ... chat -Q -q <prompt> --image <local_image_path_1> ... --attachment-root <session_attachment_dir> --usage-file <usage_json_path>`
+- 已有 Hermes 会话：调用 `hermes chat --resume <hermes_session_id> -Q -q <prompt> --usage-file <usage_json_path>`
+- 已有 Hermes 会话带图片：额外按顺序追加多个 `--image <local_image_path>`
 
 ## 2. 不调用 Hermes 的接口
 
@@ -64,7 +43,6 @@ hermes chat --resume <hermes_session_id> -Q -q <prompt>
 - `GET /v1/sessions`
 - `GET /v1/sessions/search`
 - `GET /v1/sessions/{session_id}/messages`
-- `GET /v1/sessions/{session_id}/search`
 - `GET /admin/login`
 - `POST /admin/login`
 - `GET /admin/logout`

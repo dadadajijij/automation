@@ -119,10 +119,19 @@ def build_top_level_parser():
         metavar="PATH",
         default=None,
         help=(
-            "One-shot mode only: after the run, write a JSON usage report "
+            "After a -z/--oneshot run or chat single-query run, write a JSON usage report "
             "(estimated cost, token counts, model, api_calls) to PATH. "
             "The report is written even when the run fails, so pipelines "
-            "can always account for spend. No effect outside -z/--oneshot."
+            "can always account for spend."
+        ),
+    )
+    parser.add_argument(
+        "--attachment-root",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Restrict @file:/@folder: context references to PATH for this "
+            "invocation. Intended for downloaded attachment directories."
         ),
     )
     # --model / --provider are accepted at the top level so they can pair
@@ -315,7 +324,29 @@ def build_top_level_parser():
         ),
     )
     chat_parser.add_argument(
-        "--image", help="Optional local image path to attach to a single query"
+        "--image",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Optional local image path to attach to a single query (repeatable)",
+    )
+    chat_parser.add_argument(
+        "--attachment-root",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help=(
+            "Restrict @file:/@folder: context references to PATH for this "
+            "chat invocation."
+        ),
+    )
+    chat_parser.add_argument(
+        "--usage-file",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help=(
+            "With -q/--query or --query-file, write a JSON usage report "
+            "(including session_id when available) to PATH."
+        ),
     )
     # `default=argparse.SUPPRESS` on flags that are ALSO declared on the
     # top-level parser: when the user writes `hermes -m foo chat`, argparse

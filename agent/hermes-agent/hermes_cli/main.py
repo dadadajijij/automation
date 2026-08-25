@@ -182,6 +182,7 @@ def _run_and_exit_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: object = None,
+    attachment_root: object = None,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -193,6 +194,7 @@ def _run_and_exit_oneshot(
             toolsets=toolsets,
             skills=skills,
             usage_file=usage_file,
+            attachment_root=attachment_root,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -581,6 +583,7 @@ def _apply_profile_override() -> None:
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--attachment-root",
         "--in",
     }
     optional_value_flags = {"-c", "--continue"}
@@ -2676,12 +2679,13 @@ def _launch_tui(
     verbose: Optional[bool] = None,
     quiet: bool = False,
     query: Optional[str] = None,
-    image: Optional[str] = None,
+    image: Optional[str | list[str]] = None,
     worktree: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
+    attachment_root: Optional[str] = None,
 ):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
@@ -2767,7 +2771,14 @@ def _launch_tui(
     if query:
         env["HERMES_TUI_QUERY"] = query
     if image:
-        env["HERMES_TUI_IMAGE"] = image
+        if isinstance(image, (list, tuple)):
+            image_value = str(image[0]).strip() if image else ""
+        else:
+            image_value = str(image).strip()
+        if image_value:
+            env["HERMES_TUI_IMAGE"] = image_value
+    if attachment_root:
+        env["HERMES_ATTACHMENT_ROOT"] = str(attachment_root)
     if checkpoints:
         env["HERMES_TUI_CHECKPOINTS"] = "1"
     if pass_session_id:
@@ -3205,6 +3216,7 @@ def cmd_chat(args):
             pass_session_id=getattr(args, "pass_session_id", False),
             max_turns=getattr(args, "max_turns", None),
             accept_hooks=getattr(args, "accept_hooks", False),
+            attachment_root=getattr(args, "attachment_root", None),
         )
 
     # Import and run the CLI
@@ -3252,6 +3264,8 @@ def cmd_chat(args):
         "pass_session_id": getattr(args, "pass_session_id", False),
         "max_turns": getattr(args, "max_turns", None),
         "run_budget": getattr(args, "run_budget", None),
+        "usage_file": getattr(args, "usage_file", None),
+        "attachment_root": getattr(args, "attachment_root", None),
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
@@ -11907,6 +11921,8 @@ def _set_chat_arg_defaults(args) -> None:
         ("resume", None),
         ("continue_last", None),
         ("worktree", False),
+        ("usage_file", None),
+        ("attachment_root", None),
     ]:
         if not hasattr(args, attr):
             setattr(args, attr, default)
@@ -11977,6 +11993,7 @@ def _try_fast_chat_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            attachment_root=getattr(args, "attachment_root", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12035,6 +12052,7 @@ def _try_termux_fast_cli_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            attachment_root=getattr(args, "attachment_root", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -13965,6 +13983,7 @@ def main():
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            attachment_root=getattr(args, "attachment_root", None),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
@@ -13977,6 +13996,8 @@ def main():
             ("toolsets", None),
             ("verbose", None),
             ("worktree", False),
+            ("usage_file", None),
+            ("attachment_root", None),
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
@@ -13994,6 +14015,8 @@ def main():
             ("resume", None),
             ("continue_last", None),
             ("worktree", False),
+            ("usage_file", None),
+            ("attachment_root", None),
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)

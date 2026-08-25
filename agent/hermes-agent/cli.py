@@ -4594,7 +4594,10 @@ def _status_bar_visible_from_display_config(display_config: object) -> bool:
     return statusbar_config is not False
 
 
-def _collect_query_images(query: str | None, image_arg: str | None = None) -> tuple[str, list[Path]]:
+def _collect_query_images(
+    query: str | None,
+    image_arg: str | list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, list[Path]]:
     """Collect local image attachments for single-query CLI flows."""
     message = query or ""
     images: list[Path] = []
@@ -4606,12 +4609,18 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
             message = dropped["remainder"] or f"[User attached image: {dropped['path'].name}]"
 
     if image_arg:
-        explicit_path = _resolve_attachment_path(image_arg)
-        if explicit_path is None:
-            raise ValueError(f"Image file not found: {image_arg}")
-        if explicit_path.suffix.lower() not in _IMAGE_EXTENSIONS:
-            raise ValueError(f"Not a supported image file: {explicit_path}")
-        images.append(explicit_path)
+        explicit_args = (
+            [image_arg]
+            if isinstance(image_arg, str)
+            else [item for item in image_arg if item]
+        )
+        for raw_image in explicit_args:
+            explicit_path = _resolve_attachment_path(raw_image)
+            if explicit_path is None:
+                raise ValueError(f"Image file not found: {raw_image}")
+            if explicit_path.suffix.lower() not in _IMAGE_EXTENSIONS:
+                raise ValueError(f"Not a supported image file: {explicit_path}")
+            images.append(explicit_path)
 
     deduped: list[Path] = []
     seen: set[str] = set()
@@ -4991,6 +5000,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        attachment_root: str = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -5007,10 +5017,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
+            attachment_root: Restrict @file:/@folder: expansion to this directory
         """
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        raw_attachment_root = (attachment_root or os.getenv("HERMES_ATTACHMENT_ROOT", "")).strip()
+        self.attachment_root = str(Path(raw_attachment_root).expanduser().resolve()) if raw_attachment_root else None
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -15762,6 +15775,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    def _expand_context_references_for_turn(
+        self,
+        message,
+        *,
+        announce: bool = True,
+    ) -> tuple[object, str | None]:
+        """Expand @file/@folder references for a user turn.
+
+        ``attachment_root`` is intentionally narrower than cwd when supplied
+        by an external gateway, so downloaded attachment refs cannot escape the
+        per-session attachment directory.
+        """
+        if not (isinstance(message, str) and "@" in message):
+            return message, None
+        try:
+            from agent.context_references import preprocess_context_references
+            from agent.model_metadata import get_model_context_length
+
+            _ctx_len = get_model_context_length(
+                self.model,
+                base_url=self.base_url or "",
+                api_key=self.api_key or "",
+                provider=self.provider or "",
+                config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
+            )
+            _ctx_result = preprocess_context_references(
+                message,
+                cwd=os.getcwd(),
+                context_length=_ctx_len,
+                allowed_root=self.attachment_root,
+            )
+            if _ctx_result.expanded or _ctx_result.blocked:
+                if announce and _ctx_result.references:
+                    _cprint(
+                        f"  {_DIM}[@ context: {len(_ctx_result.references)} ref(s), "
+                        f"{_ctx_result.injected_tokens} tokens]{_RST}"
+                    )
+                if announce:
+                    for w in _ctx_result.warnings:
+                        _cprint(f"  {_DIM}⚠ {w}{_RST}")
+                if _ctx_result.blocked:
+                    return message, "\n".join(_ctx_result.warnings) or "Context injection refused."
+                return _ctx_result.message, None
+        except Exception as e:
+            logging.debug("@ context reference expansion failed: %s", e)
+        return message, None
+
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -15792,6 +15852,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._last_chat_result = None
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -15882,28 +15943,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
 
         # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
-        if isinstance(message, str) and "@" in message:
-            try:
-                from agent.context_references import preprocess_context_references
-                from agent.model_metadata import get_model_context_length
-                _ctx_len = get_model_context_length(
-                    self.model, base_url=self.base_url or "", api_key=self.api_key or "",
-                    provider=self.provider or "",
-                    config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None)
-                _ctx_result = preprocess_context_references(
-                    message, cwd=os.getcwd(), context_length=_ctx_len)
-                if _ctx_result.expanded or _ctx_result.blocked:
-                    if _ctx_result.references:
-                        _cprint(
-                            f"  {_DIM}[@ context: {len(_ctx_result.references)} ref(s), "
-                            f"{_ctx_result.injected_tokens} tokens]{_RST}")
-                    for w in _ctx_result.warnings:
-                        _cprint(f"  {_DIM}⚠ {w}{_RST}")
-                    if _ctx_result.blocked:
-                        return "\n".join(_ctx_result.warnings) or "Context injection refused."
-                    message = _ctx_result.message
-            except Exception as e:
-                logging.debug("@ context reference expansion failed: %s", e)
+        message, context_blocked = self._expand_context_references_for_turn(message)
+        if context_blocked:
+            return context_blocked
 
         # Sanitize surrogate characters that can arrive via clipboard paste from
         # rich-text editors (Google Docs, Word, etc.).  Lone surrogates are invalid
@@ -16349,6 +16391,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            if isinstance(result, dict):
+                result.setdefault("session_id", self.session_id)
+                self._last_chat_result = result
 
             # Session titling now runs at TURN START (agent/turn_context.py)
             # from the user's message alone, so it is already done — or in
@@ -20347,10 +20392,36 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _write_single_query_usage_file(
+    usage_file: str | None,
+    result: Any,
+    cli: "HermesCLI",
+    failure: str | None = None,
+) -> None:
+    if not usage_file:
+        return
+    try:
+        from hermes_cli.oneshot import _write_usage_file
+
+        report = dict(result) if isinstance(result, dict) else {}
+        session_id = (
+            getattr(getattr(cli, "agent", None), "session_id", None)
+            or getattr(cli, "session_id", None)
+        )
+        if session_id:
+            report["session_id"] = session_id
+        agent = getattr(cli, "agent", None)
+        report.setdefault("model", getattr(agent, "model", None) or getattr(cli, "model", None))
+        report.setdefault("provider", getattr(agent, "provider", None) or getattr(cli, "provider", None))
+        _write_usage_file(usage_file, report, failure=failure)
+    except Exception:
+        pass
+
+
 def main(
     query: str = None,
     q: str = None,
-    image: str = None,
+    image: str | list[str] = None,
     toolsets: str = None,
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
@@ -20371,6 +20442,8 @@ def main(
     w: bool = False,
     checkpoints: bool = False,
     pass_session_id: bool = False,
+    usage_file: str = None,
+    attachment_root: str = None,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
 ):
@@ -20380,7 +20453,7 @@ def main(
     Args:
         query: Single query to execute (then exit). Alias: -q
         q: Shorthand for --query
-        image: Optional local image path to attach to a single query
+        image: Optional local image path(s) to attach to a single query
         toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
         skills: Comma-separated or repeated list of skills to preload for the session
         model: Model to use (default: anthropic/claude-opus-4-20250514)
@@ -20396,6 +20469,8 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
+        usage_file: Optional JSON usage report path for single-query mode
+        attachment_root: Restrict @file:/@folder: expansion to this directory
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -20563,6 +20638,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        attachment_root=attachment_root,
     )
 
     if parsed_skills:
@@ -20825,6 +20901,19 @@ def main(
                                 single_query_images,
                                 announce=False,
                             )
+                    effective_query, context_blocked = cli._expand_context_references_for_turn(
+                        effective_query,
+                        announce=False,
+                    )
+                    if context_blocked:
+                        print(context_blocked)
+                        _write_single_query_usage_file(
+                            usage_file,
+                            {"failed": True, "session_id": cli.session_id},
+                            cli,
+                            failure=context_blocked,
+                        )
+                        sys.exit(1)
                     turn_route = cli._resolve_turn_agent_config(effective_query)
                     if turn_route["signature"] != cli._active_agent_route_signature:
                         cli.agent = None
@@ -20846,6 +20935,12 @@ def main(
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            _write_single_query_usage_file(
+                                usage_file,
+                                {},
+                                cli,
+                                failure="KeyboardInterrupt",
+                            )
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
@@ -20858,6 +20953,8 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
+                        if isinstance(result, dict):
+                            result.setdefault("session_id", cli.session_id)
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
@@ -20887,6 +20984,7 @@ def main(
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 
                         # Session ID goes to stderr so piped stdout is clean.
+                        _write_single_query_usage_file(usage_file, result, cli)
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
                         # Ensure proper exit code for automation wrappers.
@@ -20917,6 +21015,12 @@ def main(
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
+                _write_single_query_usage_file(
+                    usage_file,
+                    {},
+                    cli,
+                    failure="agent initialization failed",
+                )
                 sys.exit(1)
             else:
                 # Single-query mode (`hermes chat -q "…"`): skip the welcome
@@ -20939,6 +21043,17 @@ def main(
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
+                _chat_result = getattr(cli, "_last_chat_result", None)
+                _write_single_query_usage_file(
+                    usage_file,
+                    _chat_result,
+                    cli,
+                    failure=(
+                        None
+                        if _chat_result is not None
+                        else "agent did not return a result"
+                    ),
+                )
                 cli._print_exit_summary(clear_screen=False)
         finally:
             _finalize_single_query(cli)

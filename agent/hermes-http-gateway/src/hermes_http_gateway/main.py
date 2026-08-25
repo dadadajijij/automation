@@ -5,14 +5,24 @@ import re
 import uuid
 import shutil
 from contextlib import asynccontextmanager
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .admin_ui import render_dashboard_page, render_login_page
+from .attachments import (
+    AttachmentError,
+    DownloadedFile,
+    DownloadedImage,
+    attachment_session_dir,
+    cleanup_old_attachment_dirs,
+    download_file,
+    download_image,
+)
 from .config import Settings, load_env_file, load_settings
 from .db import (
     append_message,
@@ -21,6 +31,7 @@ from .db import (
     count_messages,
     count_users,
     delete_admin_session,
+    delete_message,
     create_conversation,
     get_conversation_by_session,
     get_conversation,
@@ -38,21 +49,49 @@ from .db import (
     touch_admin_session,
     update_conversation,
 )
-from .hermes_client import HermesInvocationError, run_first_turn, run_resume_turn
-from .locks import get_session_lock
+from .hermes_client import HermesInvocationCancelled, HermesInvocationError, run_first_turn, run_resume_turn
+from .locks import (
+    begin_attachment_download,
+    begin_session_turn,
+    clear_pending_attachments,
+    finish_attachment_download,
+    get_pending_attachments,
+    get_session_lock,
+    is_session_turn_current,
+    wait_for_attachment_downloads,
+)
 
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 DEFAULT_USER_ID = "guest"
 
 
+class ChatAttachment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=2048)
+    type: Literal["image", "file"]
+
+
+class ChatQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(default="", max_length=20000)
+    attachments: list[ChatAttachment] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def require_text_or_attachment(self) -> "ChatQuestion":
+        if not self.text.strip() and not self.attachments:
+            raise ValueError("question.text is required when question.attachments is empty")
+        return self
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    question: str = Field(min_length=1, max_length=20000)
+    question: ChatQuestion
     user_id: str | None = Field(default=None, max_length=120)
     session_id: str | None = Field(default=None, max_length=120)
-    title: str | None = Field(default=None, max_length=120)
     profile: str | None = Field(default=None, max_length=120)
 
 
@@ -141,6 +180,8 @@ def _validate_session_id(session_id: str) -> str:
 
 def _conversation_title(question: str) -> str:
     title = " ".join(question.strip().split())
+    if not title:
+        return "附件请求"
     if len(title) <= 80:
         return title
     return title[:77].rstrip() + "..."
@@ -173,6 +214,123 @@ def _message_payload(row: dict[str, Any]) -> dict[str, Any]:
         "provider": row["provider"],
         "created_at": row["created_at"],
     }
+
+
+def _search_message_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["message_id"],
+        "session_id": row["external_session_id"],
+        "user_id": row["user_id"],
+        "role": row["role"],
+        "kind": row["kind"],
+        "content": row["content"],
+        "model": row["model"],
+        "provider": row["provider"],
+        "created_at": row["created_at"],
+    }
+
+
+def _prepare_image_attachments(
+    settings: Settings,
+    attachments: list[ChatAttachment],
+    target_dir: Path,
+) -> list[DownloadedImage]:
+    image_attachments = [item for item in attachments if item.type == "image"]
+    if len(image_attachments) > settings.attachment_max_images:
+        raise HTTPException(
+            status_code=400,
+            detail=f"only {settings.attachment_max_images} image attachment(s) are supported",
+        )
+
+    downloaded: list[DownloadedImage] = []
+    for item in image_attachments:
+        try:
+            downloaded.append(download_image(settings, url=item.url, target_dir=target_dir))
+        except AttachmentError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return downloaded
+
+
+def _prepare_file_attachments(
+    settings: Settings,
+    attachments: list[ChatAttachment],
+    target_dir: Path,
+) -> list[DownloadedFile]:
+    file_attachments = [item for item in attachments if item.type == "file"]
+
+    downloaded: list[DownloadedFile] = []
+    for item in file_attachments:
+        try:
+            downloaded.append(download_file(settings, url=item.url, target_dir=target_dir))
+        except AttachmentError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return downloaded
+
+
+def _format_file_ref(path: Path) -> str:
+    value = str(path)
+    if not any(ch.isspace() or ch in "()[]{}<>\"'`" for ch in value):
+        return f"@file:{value}"
+    for quote in ("`", '"', "'"):
+        if quote not in value:
+            return f"@file:{quote}{value}{quote}"
+    return f"@file:{value}"
+
+
+def _prompt_with_attachments(
+    prompt: str,
+    images: list[DownloadedImage],
+    files: list[DownloadedFile],
+) -> str:
+    if not images and not files:
+        return prompt
+
+    sections: list[str] = []
+    if images:
+        image_refs = "\n".join(f"- {_format_file_ref(item.local_path)}" for item in images)
+        sections.append(f"附件图片：\n{image_refs}")
+    if files:
+        file_refs = "\n".join(f"- {_format_file_ref(item.local_path)}" for item in files)
+        sections.append(f"附件文件：\n{file_refs}")
+    prefix = prompt.rstrip()
+    if not prefix:
+        return "\n\n".join(sections)
+    return f"{prefix}\n\n" + "\n\n".join(sections)
+
+
+def _dedupe_downloaded(items: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    deduped: list[Any] = []
+    for item in items:
+        key = str(item.local_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _attachment_root_for_prompt(
+    settings: Settings,
+    external_session_id: str,
+    prompt: str,
+    images: list[DownloadedImage],
+    files: list[DownloadedFile],
+) -> Path | None:
+    paths = [item.local_path for item in images] + [item.local_path for item in files]
+    if paths:
+        parents = {path.parent for path in paths}
+        if len(parents) == 1:
+            return next(iter(parents))
+        return settings.attachment_storage_root
+    if "@" in prompt:
+        return attachment_session_dir(settings, external_session_id)
+    return None
+
+
+def _ensure_turn_current(run_key: str, run_generation: int) -> None:
+    if not is_session_turn_current(run_key, run_generation):
+        raise HermesInvocationCancelled("request superseded by a newer request")
 
 
 def _ensure_conversation(
@@ -222,6 +380,8 @@ async def _run_chat_turn(
     session_id: str | None,
     request: ChatRequest,
 ) -> dict[str, Any]:
+    question_text = request.question.text
+    attachments = request.question.attachments
     effective_model = settings.default_model
     effective_provider = settings.default_provider
     if effective_provider and not effective_model:
@@ -234,26 +394,86 @@ async def _run_chat_turn(
         user_id=user_id,
         session_id=session_id or request.session_id,
         profile=request.profile,
-        title=request.title or _conversation_title(request.question),
+        title=_conversation_title(question_text),
     )
 
     external_session_id = conversation["external_session_id"]
-    lock = get_session_lock(f"{user_id}:{external_session_id}")
+    run_key = f"{user_id}:{external_session_id}"
+    await asyncio.to_thread(wait_for_attachment_downloads, run_key)
+    run_generation = begin_session_turn(run_key)
+    lock = get_session_lock(run_key)
 
+    try:
+        _ensure_turn_current(run_key, run_generation)
+    except HermesInvocationCancelled as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if attachments:
+        begin_attachment_download(run_key)
+        try:
+            target_dir = attachment_session_dir(settings, external_session_id)
+            downloaded_images = await asyncio.to_thread(
+                _prepare_image_attachments,
+                settings,
+                attachments,
+                target_dir,
+            )
+            downloaded_files = await asyncio.to_thread(
+                _prepare_file_attachments,
+                settings,
+                attachments,
+                target_dir,
+            )
+        except Exception:
+            finish_attachment_download(run_key)
+            raise
+        else:
+            finish_attachment_download(
+                run_key,
+                images=downloaded_images,
+                files=downloaded_files,
+            )
+    else:
+        cleanup_old_attachment_dirs(settings)
+    try:
+        _ensure_turn_current(run_key, run_generation)
+    except HermesInvocationCancelled as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    user_message_id: str | None = None
     async with lock:
+        try:
+            _ensure_turn_current(run_key, run_generation)
+        except HermesInvocationCancelled as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
         conversation = get_conversation(settings, user_id, external_session_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        append_message(
+        pending_images, pending_files = get_pending_attachments(run_key)
+        turn_images = _dedupe_downloaded(pending_images)
+        turn_files = _dedupe_downloaded(pending_files)
+        hermes_prompt = _prompt_with_attachments(question_text, turn_images, turn_files)
+        image_paths = [item.local_path for item in turn_images]
+        attachment_root = _attachment_root_for_prompt(
+            settings,
+            external_session_id,
+            hermes_prompt,
+            turn_images,
+            turn_files,
+        )
+
+        user_message = append_message(
             settings,
             external_session_id=external_session_id,
             user_id=user_id,
             role="user",
             kind="chat",
-            content=request.question,
+            content=question_text,
             title=conversation["title"],
         )
+        user_message_id = user_message["id"]
         update_conversation(
             settings,
             external_session_id=external_session_id,
@@ -267,21 +487,39 @@ async def _run_chat_turn(
                 result = await asyncio.to_thread(
                     run_resume_turn,
                     settings,
-                    prompt=request.question,
+                    prompt=hermes_prompt,
                     hermes_session_id=conversation["hermes_session_id"],
                     profile=conversation["hermes_profile"],
                     model=effective_model,
                     provider=effective_provider,
+                    image_paths=image_paths,
+                    attachment_root=attachment_root,
+                    run_key=run_key,
+                    run_generation=run_generation,
                 )
             else:
                 result = await asyncio.to_thread(
                     run_first_turn,
                     settings,
-                    prompt=request.question,
+                    prompt=hermes_prompt,
                     profile=conversation["hermes_profile"],
                     model=effective_model,
                     provider=effective_provider,
+                    image_paths=image_paths,
+                    attachment_root=attachment_root,
+                    run_key=run_key,
+                    run_generation=run_generation,
                 )
+            _ensure_turn_current(run_key, run_generation)
+        except HermesInvocationCancelled as exc:
+            if user_message_id:
+                delete_message(
+                    settings,
+                    external_session_id=external_session_id,
+                    user_id=user_id,
+                    message_id=user_message_id,
+                )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except HermesInvocationError as exc:
             append_message(
                 settings,
@@ -335,11 +573,12 @@ async def _run_chat_turn(
                 settings,
                 external_session_id=external_session_id,
                 user_id=user_id,
+                hermes_session_id=result.session_id or conversation["hermes_session_id"],
                 status="open",
                 last_error=None,
             ) or conversation
 
-        assistant = append_message(
+        append_message(
             settings,
             external_session_id=external_session_id,
             user_id=user_id,
@@ -350,17 +589,16 @@ async def _run_chat_turn(
             model=effective_model,
             provider=effective_provider,
         )
+        clear_pending_attachments(run_key, images=turn_images, files=turn_files)
 
-        return {
+        response = {
             "session_id": external_session_id,
             "hermes_session_id": conversation["hermes_session_id"] or result.session_id,
             "user_id": user_id,
             "hermes_profile": conversation["hermes_profile"],
             "answer": result.answer,
-            "assistant_message": assistant,
-            "conversation": _conversation_payload(conversation),
-            "usage": result.usage,
         }
+        return response
 
 
 @asynccontextmanager
@@ -577,46 +815,11 @@ def session_search(
 
 
 @app.get("/v1/sessions/{session_id}/messages")
-def session_messages(request: Request, session_id: str, user_id: str | None = None):
-    settings = _settings(request)
-    _require_gateway_key(request, settings)
-    resolved_user_id = _resolve_user_id(user_id)
-    conversation = get_conversation(settings, resolved_user_id, _validate_session_id(session_id))
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return {
-        "conversation": _conversation_payload(conversation),
-        "messages": [
-            _message_payload(row)
-            for row in list_messages(settings, resolved_user_id, conversation["external_session_id"])
-        ],
-    }
-
-
-@app.post("/v1/chat")
-async def chat(request: Request, body: ChatRequest):
-    settings = _settings(request)
-    _require_gateway_key(request, settings)
-    return await _run_chat_turn(settings, user_id=body.user_id, session_id=body.session_id, request=body)
-
-
-@app.post("/v1/chat/{session_id}")
-async def session_chat(request: Request, session_id: str, body: ChatRequest):
-    settings = _settings(request)
-    _require_gateway_key(request, settings)
-    validated = _validate_session_id(session_id)
-    if body.session_id and body.session_id != validated:
-        raise HTTPException(status_code=400, detail="body.session_id does not match path session_id")
-    body = body.model_copy(update={"session_id": validated})
-    return await _run_chat_turn(settings, user_id=body.user_id, session_id=validated, request=body)
-
-
-@app.get("/v1/sessions/{session_id}/search")
-def session_search_within(
+def session_messages(
     request: Request,
     session_id: str,
-    q: str,
     user_id: str | None = None,
+    q: str | None = None,
     limit: int = 20,
 ):
     settings = _settings(request)
@@ -626,16 +829,33 @@ def session_search_within(
     conversation = get_conversation(settings, resolved_user_id, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    if q:
+        messages = [
+            _search_message_payload(row)
+            for row in search_messages(
+                settings,
+                user_id=resolved_user_id,
+                query=q,
+                external_session_id=conversation_id,
+                limit=limit,
+            )
+        ]
+    else:
+        messages = [
+            _message_payload(row)
+            for row in list_messages(settings, resolved_user_id, conversation["external_session_id"])
+        ]
     return {
         "conversation": _conversation_payload(conversation),
-        "results": search_messages(
-            settings,
-            user_id=resolved_user_id,
-            query=q,
-            external_session_id=conversation_id,
-            limit=limit,
-        ),
+        "messages": messages,
     }
+
+
+@app.post("/v1/chat")
+async def chat(request: Request, body: ChatRequest):
+    settings = _settings(request)
+    _require_gateway_key(request, settings)
+    return await _run_chat_turn(settings, user_id=body.user_id, session_id=body.session_id, request=body)
 
 
 def main() -> None:

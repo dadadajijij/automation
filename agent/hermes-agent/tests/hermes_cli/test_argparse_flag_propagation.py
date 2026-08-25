@@ -238,6 +238,39 @@ class TestChatSubparserInheritedValueFlags:
         assert args.model == "anthropic/claude-sonnet-4"
         assert args.provider == "openrouter"
 
+    def test_attachment_root_survives_before_chat(self, real_parser):
+        args, _ = real_parser.parse_known_args([
+            "--attachment-root",
+            "/tmp/hermes/demo-session",
+            "chat",
+        ])
+
+        assert args.attachment_root == "/tmp/hermes/demo-session"
+
+    def test_attachment_root_after_chat(self, real_parser):
+        args, _ = real_parser.parse_known_args([
+            "chat",
+            "--attachment-root",
+            "/tmp/hermes/demo-session",
+        ])
+
+        assert args.attachment_root == "/tmp/hermes/demo-session"
+
+    def test_usage_file_before_or_after_chat(self, real_parser):
+        before, _ = real_parser.parse_known_args([
+            "--usage-file", "/tmp/hermes-usage.json",
+            "chat",
+            "-q", "hello",
+        ])
+        after, _ = real_parser.parse_known_args([
+            "chat",
+            "-q", "hello",
+            "--usage-file", "/tmp/hermes-usage.json",
+        ])
+
+        assert before.usage_file == "/tmp/hermes-usage.json"
+        assert after.usage_file == "/tmp/hermes-usage.json"
+
 
     def test_chat_subparser_inherited_value_flags_use_suppress(self):
         """Contract test for the underlying invariant.
