@@ -215,6 +215,40 @@ def wrap_runtime_tool_base_expr(path_expr: str) -> str:
     return f'(Reflect.get(window, "withToolBase")?.({path_expr}) ?? {path_expr})'
 
 
+_INLINE_HTML_API_FETCH_PATH_PATTERN = re.compile(
+    r"(?P<header>"
+    r"(?:async\s+)?function\s+api\s*\(\s*"
+    r"(?P<path>[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\s*,\s*"
+    r"(?P<options>[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\s*\)\s*\{\s*"
+    r"const\s+res\s*=\s*await\s+fetch\s*\(\s*)"
+    r"(?P=path)"
+    r"(?P<rest>\s*,\s*(?P=options)\s*\)\s*;)"
+)
+
+
+def rewrite_inline_html_api_fetch_path(text: str) -> str:
+    """Fix the narrow single-file HTML pattern where ``api(path)`` is a local
+    wrapper around ``fetch(path, ...)``.
+
+    The existing generic logic rewrites direct ``fetch('/api/...')`` calls, but
+    cannot see root-relative URLs passed through a local request-wrapper
+    function.  This intentionally only rewrites the wrapper body's fetch call;
+    it does not scan every string in inline scripts and does not touch HTML
+    attributes or external files.
+    """
+
+    def replace_fetch_path(match: re.Match[str]) -> str:
+        return (
+            match.group("header")
+            + wrap_runtime_tool_base_expr(match.group("path"))
+            + match.group("rest")
+        )
+
+    return _INLINE_HTML_API_FETCH_PATH_PATTERN.sub(replace_fetch_path, text)
+
+
 def _safe_api_base_assignment_pattern(var_name: str) -> re.Pattern[str]:
     return re.compile(
         rf'((?:const|let|var)\s+{re.escape(var_name)}\s*=\s*)(?P<value>""|\'\'|window\.location\.origin|location\.origin)(\s*;)',
@@ -609,6 +643,7 @@ def rewrite_frontend_subpath_urls(
     if file_path.suffix in {".html", ".js", ".mjs", ".ts", ".tsx", ".jsx"}:
         rewritten = _rewrite_client_request_text(rewritten)
         if file_path.suffix == ".html":
+            rewritten = rewrite_inline_html_api_fetch_path(rewritten)
             rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
             html_attr_pattern = re.compile(r'(?P<attr>src|href|action)=["\'](?P<url>/(?!/)[^"\']*)["\']')
 

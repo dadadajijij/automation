@@ -48,5 +48,9 @@
   },
   "shangshutai": {
     "port": "8011:3000"
+  },
+  "momo-argus-cdn-push": {
+    "port": "8012:8787",
+    "env_file": "/home/devops/ka/data/momo-argus-cdn-push/env"
   }
 }
