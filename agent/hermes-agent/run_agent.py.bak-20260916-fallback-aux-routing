@@ -1338,7 +1338,7 @@ class AIAgent:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, Any]:
+    def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             "model": getattr(self, "model", "") or "",
@@ -1347,8 +1347,6 @@ class AIAgent:
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
-            "auxiliary_routes": dict(getattr(self, "_active_auxiliary_routes", {}) or {}),
-            "gateway_audit_events": getattr(self, "_gateway_audit_events", None),
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -7183,9 +7181,6 @@ class AIAgent:
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
         """
-        override = getattr(self, "_active_model_supports_vision", None)
-        if isinstance(override, bool):
-            return override
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _lookup_supports_vision
@@ -7288,21 +7283,7 @@ class AIAgent:
         # native Anthropic ``{"type": "image", "source": ...}`` blocks. When
         # the active model supports vision we let the adapter do its job and
         # skip this legacy text-fallback preprocessor entirely.
-        supports_vision = self._model_supports_vision()
-        try:
-            from agent.gateway_audit import record as record_gateway_audit
-
-            record_gateway_audit(
-                self,
-                "image_input",
-                task="image",
-                provider=getattr(self, "provider", None),
-                model=getattr(self, "model", None),
-                input_mode="native" if supports_vision else "text",
-            )
-        except Exception:
-            pass
-        if supports_vision:
+        if self._model_supports_vision():
             return api_messages
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
@@ -7332,21 +7313,7 @@ class AIAgent:
         ):
             return api_messages
 
-        supports_vision = self._model_supports_vision()
-        try:
-            from agent.gateway_audit import record as record_gateway_audit
-
-            record_gateway_audit(
-                self,
-                "image_input",
-                task="image",
-                provider=getattr(self, "provider", None),
-                model=getattr(self, "model", None),
-                input_mode="native" if supports_vision else "text",
-            )
-        except Exception:
-            pass
-        if supports_vision:
+        if self._model_supports_vision():
             return api_messages
 
         transformed = copy.deepcopy(api_messages)

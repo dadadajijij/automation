@@ -2659,43 +2659,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
-        routes = fb.get("auxiliary_routes")
-        agent._active_auxiliary_routes = dict(routes) if isinstance(routes, dict) else {}
-        raw_vision_capability = fb.get("supports_vision")
-        agent._active_model_supports_vision = (
-            raw_vision_capability if isinstance(raw_vision_capability, bool) else None
-        )
-        try:
-            from agent.gateway_audit import record as record_gateway_audit
-
-            record_gateway_audit(
-                agent,
-                "main_fallback",
-                task="main",
-                provider=fb_provider,
-                model=fb_model,
-                from_provider=old_provider,
-                from_model=old_model,
-            )
-        except Exception:
-            logger.debug("Fallback gateway audit update failed", exc_info=True)
-        try:
-            from agent.auxiliary_client import set_runtime_main
-
-            set_runtime_main(
-                agent.provider,
-                agent.model,
-                requested_provider=agent.requested_provider,
-                base_url=agent.base_url,
-                api_key=agent.api_key,
-                api_mode=agent.api_mode,
-                auth_mode=getattr(agent, "auth_mode", "") or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                auxiliary_routes=agent._active_auxiliary_routes,
-                gateway_audit_events=getattr(agent, "_gateway_audit_events", None),
-            )
-        except Exception:
-            logger.debug("Fallback auxiliary route update failed", exc_info=True)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2866,9 +2829,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"→ {fb_model} via {fb_provider}"
         )
         logger.info(
-            "Fallback activated: %s → %s (%s), auxiliary routes=%s",
+            "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
-            ",".join(sorted(agent._active_auxiliary_routes)) or "none",
         )
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would

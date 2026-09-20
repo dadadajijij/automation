@@ -1348,7 +1348,6 @@ class AIAgent:
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
             "auxiliary_routes": dict(getattr(self, "_active_auxiliary_routes", {}) or {}),
-            "gateway_audit_events": getattr(self, "_gateway_audit_events", None),
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -7288,21 +7287,7 @@ class AIAgent:
         # native Anthropic ``{"type": "image", "source": ...}`` blocks. When
         # the active model supports vision we let the adapter do its job and
         # skip this legacy text-fallback preprocessor entirely.
-        supports_vision = self._model_supports_vision()
-        try:
-            from agent.gateway_audit import record as record_gateway_audit
-
-            record_gateway_audit(
-                self,
-                "image_input",
-                task="image",
-                provider=getattr(self, "provider", None),
-                model=getattr(self, "model", None),
-                input_mode="native" if supports_vision else "text",
-            )
-        except Exception:
-            pass
-        if supports_vision:
+        if self._model_supports_vision():
             return api_messages
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
@@ -7332,21 +7317,7 @@ class AIAgent:
         ):
             return api_messages
 
-        supports_vision = self._model_supports_vision()
-        try:
-            from agent.gateway_audit import record as record_gateway_audit
-
-            record_gateway_audit(
-                self,
-                "image_input",
-                task="image",
-                provider=getattr(self, "provider", None),
-                model=getattr(self, "model", None),
-                input_mode="native" if supports_vision else "text",
-            )
-        except Exception:
-            pass
-        if supports_vision:
+        if self._model_supports_vision():
             return api_messages
 
         transformed = copy.deepcopy(api_messages)

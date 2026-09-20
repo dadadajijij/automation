@@ -2666,20 +2666,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             raw_vision_capability if isinstance(raw_vision_capability, bool) else None
         )
         try:
-            from agent.gateway_audit import record as record_gateway_audit
-
-            record_gateway_audit(
-                agent,
-                "main_fallback",
-                task="main",
-                provider=fb_provider,
-                model=fb_model,
-                from_provider=old_provider,
-                from_model=old_model,
-            )
-        except Exception:
-            logger.debug("Fallback gateway audit update failed", exc_info=True)
-        try:
             from agent.auxiliary_client import set_runtime_main
 
             set_runtime_main(
@@ -2692,7 +2678,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 auth_mode=getattr(agent, "auth_mode", "") or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 auxiliary_routes=agent._active_auxiliary_routes,
-                gateway_audit_events=getattr(agent, "_gateway_audit_events", None),
             )
         except Exception:
             logger.debug("Fallback auxiliary route update failed", exc_info=True)

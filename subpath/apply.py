@@ -32,12 +32,35 @@ def default_strategy_from_plan(plan: SubpathPlan) -> Dict[str, str]:
     }
 
 
+def plan_from_strategy(repo_dir: Path, strategy: Optional[Dict[str, str]]) -> SubpathPlan:
+    strategy = strategy or {}
+    framework = str(strategy.get("framework") or "generic")
+    proxy_mode = str(strategy.get("proxy_mode") or "strip_prefix")
+    adapter = str(strategy.get("adapter") or "static_rewrite")
+    source_adapter = str(strategy.get("source_adapter") or adapter or "static_rewrite")
+    project = FrontendProjectStrategy(
+        project_id="root",
+        framework=framework,
+        proxy_mode=proxy_mode,
+        adapter=adapter,
+        source_adapter=source_adapter,
+        project_root=Path(repo_dir),
+        source_roots=(),
+        runtime_roots=(),
+        config_files=(),
+        capabilities=(),
+        evidence=("legacy_strategy",),
+    )
+    return SubpathPlan(projects=(project,), default_project="root")
+
+
 def auto_fix_findings(
     repo_dir: Path,
     project_slug: str,
     findings: List[Dict[str, object]],
-    plan: SubpathPlan,
+    plan: Optional[SubpathPlan] = None,
     *,
+    strategy: Optional[Dict[str, str]] = None,
     auto_fix_nextjs_subpath_issues_fn: Callable[[Path, str], List[str]],
     find_subpath_audit_targets: Callable[[Path, SubpathPlan], List[Path]],
     rewrite_frontend_subpath_urls: Callable[[Path, str, Path], bool],
@@ -50,9 +73,16 @@ def auto_fix_findings(
     rewrite_frontend_navigation_urls: Optional[Callable[[Path, str, Path], bool]] = None,
     rewrite_frontend_eventsource_urls: Optional[Callable[[Path, str, Path], bool]] = None,
     rewrite_frontend_return_value_urls: Optional[Callable[[Path, str, Path], bool]] = None,
+    find_python_embedded_html_files: Optional[Callable[[Path], List[Path]]] = None,
+    rewrite_python_embedded_html_subpath_urls: Optional[Callable[[Path, str, Path], bool]] = None,
     sorted_unique: Callable[[List[str]], List[str]],
 ) -> Dict[str, object]:
-    strategy = default_strategy_from_plan(plan)
+    if plan is None:
+        plan = plan_from_strategy(repo_dir, strategy)
+    plan_strategy = default_strategy_from_plan(plan)
+    if strategy is not None:
+        plan_strategy.update({key: value for key, value in strategy.items() if value is not None})
+    strategy = plan_strategy
     grouped = group_subpath_findings_by_code(findings)
     changed: List[str] = []
     applied_codes: List[str] = []
@@ -76,6 +106,10 @@ def auto_fix_findings(
         "build_output_html_root_relative_url",
         "build_output_client_root_relative_url",
         "build_output_manifest_root_relative_url",
+    }
+    python_embedded_codes = {
+        "python_embedded_root_relative_html_url",
+        "python_embedded_root_relative_client_url",
     }
     if framework == "nextjs" and (not project_capabilities or "client_code" in project_capabilities) and any(code in grouped for code in ("nextjs_raw_anchor_root_href", "nextjs_form_root_action", "root_relative_client_url")):
         changed.extend(auto_fix_nextjs_subpath_issues_fn(repo_dir, project_slug))
@@ -161,6 +195,38 @@ def auto_fix_findings(
                         unchanged_reason_overrides[code] = "file_type_not_supported"
                     elif targeted_files:
                         unchanged_reason_overrides[code] = "rewriter_made_no_changes"
+    if adapter in generic_rewrite_adapters and python_embedded_codes.intersection(grouped):
+        base_path = build_deployment_base_path(project_slug)
+        embedded_targets = {
+            path.relative_to(repo_dir).as_posix(): path
+            for path in (find_python_embedded_html_files(repo_dir) if find_python_embedded_html_files is not None else [])
+        }
+        for code in sorted(python_embedded_codes.intersection(grouped)):
+            touched_for_code: List[str] = []
+            relevant_files = sorted(
+                {
+                    str(item.get("file", "")).strip()
+                    for item in grouped.get(code, [])
+                    if isinstance(item, dict) and str(item.get("file", "")).strip()
+                }
+            )
+            for file_name in relevant_files:
+                file_path = embedded_targets.get(file_name)
+                if file_path is None or rewrite_python_embedded_html_subpath_urls is None:
+                    continue
+                if rewrite_python_embedded_html_subpath_urls(file_path, base_path, repo_dir):
+                    changed.append(file_name)
+                    touched_for_code.append(file_name)
+            if touched_for_code:
+                applied_codes.append(code)
+                applied_codes_by_reason.setdefault("python_embedded_html_rewrite", []).append(code)
+                for file_name in touched_for_code:
+                    applied_codes_by_file.setdefault(file_name, []).append(code)
+            elif relevant_files:
+                unchanged_reason_overrides.setdefault(
+                    code,
+                    "target_not_discovered" if not any(file_name in embedded_targets for file_name in relevant_files) else "rewriter_made_no_changes",
+                )
     applied_codes = sorted({code for code in applied_codes if code})
     unchanged_codes = sorted(code for code in grouped if code not in applied_codes)
     unchanged_codes_by_reason: Dict[str, List[str]] = {}
@@ -181,6 +247,8 @@ def auto_fix_findings(
             known_codes = set()
         if code in build_output_codes:
             reason = "build_output_only"
+        elif code in python_embedded_codes and adapter in generic_rewrite_adapters:
+            reason = unchanged_reason_overrides.get(code, "no_target_files_changed")
         elif any(code in codes and framework != owner for owner, codes in framework_specific_codes.items()):
             reason = "framework_specific_only"
         elif code not in known_codes:
@@ -242,6 +310,8 @@ def apply_subpath_rewrites(
     ensure_cra_homepage_fn: Callable[[Path, str], List[str]],
     find_frontend_rewrite_targets: Callable[[Path], List[Path]],
     rewrite_frontend_subpath_urls: Callable[[Path, str, Path], bool],
+    find_python_embedded_html_files: Optional[Callable[[Path], List[Path]]] = None,
+    rewrite_python_embedded_html_subpath_urls: Optional[Callable[[Path, str, Path], bool]] = None,
 ) -> List[str]:
     if not isinstance(project_slug, str) or not project_slug.strip():
         return []
@@ -265,4 +335,8 @@ def apply_subpath_rewrites(
     for file_path in find_frontend_rewrite_targets(repo_dir):
         if rewrite_frontend_subpath_urls(file_path, base_path, repo_dir):
             changed.append(file_path.relative_to(repo_dir).as_posix())
+    if find_python_embedded_html_files is not None and rewrite_python_embedded_html_subpath_urls is not None:
+        for file_path in find_python_embedded_html_files(repo_dir):
+            if rewrite_python_embedded_html_subpath_urls(file_path, base_path, repo_dir):
+                changed.append(file_path.relative_to(repo_dir).as_posix())
     return sorted({item for item in changed if item})

@@ -382,6 +382,29 @@ def rewrite_nextjs_form_actions(text: str) -> str:
     )
 
 
+def rewrite_nextjs_metadata_icon_urls(text: str, base_path: str) -> str:
+    """Make Next Metadata icon URLs independent of build-time public env values."""
+    def prefix_asset(asset_path: str) -> str:
+        if asset_path == base_path or asset_path.startswith(f"{base_path}/"):
+            return asset_path
+        return f"{base_path}{asset_path}"
+
+    direct_icon_pattern = re.compile(
+        r'(?P<property>\b(?:icon|shortcut|apple)\s*:\s*)(?P<quote>["\'])(?P<asset>/(?!/)[^"\']*)(?P=quote)'
+    )
+    rewritten = direct_icon_pattern.sub(
+        lambda match: f'{match.group("property")}"{prefix_asset(match.group("asset"))}"',
+        text,
+    )
+    dynamic_icon_pattern = re.compile(
+        r'(?P<property>\b(?:icon|shortcut|apple)\s*:\s*)`\$\{[^`{}]*\}/(?P<asset>[^`]+)`'
+    )
+    return dynamic_icon_pattern.sub(
+        lambda match: f'{match.group("property")}"{base_path}/{match.group("asset")}"',
+        rewritten,
+    )
+
+
 def ensure_nextjs_helper_module(
     entry_path: Path,
     repo_dir: Path,
@@ -454,7 +477,10 @@ def auto_fix_nextjs_subpath_issues(
     helper_path = repo_dir / f"{NEXTJS_RUNTIME_SHIM_BASENAME}.ts"
     for file_path in collect_matching_files(repo_dir, source_patterns):
         original = read_text(file_path)
-        rewritten = original
+        rewritten = rewrite_nextjs_metadata_icon_urls(
+            original,
+            build_deployment_base_path(project_slug),
+        )
         if re.search(r'<a\b[^>]*\bhref\s*=\s*(["\'])/[^"\']*\1', rewritten):
             rewritten = ensure_next_link_import(rewritten)
             rewritten = rewrite_nextjs_jsx_anchor_hrefs(rewritten)

@@ -507,6 +507,8 @@ def run_static_subpath_audit(
     detect_frontend_runtime_roots: Callable[[Path], List[Path]],
     vite_project_roots: Callable[[Path], List[Path]],
     read_text: Callable[[Path], str],
+    find_python_embedded_html_files: Optional[Callable[[Path], List[Path]]] = None,
+    scan_python_embedded_html_findings: Optional[Callable[[Path, str], List[SubpathAuditFinding]]] = None,
 ) -> Dict[str, object]:
     base_path = build_deployment_base_path(project_slug)
     targets = find_subpath_audit_targets(
@@ -544,10 +546,16 @@ def run_static_subpath_audit(
                 vite_project_roots=vite_project_roots,
             )
         )
+    embedded_targets: List[Path] = []
+    if find_python_embedded_html_files is not None:
+        embedded_targets = find_python_embedded_html_files(repo_dir)
+    if scan_python_embedded_html_findings is not None:
+        findings.extend(scan_python_embedded_html_findings(repo_dir, project_slug))
+    scanned_paths = _sorted_unique_paths([*targets, *embedded_targets])
     return {
         "framework": default_project.framework if default_project is not None else None,
         "proxy_mode": default_project.proxy_mode if default_project is not None else None,
-        "scanned_files": [path.relative_to(repo_dir).as_posix() for path in targets],
+        "scanned_files": [path.relative_to(repo_dir).as_posix() for path in scanned_paths],
         "findings": [
             {
                 "file": item.file,

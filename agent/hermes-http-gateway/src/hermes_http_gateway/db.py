@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -80,6 +81,39 @@ def init_db(settings: Settings) -> None:
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
                   ON messages(external_session_id, created_at);
 
+                CREATE TABLE IF NOT EXISTS request_events (
+                  id TEXT PRIMARY KEY,
+                  external_session_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  prompt TEXT NOT NULL,
+                  status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'superseded')),
+                  http_status INTEGER,
+                  error_detail TEXT,
+                  model TEXT,
+                  provider TEXT,
+                  request_body TEXT,
+                  runtime_audit TEXT,
+                  created_at TEXT NOT NULL,
+                  completed_at TEXT,
+                  FOREIGN KEY (external_session_id) REFERENCES conversations(external_session_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_request_events_conversation_created
+                  ON request_events(external_session_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS request_stage_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  request_event_id TEXT NOT NULL,
+                  stage TEXT NOT NULL,
+                  duration_ms REAL NOT NULL,
+                  detail TEXT,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (request_event_id) REFERENCES request_events(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_request_stage_events_request_created
+                  ON request_stage_events(request_event_id, created_at, id);
+
                 CREATE VIRTUAL TABLE IF NOT EXISTS session_search USING fts5(
                   user_id UNINDEXED,
                   external_session_id UNINDEXED,
@@ -104,6 +138,13 @@ def init_db(settings: Settings) -> None:
                   ON admin_sessions(expires_at);
                 """
             )
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(request_events)").fetchall()
+            }
+            if "request_body" not in columns:
+                conn.execute("ALTER TABLE request_events ADD COLUMN request_body TEXT")
+            if "runtime_audit" not in columns:
+                conn.execute("ALTER TABLE request_events ADD COLUMN runtime_audit TEXT")
         _initialized = True
 
 
@@ -242,6 +283,12 @@ def count_messages(settings: Settings) -> int:
         return int((row["count"] if row else 0) or 0)
 
 
+def count_request_events(settings: Settings) -> int:
+    with _connect(settings.database_url) as conn:
+        row = conn.execute("SELECT COUNT(*) AS count FROM request_events").fetchone()
+        return int((row["count"] if row else 0) or 0)
+
+
 def list_users(
     settings: Settings,
     limit: int = 100,
@@ -328,7 +375,12 @@ def get_conversation_by_session(settings: Settings, external_session_id: str) ->
         row = conn.execute(
             """
             SELECT external_session_id, user_id, hermes_session_id, hermes_profile,
-                   title, status, last_error, created_at, updated_at
+                   title, status, last_error, created_at, updated_at,
+                   (
+                     SELECT COUNT(*)
+                     FROM messages m
+                     WHERE m.external_session_id = conversations.external_session_id
+                   ) AS message_count
             FROM conversations
             WHERE external_session_id = ?
             """,
@@ -349,6 +401,172 @@ def list_messages_by_session(settings: Settings, external_session_id: str) -> li
             (external_session_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def create_request_event(
+    settings: Settings,
+    *,
+    external_session_id: str,
+    user_id: str,
+    prompt: str,
+    model: str | None = None,
+    provider: str | None = None,
+    request_body: str | None = None,
+) -> dict[str, Any]:
+    event = {
+        "id": str(uuid.uuid4()),
+        "external_session_id": external_session_id,
+        "user_id": user_id,
+        "prompt": prompt,
+        "status": "running",
+        "http_status": None,
+        "error_detail": None,
+        "model": model,
+        "provider": provider,
+        "request_body": request_body,
+        "created_at": now_iso(),
+        "completed_at": None,
+    }
+    with _connect(settings.database_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO request_events (
+              id, external_session_id, user_id, prompt, status, http_status,
+              error_detail, model, provider, request_body, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["id"],
+                event["external_session_id"],
+                event["user_id"],
+                event["prompt"],
+                event["status"],
+                event["http_status"],
+                event["error_detail"],
+                event["model"],
+                event["provider"],
+                event["request_body"],
+                event["created_at"],
+                event["completed_at"],
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE conversations SET updated_at = ?
+            WHERE external_session_id = ? AND user_id = ?
+            """,
+            (event["created_at"], external_session_id, user_id),
+        )
+    return event
+
+
+def finish_request_event(
+    settings: Settings,
+    *,
+    event_id: str,
+    status: str,
+    http_status: int | None = None,
+    error_detail: str | None = None,
+    runtime_audit: dict[str, Any] | None = None,
+) -> None:
+    if status not in {"completed", "failed", "superseded"}:
+        raise ValueError(f"invalid request event status: {status}")
+    completed_at = now_iso()
+    with _connect(settings.database_url) as conn:
+        conn.execute(
+            """
+            UPDATE request_events
+            SET status = ?, http_status = ?, error_detail = ?, runtime_audit = ?, completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                http_status,
+                error_detail,
+                json.dumps(runtime_audit, ensure_ascii=True) if runtime_audit else None,
+                completed_at,
+                event_id,
+            ),
+        )
+
+
+def record_request_stage(
+    settings: Settings,
+    *,
+    request_event_id: str,
+    stage: str,
+    duration_ms: float,
+    detail: str | None = None,
+) -> dict[str, Any]:
+    event = {
+        "request_event_id": request_event_id,
+        "stage": stage,
+        "duration_ms": round(max(0.0, duration_ms), 1),
+        "detail": detail,
+        "created_at": now_iso(),
+    }
+    with _connect(settings.database_url) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO request_stage_events (
+              request_event_id, stage, duration_ms, detail, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event["request_event_id"],
+                event["stage"],
+                event["duration_ms"],
+                event["detail"],
+                event["created_at"],
+            ),
+        )
+    event["id"] = int(cursor.lastrowid)
+    return event
+
+
+def list_request_stages_by_session(
+    settings: Settings, external_session_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    with _connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT s.id, s.request_event_id, s.stage, s.duration_ms, s.detail, s.created_at
+            FROM request_stage_events s
+            JOIN request_events r ON r.id = s.request_event_id
+            WHERE r.external_session_id = ?
+            ORDER BY s.created_at ASC, s.id ASC
+            """,
+            (external_session_id,),
+        ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        grouped.setdefault(item["request_event_id"], []).append(item)
+    return grouped
+
+
+def list_request_events_by_session(
+    settings: Settings, external_session_id: str
+) -> list[dict[str, Any]]:
+    with _connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, external_session_id, user_id, prompt, status, http_status,
+                   error_detail, model, provider, request_body, runtime_audit, created_at, completed_at
+            FROM request_events
+            WHERE external_session_id = ?
+            ORDER BY created_at ASC
+            """,
+            (external_session_id,),
+        ).fetchall()
+        events = [dict(row) for row in rows]
+    for event in events:
+        raw_audit = event.get("runtime_audit")
+        try:
+            event["runtime_audit"] = json.loads(raw_audit) if raw_audit else None
+        except (TypeError, json.JSONDecodeError):
+            event["runtime_audit"] = None
+    return events
 
 
 def search_messages_admin(

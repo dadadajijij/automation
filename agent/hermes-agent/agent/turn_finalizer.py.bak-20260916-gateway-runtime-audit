@@ -29,7 +29,6 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
-from agent.gateway_audit import build as build_gateway_audit
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -726,7 +725,6 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
-        "gateway_audit": build_gateway_audit(agent),
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

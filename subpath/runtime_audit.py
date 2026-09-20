@@ -1,6 +1,8 @@
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .common import build_deployment_base_path, is_allowed_root_relative_url
+from .models import SUBPATH_CLIENT_METHOD_PATTERNS
 from .runtime_urls import extract_html_urls, normalize_runtime_url_path, translate_external_to_upstream_path, translate_upstream_to_external_path
 
 
@@ -30,6 +32,44 @@ def runtime_subpath_findings_for_html(
                 "message": f'Runtime HTML emits root-relative `{ref.attr}="{ref.url}"` outside deployment subpath `{base_path}`',
             }
         )
+    return findings
+
+
+def runtime_subpath_findings_for_inline_scripts(
+    html: str,
+    current_path: str,
+    base_path: str,
+) -> List[Dict[str, object]]:
+    findings: List[Dict[str, object]] = []
+    detail_kinds = (
+        "request_api",
+        "request_api",
+        "eventsource",
+        "request_api",
+        "request_api",
+        "navigation",
+        "navigation",
+        "navigation",
+    )
+    for script_match in re.finditer(r"<script\b(?![^>]*\bsrc=)[^>]*>(?P<body>.*?)</script>", html, flags=re.IGNORECASE | re.DOTALL):
+        body = script_match.group("body")
+        body_start = script_match.start("body")
+        for pattern, detail_kind in zip(SUBPATH_CLIENT_METHOD_PATTERNS, detail_kinds):
+            for match in pattern.finditer(body):
+                url = f"/{match.group('path')}"
+                if is_allowed_root_relative_url(url, base_path):
+                    continue
+                line = html.count("\n", 0, body_start + match.start()) + 1
+                findings.append(
+                    {
+                        "path": current_path,
+                        "line": line,
+                        "tag": "script",
+                        "attr": detail_kind,
+                        "url": url,
+                        "message": f'Runtime inline script emits root-relative browser URL `{url}` outside deployment subpath `{base_path}`',
+                    }
+                )
     return findings
 
 
@@ -127,6 +167,7 @@ def run_runtime_subpath_audit(
         }
 
     findings.extend(runtime_subpath_findings_for_html(html, external_final_path, base_path, base_origin=base_origin))
+    findings.extend(runtime_subpath_findings_for_inline_scripts(html, external_final_path, base_path))
     current_entry_path = external_final_path if proxy_mode == "strip_prefix" else base_path
     for candidate in collect_runtime_follow_links(html, current_entry_path, base_path, base_origin=base_origin):
         upstream_candidate = translate_external_to_upstream_path(candidate, base_path, proxy_mode)
@@ -149,6 +190,7 @@ def run_runtime_subpath_audit(
         if "html" not in child_content_type and "<html" not in child_html.lower():
             continue
         findings.extend(runtime_subpath_findings_for_html(child_html, external_child_final_path, base_path, base_origin=base_origin))
+        findings.extend(runtime_subpath_findings_for_inline_scripts(child_html, external_child_final_path, base_path))
 
     return {
         "checked_paths": sorted_unique(checked_paths),

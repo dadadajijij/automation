@@ -3449,8 +3449,6 @@ def set_runtime_main(
     auth_mode: str = "",
     session_id: str = "",
     cache_scope: str = "",
-    auxiliary_routes: Optional[Dict[str, Dict[str, Any]]] = None,
-    gateway_audit_events: Optional[List[Dict[str, Any]]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3479,8 +3477,6 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
-        "auxiliary_routes": _normalize_auxiliary_routes(auxiliary_routes),
-        "gateway_audit_events": gateway_audit_events if isinstance(gateway_audit_events, list) else None,
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -3954,22 +3950,7 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
-    "requested_provider",
-    "auxiliary_routes",
-    "gateway_audit_events",
-)
-
-
-def _normalize_auxiliary_routes(raw: Any) -> Dict[str, Dict[str, Any]]:
-    if not isinstance(raw, dict):
-        return {}
-    routes: Dict[str, Dict[str, Any]] = {}
-    for task, value in raw.items():
-        if not isinstance(task, str) or not task.strip() or not isinstance(value, dict):
-            continue
-        routes[task.strip()] = dict(value)
-    return routes
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3998,14 +3979,8 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
             continue
-        if field == "gateway_audit_events" and isinstance(value, list):
-            normalized[field] = value
-            continue
         if isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
-    routes = _normalize_auxiliary_routes(main_runtime.get("auxiliary_routes"))
-    if routes:
-        normalized["auxiliary_routes"] = routes
     for identity_field in ("provider", "requested_provider"):
         identity = normalized.get(identity_field)
         if isinstance(identity, str):
@@ -7075,9 +7050,7 @@ def get_text_auxiliary_client(
     Callers may override the returned model via config.yaml
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
-        task or None, main_runtime=main_runtime
-    )
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider,
         model=model,
@@ -7095,9 +7068,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
-        task or None, main_runtime=main_runtime
-    )
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider,
         model=model,
@@ -7239,7 +7210,7 @@ def resolve_vision_provider_client(
     """
     runtime = _normalize_main_runtime(main_runtime)
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key, main_runtime=runtime
+        "vision", provider, model, base_url, api_key
     )
     requested = _normalize_vision_provider(requested)
 
@@ -8002,7 +7973,6 @@ def _resolve_task_provider_model(
     model: str = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -8037,21 +8007,6 @@ def _resolve_task_provider_model(
             if cfg_key_env:
                 cfg_api_key = _scoped_key_env(cfg_key_env) or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
-
-        runtime_routes = _normalize_main_runtime(main_runtime).get("auxiliary_routes", {})
-        route_config = runtime_routes.get(task) if isinstance(runtime_routes, dict) else None
-        if isinstance(route_config, dict):
-            cfg_provider = str(route_config.get("provider", "")).strip() or cfg_provider
-            cfg_model = str(route_config.get("model", "")).strip() or cfg_model
-            cfg_base_url = str(route_config.get("base_url", "")).strip() or cfg_base_url
-            cfg_api_key = str(route_config.get("api_key", "")).strip() or cfg_api_key
-            if not cfg_api_key:
-                route_key_env = str(
-                    route_config.get("key_env") or route_config.get("api_key_env") or ""
-                ).strip()
-                if route_key_env:
-                    cfg_api_key = _scoped_key_env(route_key_env) or None
-            cfg_api_mode = str(route_config.get("api_mode", "")).strip() or cfg_api_mode
 
     # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not
     # a literal model id. Without this, a config of `auxiliary.<task>.model: auto`
@@ -9384,7 +9339,7 @@ def _call_llm_impl(
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key, main_runtime=main_runtime)
+        task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -9480,17 +9435,6 @@ def _call_llm_impl(
     _record_route_info(
         route_info, _fallback_provider_from_label(request_provider), final_model
     )
-    try:
-        from agent.gateway_audit import record_runtime as record_gateway_audit_runtime
-
-        record_gateway_audit_runtime(
-            main_runtime,
-            task=task,
-            provider=_fallback_provider_from_label(request_provider),
-            model=final_model,
-        )
-    except Exception:
-        logger.debug("Auxiliary gateway audit update failed", exc_info=True)
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -10220,7 +10164,7 @@ async def _async_call_llm_impl(
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key, main_runtime=main_runtime)
+        task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
@@ -10310,17 +10254,6 @@ async def _async_call_llm_impl(
     _record_route_info(
         route_info, _fallback_provider_from_label(request_provider), final_model
     )
-    try:
-        from agent.gateway_audit import record_runtime as record_gateway_audit_runtime
-
-        record_gateway_audit_runtime(
-            main_runtime,
-            task=task,
-            provider=_fallback_provider_from_label(request_provider),
-            model=final_model,
-        )
-    except Exception:
-        logger.debug("Auxiliary gateway audit update failed", exc_info=True)
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish

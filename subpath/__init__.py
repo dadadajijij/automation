@@ -45,7 +45,17 @@ from .adapters import (
 from .apply import apply_subpath_rewrites, auto_fix_findings, auto_fix_subpath_issues, group_subpath_findings_by_code
 from .common import build_deployment_base_path, is_allowed_root_relative_url, looks_like_templated_value, slugify, split_url_suffix
 from .models import HtmlUrlExtractor, HtmlUrlReference, SubpathAuditFinding, SUBPATH_ALLOWED_ROOT_COMMENT, SUBPATH_BROWSER_ATTRS, SUBPATH_CLIENT_METHOD_PATTERNS, SUBPATH_TEMPLATE_ALLOWLIST_FIELDS
-from .runtime_audit import collect_runtime_follow_links, run_runtime_subpath_audit, runtime_subpath_findings_for_html
+from .python_embedded_html import (
+    PYTHON_EMBEDDED_HTML_SOURCE,
+    PythonEmbeddedHtmlTarget,
+    collect_python_embedded_html_candidate_files,
+    find_python_embedded_html_files,
+    find_python_embedded_html_targets,
+    find_python_embedded_html_targets_in_file,
+    rewrite_python_embedded_html_subpath_urls,
+    scan_python_embedded_html_findings,
+)
+from .runtime_audit import collect_runtime_follow_links, run_runtime_subpath_audit, runtime_subpath_findings_for_html, runtime_subpath_findings_for_inline_scripts
 from .rewrite import (
     frontend_runtime_root,
     find_plan_rewrite_targets,
@@ -144,6 +154,12 @@ __all__ = [
     "normalize_python_hint_path",
     "nextjs_runtime_import_path",
     "prepare_subpath_sources",
+    "PYTHON_EMBEDDED_HTML_SOURCE",
+    "PythonEmbeddedHtmlTarget",
+    "collect_python_embedded_html_candidate_files",
+    "find_python_embedded_html_files",
+    "find_python_embedded_html_targets",
+    "find_python_embedded_html_targets_in_file",
     "group_subpath_findings_by_code",
     "remove_nextjs_runtime_import",
     "resolve_entrypoint_relative_dir",
@@ -160,6 +176,7 @@ __all__ = [
     "rewrite_frontend_return_value_urls",
     "rewrite_frontend_subpath_urls",
     "rewrite_html_relative_asset_urls",
+    "rewrite_python_embedded_html_subpath_urls",
     "rewrite_nextjs_fetch_calls",
     "rewrite_nextjs_jsx_anchor_hrefs",
     "rewrite_origin_based_subpath_logic",
@@ -168,12 +185,14 @@ __all__ = [
     "run_runtime_subpath_audit",
     "run_static_subpath_audit",
     "runtime_subpath_findings_for_html",
+    "runtime_subpath_findings_for_inline_scripts",
     "runtime_subpath_phase",
     "scan_subpath_findings",
     "should_prefix_root_relative_html_url",
     "should_rewrite_relative_html_asset",
     "slugify",
     "scan_build_output_findings",
+    "scan_python_embedded_html_findings",
     "split_url_suffix",
     "translate_external_to_upstream_path",
     "translate_upstream_to_external_path",

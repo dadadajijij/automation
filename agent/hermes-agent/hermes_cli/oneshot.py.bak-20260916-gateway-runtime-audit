@@ -189,7 +189,6 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             # paying for actually went out on the wire (July 2026 incident:
             # a config-matching bug silently dropped flex -> 2.3x billing).
             "service_tier": result.get("service_tier"),
-            "gateway_audit": result.get("gateway_audit"),
         }
         if failure is not None:
             report["failure"] = failure

@@ -250,7 +250,6 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 "auxiliary_routes": dict(
                     getattr(agent, "_active_auxiliary_routes", {}) or {}
                 ),
-                "gateway_audit_events": getattr(agent, "_gateway_audit_events", None),
             },
             title_callback=getattr(agent, "_on_session_title", None),
             runtime_validator=lambda: (
@@ -512,7 +511,6 @@ def build_turn_context(
             session_id=getattr(agent, "session_id", "") or "",
             cache_scope=_cache_scope,
             auxiliary_routes=getattr(agent, "_active_auxiliary_routes", None),
-            gateway_audit_events=getattr(agent, "_gateway_audit_events", None),
         )
     except Exception:
         pass

@@ -86,39 +86,6 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
-    def test_fallback_binds_auxiliary_routes_and_vision_capability(self):
-        fallback_routes = {
-            "vision": {
-                "provider": "custom",
-                "model": "fallback-vision",
-                "base_url": "https://fallback.example/v1",
-            },
-            "compression": {
-                "provider": "custom",
-                "model": "fallback-compression",
-            },
-        }
-        agent = _make_agent(fallback_model=[{
-            "provider": "custom",
-            "model": "fallback-main",
-            "supports_vision": False,
-            "auxiliary_routes": fallback_routes,
-        }])
-
-        with (
-            patch(
-                "agent.auxiliary_client.resolve_provider_client",
-                return_value=(_mock_client(), "fallback-main"),
-            ),
-            patch("agent.auxiliary_client.set_runtime_main") as set_runtime_main,
-        ):
-            assert agent._try_activate_fallback() is True
-
-        assert agent._active_auxiliary_routes == fallback_routes
-        assert agent._current_main_runtime()["auxiliary_routes"] == fallback_routes
-        assert agent._model_supports_vision() is False
-        assert set_runtime_main.call_args.kwargs["auxiliary_routes"] == fallback_routes
-
 
 
     def test_skips_unconfigured_provider_to_next(self):

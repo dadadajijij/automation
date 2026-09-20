@@ -35,8 +35,48 @@ HTML_RELATIVE_ASSET_EXTENSIONS = {
 }
 
 
+HTML_SCRIPT_STYLE_BLOCK_PATTERN = re.compile(r"(<(?:script|style)\b[^>]*>)(.*?)(</(?:script|style)>)", re.IGNORECASE | re.DOTALL)
+
+
 def _sorted_unique_paths(items: List[Path]) -> List[Path]:
     return sorted(set(items))
+
+
+def _rewrite_html_outside_script_style_blocks(text: str, rewrite_segment: Callable[[str], str]) -> str:
+    rewritten_parts: List[str] = []
+    previous_end = 0
+    for match in HTML_SCRIPT_STYLE_BLOCK_PATTERN.finditer(text):
+        rewritten_parts.append(rewrite_segment(text[previous_end : match.start()]))
+        rewritten_parts.append(rewrite_segment(match.group(1)))
+        rewritten_parts.append(match.group(2))
+        rewritten_parts.append(match.group(3))
+        previous_end = match.end()
+    rewritten_parts.append(rewrite_segment(text[previous_end:]))
+    return "".join(rewritten_parts)
+
+
+def _rewrite_root_relative_html_attrs_outside_scripts(
+    text: str,
+    *,
+    attrs: tuple[str, ...],
+    replace_url: Callable[[str, str], Optional[str]],
+) -> str:
+    attr_names = "|".join(re.escape(attr) for attr in attrs)
+    attr_pattern = re.compile(rf'(?P<attr>{attr_names})=(?P<quote>["\'])(?P<url>/(?!/)[^"\']*)(?P=quote)')
+
+    def rewrite_segment(segment: str) -> str:
+        def replace_attr(match: re.Match[str]) -> str:
+            attr = match.group("attr")
+            url = match.group("url")
+            replacement = replace_url(attr, url)
+            if replacement is None:
+                return match.group(0)
+            quote = match.group("quote")
+            return f"{attr}={quote}{replacement}{quote}"
+
+        return attr_pattern.sub(replace_attr, segment)
+
+    return _rewrite_html_outside_script_style_blocks(text, rewrite_segment)
 
 
 def _paths_under_project(paths: List[Path], project: FrontendProjectStrategy) -> List[Path]:
@@ -163,16 +203,20 @@ def rewrite_html_relative_asset_urls(
     file_path: Path,
     runtime_roots: Optional[List[Path]] = None,
 ) -> str:
-    attr_pattern = re.compile(r'(?P<prefix>\b(?:src|href)=["\'])(?P<url>[^"\']+)(?P<suffix>["\'])')
+    attr_pattern = re.compile(r'(?P<attr>\b(?:src|href))=(?P<quote>["\'])(?P<url>[^"\']+)(?P=quote)')
 
-    def replace_attr(match: re.Match[str]) -> str:
-        original_url = match.group("url")
-        rewritten_url = resolve_repo_relative_asset_url(repo_dir, file_path, original_url, runtime_roots)
-        if rewritten_url is None:
-            return match.group(0)
-        return f'{match.group("prefix")}{rewritten_url}{match.group("suffix")}'
+    def rewrite_segment(segment: str) -> str:
+        def replace_attr(match: re.Match[str]) -> str:
+            original_url = match.group("url")
+            rewritten_url = resolve_repo_relative_asset_url(repo_dir, file_path, original_url, runtime_roots)
+            if rewritten_url is None:
+                return match.group(0)
+            quote = match.group("quote")
+            return f'{match.group("attr")}={quote}{rewritten_url}{quote}'
 
-    return attr_pattern.sub(replace_attr, text)
+        return attr_pattern.sub(replace_attr, segment)
+
+    return _rewrite_html_outside_script_style_blocks(text, rewrite_segment)
 
 
 def rewrite_origin_based_subpath_logic(text: str) -> str:
@@ -344,6 +388,7 @@ def _rewrite_request_api_text(text: str) -> str:
     rewritten = re.sub(r'axios\.(get|post|put|delete|patch)\(\s*window\.withToolBase\(\s*window\.withToolBase\((.*?)\)\s*\)', r'axios.\1(window.withToolBase(\2)', rewritten)
     rewritten = re.sub(r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*\)', lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))})", rewritten)
     rewritten = re.sub(r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*,', lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))},", rewritten)
+    rewritten = re.sub(r'fetch\(\s*(["\'`]/[^"\'`]*["\'`])\s*\+', lambda match: f"fetch({wrap_runtime_tool_base_expr(match.group(1))} +", rewritten)
     rewritten = re.sub(r'axios\.(get|post|put|delete|patch)\(\s*(["\'`]/[^"\'`]*["\'`])', lambda match: f"axios.{match.group(1)}({wrap_runtime_tool_base_expr(match.group(2))}", rewritten)
     rewritten = re.sub(r'new\s+Request\(\s*(["\'`]/[^"\'`]*["\'`])\s*\)', lambda match: f"new Request({wrap_runtime_tool_base_expr(match.group(1))})", rewritten)
     rewritten = re.sub(r'new\s+Request\(\s*(["\'`]/[^"\'`]*["\'`])\s*,', lambda match: f"new Request({wrap_runtime_tool_base_expr(match.group(1))},", rewritten)
@@ -375,6 +420,22 @@ def _rewrite_return_value_text(text: str) -> str:
     rewritten = re.sub(r'\breturn\s+(["\'`]/[^"\'`]*["\'`])', lambda match: f"return {wrap_runtime_tool_base_expr(match.group(1))}", rewritten)
     rewritten = re.sub(r'\breturn\s+(`\/[^`]*\$\{[^`]+\}[^`]*`)', lambda match: f"return {wrap_runtime_tool_base_expr(match.group(1))}", rewritten)
     return rewritten
+
+
+def _rewrite_dynamic_html_attr_fragments_in_js_text(text: str) -> str:
+    pattern = re.compile(
+        r'(?P<literal_quote>["\'])(?P<prefix><[^"\'`<>]*?\b(?:href|src|action)=(?P<attr_quote>["\']))(?P<url>/(?!/)[^"\'`+]*?/)(?P=literal_quote)\s*\+'
+    )
+
+    def replace_fragment(match: re.Match[str]) -> str:
+        literal_quote = match.group("literal_quote")
+        url = match.group("url")
+        if not url.startswith("/api/"):
+            return match.group(0)
+        expression = wrap_runtime_tool_base_expr(f"{literal_quote}{url}{literal_quote}")
+        return f'{literal_quote}{match.group("prefix")}{literal_quote} + {expression} +'
+
+    return pattern.sub(replace_fragment, text)
 
 
 def _rewrite_client_request_text(text: str) -> str:
@@ -498,16 +559,16 @@ def rewrite_frontend_html_attribute_urls(
     if not runtime_roots:
         runtime_roots = detect_frontend_runtime_roots(repo_dir)
     rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
-    html_attr_pattern = re.compile(r'(?P<attr>src|href|action)=["\'](?P<url>/(?!/)[^"\']*)["\']')
-
-    def replace_root_relative_attr(match: re.Match[str]) -> str:
-        attr = match.group("attr")
-        url = match.group("url")
+    def replace_root_relative_attr(attr: str, url: str) -> Optional[str]:
         if not should_prefix_root_relative_html_url(attr, url, file_path, repo_dir, vite_project_roots=vite_project_roots):
-            return match.group(0)
-        return f'{attr}="{base_path}{url}"'
+            return None
+        return f"{base_path}{url}"
 
-    rewritten = html_attr_pattern.sub(replace_root_relative_attr, rewritten)
+    rewritten = _rewrite_root_relative_html_attrs_outside_scripts(
+        rewritten,
+        attrs=("src", "href", "action"),
+        replace_url=replace_root_relative_attr,
+    )
     rewritten = inject_tool_base_runtime(rewritten, base_path)
     if rewritten != original:
         write_text(file_path, rewritten)
@@ -535,15 +596,16 @@ def rewrite_frontend_html_link_urls(
     if not runtime_roots:
         runtime_roots = detect_frontend_runtime_roots(repo_dir)
     rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
-    link_pattern = re.compile(r'href=["\'](?P<url>/(?!/)[^"\']*)["\']')
-
-    def replace_link_attr(match: re.Match[str]) -> str:
-        url = match.group("url")
+    def replace_link_attr(_attr: str, url: str) -> Optional[str]:
         if not should_prefix_root_relative_html_url("href", url, file_path, repo_dir, vite_project_roots=vite_project_roots):
-            return match.group(0)
-        return f'href="{base_path}{url}"'
+            return None
+        return f"{base_path}{url}"
 
-    rewritten = link_pattern.sub(replace_link_attr, rewritten)
+    rewritten = _rewrite_root_relative_html_attrs_outside_scripts(
+        rewritten,
+        attrs=("href",),
+        replace_url=replace_link_attr,
+    )
     rewritten = inject_tool_base_runtime(rewritten, base_path)
     if rewritten != original:
         write_text(file_path, rewritten)
@@ -571,15 +633,16 @@ def rewrite_frontend_html_script_urls(
     if not runtime_roots:
         runtime_roots = detect_frontend_runtime_roots(repo_dir)
     rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
-    script_pattern = re.compile(r'src=["\'](?P<url>/(?!/)[^"\']*)["\']')
-
-    def replace_script_attr(match: re.Match[str]) -> str:
-        url = match.group("url")
+    def replace_script_attr(_attr: str, url: str) -> Optional[str]:
         if not should_prefix_root_relative_html_url("src", url, file_path, repo_dir, vite_project_roots=vite_project_roots):
-            return match.group(0)
-        return f'src="{base_path}{url}"'
+            return None
+        return f"{base_path}{url}"
 
-    rewritten = script_pattern.sub(replace_script_attr, rewritten)
+    rewritten = _rewrite_root_relative_html_attrs_outside_scripts(
+        rewritten,
+        attrs=("src",),
+        replace_url=replace_script_attr,
+    )
     rewritten = inject_tool_base_runtime(rewritten, base_path)
     if rewritten != original:
         write_text(file_path, rewritten)
@@ -607,15 +670,16 @@ def rewrite_frontend_html_form_action_urls(
     if not runtime_roots:
         runtime_roots = detect_frontend_runtime_roots(repo_dir)
     rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
-    form_action_pattern = re.compile(r'action=["\'](?P<url>/(?!/)[^"\']*)["\']')
-
-    def replace_form_action_attr(match: re.Match[str]) -> str:
-        url = match.group("url")
+    def replace_form_action_attr(_attr: str, url: str) -> Optional[str]:
         if not should_prefix_root_relative_html_url("action", url, file_path, repo_dir, vite_project_roots=vite_project_roots):
-            return match.group(0)
-        return f'action="{base_path}{url}"'
+            return None
+        return f"{base_path}{url}"
 
-    rewritten = form_action_pattern.sub(replace_form_action_attr, rewritten)
+    rewritten = _rewrite_root_relative_html_attrs_outside_scripts(
+        rewritten,
+        attrs=("action",),
+        replace_url=replace_form_action_attr,
+    )
     rewritten = inject_tool_base_runtime(rewritten, base_path)
     if rewritten != original:
         write_text(file_path, rewritten)
@@ -645,16 +709,16 @@ def rewrite_frontend_subpath_urls(
         if file_path.suffix == ".html":
             rewritten = rewrite_inline_html_api_fetch_path(rewritten)
             rewritten = rewrite_html_relative_asset_urls(rewritten, repo_dir, file_path, runtime_roots)
-            html_attr_pattern = re.compile(r'(?P<attr>src|href|action)=["\'](?P<url>/(?!/)[^"\']*)["\']')
-
-            def replace_root_relative_attr(match: re.Match[str]) -> str:
-                attr = match.group("attr")
-                url = match.group("url")
+            def replace_root_relative_attr(attr: str, url: str) -> Optional[str]:
                 if not should_prefix_root_relative_html_url(attr, url, file_path, repo_dir, vite_project_roots=vite_project_roots):
-                    return match.group(0)
-                return f'{attr}="{base_path}{url}"'
+                    return None
+                return f"{base_path}{url}"
 
-            rewritten = html_attr_pattern.sub(replace_root_relative_attr, rewritten)
+            rewritten = _rewrite_root_relative_html_attrs_outside_scripts(
+                rewritten,
+                attrs=("src", "href", "action"),
+                replace_url=replace_root_relative_attr,
+            )
             rewritten = inject_tool_base_runtime(rewritten, base_path)
     if rewritten != original:
         write_text(file_path, rewritten)

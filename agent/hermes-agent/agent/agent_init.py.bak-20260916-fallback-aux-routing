@@ -3016,10 +3016,6 @@ def init_agent(
         "compressor_context_length": _cc.context_length,
         "compressor_threshold_tokens": _cc.threshold_tokens,
     }
-    agent._active_auxiliary_routes = {}
-    agent._active_model_supports_vision = None
-    from agent.gateway_audit import reset as reset_gateway_audit
-    reset_gateway_audit(agent)
     if agent.api_mode == "anthropic_messages":
         agent._primary_runtime.update({
             "anthropic_api_key": agent._anthropic_api_key,

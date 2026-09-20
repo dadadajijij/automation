@@ -14,7 +14,7 @@ from unittest import mock
 
 from fastapi import HTTPException
 
-from hermes_http_gateway.admin_ui import render_dashboard_page, render_login_page
+from hermes_http_gateway.admin_ui import render_chat_page, render_dashboard_page, render_login_page
 from hermes_http_gateway import main as gateway
 from hermes_http_gateway.attachments import attachment_session_dir
 from hermes_http_gateway.config import Settings, load_env_file
@@ -38,6 +38,7 @@ def _make_settings(tmpdir: Path) -> Settings:
         admin_cookie_name="hermes_admin_session",
         admin_session_ttl_seconds=3600,
         admin_cookie_secure=False,
+        public_base_path="",
         timeout_seconds=300,
         source_tag="tool",
         default_model=None,
@@ -65,6 +66,34 @@ def _chat_request(question: str, **kwargs) -> gateway.ChatRequest:
         ),
         **kwargs,
     )
+
+
+class _FakeUpload:
+    def __init__(self, filename: str, content_type: str, data: bytes):
+        self.filename = filename
+        self.content_type = content_type
+        self._data = data
+        self._offset = 0
+        self.closed = False
+
+    async def read(self, size: int) -> bytes:
+        if self._offset >= len(self._data):
+            return b""
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeForm(dict):
+    def __init__(self, values: dict[str, object], files: list[_FakeUpload]):
+        super().__init__(values)
+        self._files = files
+
+    def getlist(self, key: str) -> list[object]:
+        return list(self._files) if key == "files" else []
 
 
 class GatewayTests(unittest.TestCase):
@@ -126,10 +155,138 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaises(Exception):
             gateway.ChatRequest(question=gateway.ChatQuestion(text="   "))
 
+    def test_prompt_with_image_attachments_uses_natural_language_hint(self):
+        prompt = gateway._prompt_with_attachments(
+            "请分析这张图",
+            [
+                SimpleNamespace(local_path=Path("/tmp/hermes/demo/image-1.png")),
+                SimpleNamespace(local_path=Path("/tmp/hermes/demo/image-2.png")),
+            ],
+            [],
+        )
+
+        self.assertIn("请分析这张图", prompt)
+        self.assertIn("本轮请求包含 2 张图片附件", prompt)
+        self.assertNotIn("@file:", prompt)
+        self.assertNotIn("image-1.png", prompt)
+        self.assertNotIn("image-2.png", prompt)
+
+    def test_prompt_with_file_attachments_keeps_file_refs(self):
+        prompt = gateway._prompt_with_attachments(
+            "请分析日志",
+            [],
+            [SimpleNamespace(local_path=Path("/tmp/hermes/demo/app.log"))],
+        )
+
+        self.assertIn("请分析日志", prompt)
+        self.assertIn("附件文件", prompt)
+        self.assertIn("@file:/tmp/hermes/demo/app.log", prompt)
+
+    def test_audit_body_redacts_signed_url_query_values(self):
+        serialized = gateway._serialize_audit_body(
+            {
+                "question": {
+                    "text": "inspect",
+                    "attachments": [
+                        {"type": "file", "url": "https://example.com/a.log?token=secret&part=1"}
+                    ],
+                }
+            }
+        )
+        self.assertIn("token=%5BREDACTED%5D", serialized)
+        self.assertIn("part=1", serialized)
+        self.assertNotIn("secret", serialized)
+
+    def test_uploaded_attachments_use_the_same_attachment_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            image = _FakeUpload("diagram.png", "image/png", b"\x89PNG\r\n\x1a\ncontent")
+            text = _FakeUpload("notes.txt", "text/plain", b"hello from upload")
+            loop = asyncio.new_event_loop()
+            try:
+                prepared = loop.run_until_complete(
+                    gateway._prepare_uploaded_attachments(
+                        settings,
+                        [image, text],
+                        Path(tmp) / "attachments",
+                    )
+                )
+            finally:
+                loop.close()
+
+        self.assertEqual(len(prepared.images), 1)
+        self.assertEqual(len(prepared.files), 1)
+        self.assertEqual(prepared.images[0].mime_type, "image/png")
+        self.assertEqual(prepared.files[0].mime_type, "text/plain")
+        self.assertTrue(image.closed)
+        self.assertTrue(text.closed)
+
+    def test_admin_chat_rejects_invalid_csrf_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            admin = gateway_db.create_admin_session(settings, username="admin", ttl_seconds=3600)
+            request = SimpleNamespace(
+                headers={"x-csrf-token": "bad"},
+                cookies={settings.admin_cookie_name: admin["session_token"]},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(gateway._admin_chat_request(request, settings))
+
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_admin_chat_uses_shared_chat_execution_with_uploaded_image(self):
+        seen: dict[str, object] = {}
+
+        def fake_first_turn(settings, *, prompt, profile, model=None, provider=None, image_paths=None, attachment_root=None, run_key=None, run_generation=None):
+            seen["prompt"] = prompt
+            seen["image_paths"] = image_paths
+            return HermesRunResult(
+                answer="uploaded image answer",
+                session_id="hermes-admin-upload",
+                stdout="uploaded image answer",
+                stderr="",
+                returncode=0,
+                usage={"session_id": "hermes-admin-upload"},
+            )
+
+        class RequestWithForm(SimpleNamespace):
+            async def form(self):
+                return _FakeForm(
+                    {"text": "请分析上传的图片", "user_id": "admin-playground", "session_id": "admin-upload", "profile": "default"},
+                    [_FakeUpload("upload.png", "image/png", b"\x89PNG\r\n\x1a\ncontent")],
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            admin = gateway_db.create_admin_session(settings, username="admin", ttl_seconds=3600)
+            request = RequestWithForm(
+                headers={"x-csrf-token": gateway._admin_csrf_token(admin["session_token"])},
+                cookies={settings.admin_cookie_name: admin["session_token"]},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            original_first = gateway.run_first_turn
+            gateway.run_first_turn = fake_first_turn
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(gateway._admin_chat_request(request, settings))
+                finally:
+                    loop.close()
+            finally:
+                gateway.run_first_turn = original_first
+
+        self.assertEqual(result["answer"], "uploaded image answer")
+        self.assertEqual(result["session_id"], "admin-upload")
+        self.assertIn("本轮请求包含 1 张图片附件", seen["prompt"])
+        self.assertEqual(len(seen["image_paths"] or []), 1)
+
     def test_chat_endpoint_passes_user_id_from_body(self):
         seen: list[tuple[str | None, str | None]] = []
 
-        async def fake_run_chat_turn(settings, *, user_id, session_id, request):
+        async def fake_run_chat_turn(settings, *, user_id, session_id, request, request_body=None):
             seen.append((user_id, session_id))
             return {"user_id": user_id, "session_id": session_id}
 
@@ -412,6 +569,7 @@ class GatewayTests(unittest.TestCase):
             try:
                 second, first_error = asyncio.run(run_case(settings))
                 messages = gateway_db.list_messages(settings, "alice", "demo-session")
+                events = gateway_db.list_request_events_by_session(settings, "demo-session")
             finally:
                 gateway.run_first_turn = original_first
 
@@ -419,6 +577,91 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(second["answer"], "second answer")
         self.assertEqual(calls, ["first", "second"])
         self.assertEqual([row["content"] for row in messages], ["second", "second answer"])
+        self.assertEqual([row["prompt"] for row in events], ["first", "second"])
+        self.assertEqual([row["status"] for row in events], ["superseded", "completed"])
+        self.assertEqual(events[0]["http_status"], 409)
+        self.assertIn("superseded", events[0]["error_detail"])
+
+    def test_admin_timeline_includes_completed_failed_and_superseded_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            gateway_db.create_conversation(
+                settings,
+                external_session_id="timeline-session",
+                user_id="alice",
+                hermes_profile="default",
+                title="Timeline",
+            )
+            completed = gateway_db.create_request_event(
+                settings,
+                external_session_id="timeline-session",
+                user_id="alice",
+                prompt="completed prompt",
+                request_body='{"question":{"text":"completed prompt"}}',
+            )
+            gateway_db.finish_request_event(
+                settings, event_id=completed["id"], status="completed", http_status=200
+            )
+            gateway_db.record_request_stage(
+                settings,
+                request_event_id=completed["id"],
+                stage="Hermes CLI 运行",
+                duration_ms=1250.4,
+            )
+            failed = gateway_db.create_request_event(
+                settings,
+                external_session_id="timeline-session",
+                user_id="alice",
+                prompt="failed prompt",
+            )
+            gateway_db.finish_request_event(
+                settings,
+                event_id=failed["id"],
+                status="failed",
+                http_status=502,
+                error_detail="Hermes timed out",
+            )
+            superseded = gateway_db.create_request_event(
+                settings,
+                external_session_id="timeline-session",
+                user_id="alice",
+                prompt="cancelled prompt",
+            )
+            gateway_db.finish_request_event(
+                settings,
+                event_id=superseded["id"],
+                status="superseded",
+                http_status=409,
+                error_detail="request superseded by a newer request",
+            )
+            gateway_db.append_message(
+                settings,
+                external_session_id="timeline-session",
+                user_id="alice",
+                role="assistant",
+                kind="chat",
+                content="completed answer",
+            )
+            admin = gateway_db.create_admin_session(settings, username="admin", ttl_seconds=3600)
+            request = SimpleNamespace(
+                cookies={settings.admin_cookie_name: admin["session_token"]},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            payload = gateway.admin_conversation_messages(request, "timeline-session")
+
+        self.assertEqual([row["status"] for row in payload["requests"]], ["completed", "failed", "superseded"])
+        self.assertEqual(len(payload["timeline"]), 4)
+        self.assertEqual(payload["timeline"][0]["event_type"], "request")
+        self.assertIn("Hermes timed out", payload["timeline"][1]["error_detail"])
+        self.assertEqual(payload["timeline"][2]["http_status"], 409)
+        self.assertEqual(payload["timeline"][3]["content"], "completed answer")
+        self.assertEqual(
+            payload["requests"][0]["request_body"],
+            '{"question":{"text":"completed prompt"}}',
+        )
+        self.assertEqual(payload["requests"][0]["stages"][0]["stage"], "Hermes CLI 运行")
+        self.assertEqual(payload["requests"][0]["stages"][0]["duration_ms"], 1250.4)
 
     def test_new_chat_turn_waits_for_previous_attachment_and_reuses_it(self):
         download_started = threading.Event()
@@ -520,7 +763,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(first_error.status_code, 409)
         self.assertEqual(second["answer"], "second answer")
         self.assertEqual(hermes_calls[-1][0].splitlines()[0], "second question")
-        self.assertIn("附件图片", hermes_calls[-1][0])
+        self.assertIn("本轮请求包含 1 张图片附件", hermes_calls[-1][0])
+        self.assertNotIn("@file:", hermes_calls[-1][0])
         self.assertEqual([path.name for path in hermes_calls[-1][1]], ["old-image.png"])
         self.assertEqual(Path(hermes_calls[-1][2]).name, "pending-session")
         self.assertEqual(pending_images, [])
@@ -732,10 +976,10 @@ class GatewayTests(unittest.TestCase):
         image_paths = seen["image_paths"]
         self.assertEqual(len(image_paths), 2)
         self.assertEqual([Path(path).name for path in image_paths], ["image-1.png", "image-2.png"])
-        self.assertIn("附件图片", seen["prompt"])
-        self.assertIn("@file:", seen["prompt"])
-        self.assertIn("image-1.png", seen["prompt"])
-        self.assertIn("image-2.png", seen["prompt"])
+        self.assertIn("本轮请求包含 2 张图片附件", seen["prompt"])
+        self.assertNotIn("@file:", seen["prompt"])
+        self.assertNotIn("image-1.png", seen["prompt"])
+        self.assertNotIn("image-2.png", seen["prompt"])
         self.assertEqual(Path(seen["attachment_root"]).name, "demo-session")
 
     def test_hermes_client_repeats_image_flags(self):
@@ -807,7 +1051,12 @@ class GatewayTests(unittest.TestCase):
                 encoding="utf-8",
             )
             script.chmod(0o755)
-            settings = replace(_make_settings(root), hermes_bin=str(script), timeout_seconds=30)
+            settings = replace(
+                _make_settings(root),
+                hermes_bin=str(script),
+                hermes_workdir=root,
+                timeout_seconds=30,
+            )
             run_key = f"cancel-test:{time.time_ns()}"
             generation = begin_session_turn(run_key)
             original_started = os.environ.get("HERMES_CANCEL_STARTED")
@@ -945,10 +1194,55 @@ class GatewayTests(unittest.TestCase):
             conversations = gateway_db.list_all_conversations(settings, query="Alpha")
             self.assertEqual(len(conversations), 1)
             self.assertEqual(conversations[0]["external_session_id"], "sess-a")
+            detail = gateway_db.get_conversation_by_session(settings, "sess-a")
+            empty_detail = gateway_db.get_conversation_by_session(settings, "sess-b")
+            self.assertEqual(detail["message_count"], 1)
+            self.assertEqual(empty_detail["message_count"], 0)
 
             results = gateway_db.search_messages_admin(settings, query="hello")
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["external_session_id"], "sess-a")
+
+    def test_request_runtime_audit_is_persisted_for_admin_timeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            gateway_db.create_conversation(
+                settings,
+                external_session_id="sess-audit",
+                user_id="alice",
+                hermes_profile="default",
+                title="Audit chat",
+            )
+            event = gateway_db.create_request_event(
+                settings,
+                external_session_id="sess-audit",
+                user_id="alice",
+                prompt="inspect image",
+                model="gpt-5.6-terra",
+                provider="custom",
+            )
+            audit = {
+                "version": 1,
+                "main": {"provider": "custom", "model": "qwen3.7-plus"},
+                "events": [
+                    {"kind": "main_fallback", "task": "main", "model": "qwen3.7-plus"},
+                    {"kind": "image_input", "task": "image", "input_mode": "native"},
+                    {"kind": "auxiliary", "task": "vision", "model": "qwen3.7-plus"},
+                ],
+            }
+            gateway_db.finish_request_event(
+                settings,
+                event_id=event["id"],
+                status="completed",
+                http_status=200,
+                runtime_audit=audit,
+            )
+
+            stored = gateway_db.list_request_events_by_session(settings, "sess-audit")
+            payload = gateway._request_event_payload(stored[0])
+
+        self.assertEqual(payload["runtime_audit"], audit)
 
     def test_admin_login_helpers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -974,12 +1268,39 @@ class GatewayTests(unittest.TestCase):
     def test_admin_pages_render(self):
         login = render_login_page(username_default="admin", password_configured=True)
         dash = render_dashboard_page(username="admin")
+        chat = render_chat_page(
+            username="admin",
+            csrf_token="csrf",
+            public_base_path="/tools2/hermes-gateway",
+        )
         self.assertIn("Hermes 管理登录", login)
         self.assertIn("admin", login)
         self.assertIn("Hermes 管理面板", dash)
         self.assertIn("admin", dash)
+        self.assertNotIn('id="loginLabel"', dash)
+        self.assertNotIn("当前管理员", dash)
+        self.assertNotIn('id="currentAdmin"', dash)
+        self.assertIn("<tr><th>会话</th><th>状态</th><th>消息</th></tr>", dash)
+        self.assertNotIn("<tr><th>会话</th><th>用户</th><th>状态</th><th>消息</th></tr>", dash)
+        self.assertIn('class="sessions-table"', dash)
+        self.assertIn("table-layout: fixed", dash)
         self.assertIn("userFilterText", dash)
         self.assertNotIn("els.userFilter.value = state.selectedUser", dash)
+        self.assertIn("grid-template-columns: minmax(0, .72fr) minmax(0, 1fr) minmax(0, 1.9fr);", dash)
+        self.assertIn('"publicBasePath": "/tools2/hermes-gateway"', chat)
+        self.assertIn("adminPath('/api/chat')", chat)
+        self.assertIn("'/' + 'admin' + suffix", chat)
+        self.assertIn("const requestKeys = new Set", dash)
+        self.assertIn("const visibleItems = items.filter", dash)
+        self.assertIn("row.event_type === 'request' ? '用户请求' : esc(row.role)", dash)
+        self.assertNotIn('<strong>用户请求</strong>\\n${{esc(row.prompt)}}', dash)
+        self.assertIn("展开原始 Body", dash)
+        self.assertIn("row.request_body ?", dash)
+        self.assertIn("展开阶段耗时", dash)
+        self.assertIn("formatDuration(stage.duration_ms)", dash)
+        self.assertIn("实际主模型", dash)
+        self.assertIn("展开模型执行详情", dash)
+        self.assertIn("csrf", chat)
 
     def test_env_file_loader_keeps_existing_values(self):
         original = os.environ.get("ADMIN_PASSWORD")

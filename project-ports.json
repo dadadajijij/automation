@@ -52,5 +52,15 @@
   "momo-argus-cdn-push": {
     "port": "8012:8787",
     "env_file": "/home/devops/ka/data/momo-argus-cdn-push/env"
+  },
+  "meeting-minutes-demo-release": {
+    "port": "8013:8765",
+    "volumes": [
+      "/home/devops/ka/data/meeting-minutes-demo-release/config.json:/app/config.json"
+    ]
+  },
+  "csfanzha": {
+    "port": "8014:3000",
+    "env_file":"/home/devops/ka/data/csfanzha/env"
   }
 }

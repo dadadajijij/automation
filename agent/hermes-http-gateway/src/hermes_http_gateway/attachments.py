@@ -209,6 +209,36 @@ def download_image(settings: Settings, *, url: str, target_dir: Path) -> Downloa
         url=url,
         accept="image/png,image/jpeg,image/webp,image/gif;q=0.8,*/*;q=0.1",
     )
+    return store_image(
+        data=data,
+        source=url,
+        declared_content_type=content_type,
+        target_dir=target_dir,
+    )
+
+
+def download_file(settings: Settings, *, url: str, target_dir: Path) -> DownloadedFile:
+    data, content_type = _download_url(
+        settings,
+        url=url,
+        accept="text/*,application/json,application/pdf,application/octet-stream,*/*;q=0.1",
+    )
+    return store_file(
+        data=data,
+        source=url,
+        declared_content_type=content_type,
+        target_dir=target_dir,
+    )
+
+
+def store_image(
+    *,
+    data: bytes,
+    source: str,
+    declared_content_type: str,
+    target_dir: Path,
+) -> DownloadedImage:
+    content_type = declared_content_type.split(";", 1)[0].strip().lower()
     if content_type and content_type not in _MIME_SUFFIX and not content_type.startswith("application/octet-stream"):
         raise AttachmentError(f"unsupported image content-type: {content_type}")
 
@@ -221,7 +251,7 @@ def download_image(settings: Settings, *, url: str, target_dir: Path) -> Downloa
     path = target_dir / f"{digest}{_MIME_SUFFIX[mime_type]}"
     path.write_bytes(data)
     return DownloadedImage(
-        source_url=url,
+        source_url=source,
         local_path=path,
         mime_type=mime_type,
         size_bytes=len(data),
@@ -229,19 +259,21 @@ def download_image(settings: Settings, *, url: str, target_dir: Path) -> Downloa
     )
 
 
-def download_file(settings: Settings, *, url: str, target_dir: Path) -> DownloadedFile:
-    data, content_type = _download_url(
-        settings,
-        url=url,
-        accept="text/*,application/json,application/pdf,application/octet-stream,*/*;q=0.1",
-    )
+def store_file(
+    *,
+    data: bytes,
+    source: str,
+    declared_content_type: str,
+    target_dir: Path,
+) -> DownloadedFile:
+    content_type = declared_content_type.split(";", 1)[0].strip().lower() or "application/octet-stream"
     digest = hashlib.sha256(data).hexdigest()
-    suffix = _safe_file_suffix(url, content_type)
+    suffix = _safe_file_suffix(source, content_type)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{digest}{suffix}"
     path.write_bytes(data)
     return DownloadedFile(
-        source_url=url,
+        source_url=source,
         local_path=path,
         mime_type=content_type,
         size_bytes=len(data),

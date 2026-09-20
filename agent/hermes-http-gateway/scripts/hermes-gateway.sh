@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,7 +40,7 @@ start() {
   fi
 
   cd "$ROOT_DIR"
-  nohup env HOST="$HOST" PORT="$PORT" "$APP_BIN" >>"$LOG_FILE" 2>&1 &
+  nohup env HOST="$HOST" PORT="$PORT" "$APP_BIN" >>"$LOG_FILE" 2>&1 < /dev/null &
   echo $! >"$PID_FILE"
   echo "started hermes-gateway on ${HOST}:${PORT}"
   echo "pid: $(cat "$PID_FILE")"

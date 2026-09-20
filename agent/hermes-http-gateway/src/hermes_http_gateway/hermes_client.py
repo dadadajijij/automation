@@ -13,11 +13,20 @@ from .locks import clear_session_process, is_session_turn_current, register_sess
 
 
 class HermesInvocationError(RuntimeError):
-    def __init__(self, message: str, *, returncode: int | None = None, stdout: str = "", stderr: str = ""):
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+        usage: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.usage = usage
 
 
 class HermesInvocationCancelled(HermesInvocationError):
@@ -164,6 +173,7 @@ def run_first_turn(
             returncode=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
+            usage=usage,
         )
 
     session_id = None
@@ -232,6 +242,7 @@ def run_resume_turn(
             returncode=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
+            usage=usage,
         )
 
     session_id = hermes_session_id

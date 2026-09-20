@@ -182,6 +182,50 @@ class SubpathAdaptersTests(unittest.TestCase):
             rewritten = page_path.read_text(encoding="utf-8")
             self.assertIn('action={withToolBase("/api/upload")}', rewritten)
 
+    def test_auto_fix_nextjs_subpath_issues_rewrites_dynamic_metadata_icon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            src_app_dir = repo_dir / "src" / "app"
+            src_app_dir.mkdir(parents=True)
+            (repo_dir / "package.json").write_text(
+                json.dumps({"name": "demo-next", "dependencies": {"next": "^15.1.0"}}) + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "next.config.ts").write_text(
+                "const nextConfig = {}\nexport default nextConfig\n",
+                encoding="utf-8",
+            )
+            layout_path = src_app_dir / "layout.tsx"
+            layout_path.write_text(
+                "\n".join(
+                    [
+                        'import type { Metadata } from "next";',
+                        'const normalizedBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH || "";',
+                        "export const metadata: Metadata = {",
+                        "  icons: {",
+                        '    icon: `${normalizedBasePath}/favicon.ico`,',
+                        "  },",
+                        "};",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            changed = auto_fix_nextjs_subpath_issues(
+                repo_dir,
+                "demo-next",
+                nextjs_entry_file=runner.nextjs_entry_file,
+                collect_matching_files=runner.collect_matching_files,
+                read_text=runner.read_text,
+                read_text_if_exists=runner.read_text_if_exists,
+                write_text=runner.write_text,
+                sorted_unique=runner.sorted_unique,
+            )
+
+            self.assertIn("src/app/layout.tsx", changed)
+            self.assertIn('icon: "/tools2/demo-next/favicon.ico"', layout_path.read_text(encoding="utf-8"))
+
     def test_auto_fix_nextjs_subpath_issues_rewrites_request_assign_and_open(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir)

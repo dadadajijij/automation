@@ -103,6 +103,7 @@ class Settings:
     admin_cookie_name: str
     admin_session_ttl_seconds: int
     admin_cookie_secure: bool
+    public_base_path: str
     timeout_seconds: int
     source_tag: str
     default_model: str | None
@@ -130,6 +131,7 @@ def load_settings() -> Settings:
         or "hermes_admin_session",
         admin_session_ttl_seconds=_env_int("ADMIN_SESSION_TTL_SECONDS", 86400),
         admin_cookie_secure=os.environ.get("ADMIN_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes"},
+        public_base_path=os.environ.get("PUBLIC_BASE_PATH", "").strip().rstrip("/"),
         timeout_seconds=_env_int("HERMES_TIMEOUT_SECONDS", 300),
         source_tag=os.environ.get("HERMES_SOURCE_TAG", "tool").strip() or "tool",
         default_model=os.environ.get("DEFAULT_MODEL", "").strip() or None,

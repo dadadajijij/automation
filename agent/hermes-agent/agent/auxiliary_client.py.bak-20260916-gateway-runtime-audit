@@ -3450,7 +3450,6 @@ def set_runtime_main(
     session_id: str = "",
     cache_scope: str = "",
     auxiliary_routes: Optional[Dict[str, Dict[str, Any]]] = None,
-    gateway_audit_events: Optional[List[Dict[str, Any]]] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3480,7 +3479,6 @@ def set_runtime_main(
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
         "auxiliary_routes": _normalize_auxiliary_routes(auxiliary_routes),
-        "gateway_audit_events": gateway_audit_events if isinstance(gateway_audit_events, list) else None,
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -3957,7 +3955,6 @@ _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", 
 _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
     "requested_provider",
     "auxiliary_routes",
-    "gateway_audit_events",
 )
 
 
@@ -3996,9 +3993,6 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         value = main_runtime.get(field)
         # Preserve a callable api_key (Entra ID bearer provider) unchanged.
         if field == "api_key" and callable(value) and not isinstance(value, str):
-            normalized[field] = value
-            continue
-        if field == "gateway_audit_events" and isinstance(value, list):
             normalized[field] = value
             continue
         if isinstance(value, str) and value.strip():
@@ -9480,17 +9474,6 @@ def _call_llm_impl(
     _record_route_info(
         route_info, _fallback_provider_from_label(request_provider), final_model
     )
-    try:
-        from agent.gateway_audit import record_runtime as record_gateway_audit_runtime
-
-        record_gateway_audit_runtime(
-            main_runtime,
-            task=task,
-            provider=_fallback_provider_from_label(request_provider),
-            model=final_model,
-        )
-    except Exception:
-        logger.debug("Auxiliary gateway audit update failed", exc_info=True)
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -10310,17 +10293,6 @@ async def _async_call_llm_impl(
     _record_route_info(
         route_info, _fallback_provider_from_label(request_provider), final_model
     )
-    try:
-        from agent.gateway_audit import record_runtime as record_gateway_audit_runtime
-
-        record_gateway_audit_runtime(
-            main_runtime,
-            task=task,
-            provider=_fallback_provider_from_label(request_provider),
-            model=final_model,
-        )
-    except Exception:
-        logger.debug("Auxiliary gateway audit update failed", exc_info=True)
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish

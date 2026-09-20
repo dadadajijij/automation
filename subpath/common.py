@@ -32,6 +32,8 @@ def is_allowed_root_relative_url(url: str, base_path: str) -> bool:
     lowered = stripped.lower()
     if lowered.startswith(("mailto:", "tel:", "data:", "javascript:")):
         return True
+    if stripped == "/api/me":
+        return True
     if stripped == base_path or stripped.startswith(f"{base_path}/"):
         return True
     return False

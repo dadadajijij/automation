@@ -81,7 +81,7 @@ curl -X POST http://127.0.0.1:8011/v1/chat \
   }'
 ```
 
-`question.attachments[].type=image` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并同时通过 `--image` 和 prompt 里的 `@file:` 图片路径交给 agent。
+`question.attachments[].type=image` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并通过 `--image` 交给 agent；prompt 只追加图片数量的自然语言提示。
 `question.attachments[].type=file` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并通过 Hermes 的 `@file:` 引用机制交给 agent。
 有附件时，`question.text` 可以不传或传空字符串；无附件时必须传非空文本。
 图片和文件默认只保留最近 3 天数据。
@@ -128,11 +128,23 @@ curl -X POST http://127.0.0.1:8011/v1/chat \
 
 ### `GET /admin`
 
-管理员网页，可以查看所有用户、会话、消息，并做全局搜索。
+管理员网页，可以查看所有用户、会话、消息，并做全局搜索。会话详情按时间顺序展示每次请求：成功请求保留正常问答消息；被同一会话后续请求替代的调用显示 HTTP 409 和中断原因；Hermes 调用失败会显示失败状态与错误详情。
 
 ### `GET /admin/login`
 
 管理员登录页，用户名默认预填。
+
+### `GET /admin/chat`
+
+管理员在线对话页，支持输入文本并直接上传本地图片或文件。页面通过管理员 Cookie 和 CSRF token 调用 `POST /admin/api/chat`，不会向浏览器暴露 `GATEWAY_API_KEY`。上传附件与 `POST /v1/chat` 的 URL 附件会复用同一套 Hermes 调用、会话和消息记录逻辑。
+
+服务部署在反向代理子路径时，设置 `PUBLIC_BASE_PATH`。例如当前部署路径为 `/tools2/hermes-gateway`：
+
+```dotenv
+PUBLIC_BASE_PATH=/tools2/hermes-gateway
+```
+
+之后从 `https://athena.agoralab.co/tools2/hermes-gateway/admin/chat` 访问页面。
 
 ## 测试
 
@@ -147,3 +159,4 @@ cd /Users/panweikui/Pwk-Coding/automation/agent/hermes-http-gateway
 - `user_id` 不传时缺省值是 `guest`；已有会话命中时会继承原会话用户
 - 如果设置了 `GATEWAY_API_KEY`，还需要 `X-Gateway-Key` 或 `Authorization: Bearer ...`
 - 管理页和管理 API 需要先登录，账号密码来自 `ADMIN_USERNAME` / `ADMIN_PASSWORD`
+- 管理员上传接口需要 `python-multipart`，已作为项目运行依赖声明

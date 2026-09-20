@@ -145,6 +145,190 @@ class RunnerSubpathPipelineTests(unittest.TestCase):
             self.assertEqual(payload["analysis_summary"]["subpath_rewrite_report_summary"]["applied_reason_counts"], {"generic_static_rewrite": 1})
             self.assertEqual(payload["analysis_summary"]["subpath_rewrite_report_summary"]["applied_files_count_by_reason"], {"generic_static_rewrite": 1})
 
+    def test_source_phase_repairs_deterministic_dockerfile_finding_without_regenerating(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "incoming" / "demo-subpath"
+            repo_dir = root / "repo-work"
+            source_dir.mkdir(parents=True)
+            repo_dir.mkdir(parents=True)
+            (source_dir / "package.json").write_text('{"name":"demo-subpath"}\n', encoding="utf-8")
+            (repo_dir / "package.json").write_text(
+                '{"name":"demo-next","scripts":{"build":"next build","start":"next start"}}\n',
+                encoding="utf-8",
+            )
+            (repo_dir / "next.config.ts").write_text("export default {}\n", encoding="utf-8")
+            args = self._make_args(source_dir, build=False, run=False)
+            analysis = {
+                "service_runtime": "node",
+                "package_scripts": ["build", "start"],
+                "node_entry_command": "next start",
+                "python_entry_command": None,
+                "system_dependency_hints": [],
+                "package_manager": "npm",
+                "has_nextjs_ts_config": True,
+                "requires_build_step": True,
+                "required_build_commands": ["npm run build"],
+                "python_install_validation_mode": "allow_package_install",
+                "facts": [],
+            }
+            static_audit = {
+                "framework": "nextjs",
+                "proxy_mode": "preserve_prefix",
+                "scanned_files": [],
+                "findings": [],
+                "warnings": [],
+            }
+
+            def generate_initial_files(*_args, **_kwargs) -> None:
+                (repo_dir / "Dockerfile").write_text(
+                    "\n".join(
+                        [
+                            "FROM node:22-alpine",
+                            "WORKDIR /app",
+                            "COPY package.json ./",
+                            "RUN npm ci",
+                            "COPY . .",
+                            "RUN npm run build",
+                            'CMD ["./node_modules/.bin/next", "start"]',
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                    "# PROJECT_ONBOARDING\n## 1 项目基础信息\n## 2 代码和版本信息\n## 3 启动信息\n## 4 运行参数\n",
+                    encoding="utf-8",
+                )
+
+            generate_mock = mock.Mock(side_effect=generate_initial_files)
+            generate_patcher = mock.patch.object(
+                runner,
+                "invoke_codex_generation",
+                new=generate_mock,
+            )
+            patches = self._base_patches(root, source_dir, repo_dir, args) + [
+                mock.patch.object(runner, "collect_repo_analysis", return_value=analysis),
+                mock.patch.object(runner, "summarize_analysis", return_value={"project_slug": "demo-subpath"}),
+                mock.patch.object(
+                    runner,
+                    "subpath_prepare_subpath_sources",
+                    return_value={
+                        "plan": self._plan_payload(repo_dir, framework="nextjs"),
+                        "detection_evidence": [],
+                        "proxy_mode": "preserve_prefix",
+                        "rewritten_files": [],
+                        "auto_fixed_files": [],
+                        "rewrite_report": {"changed_files": [], "applied_codes": [], "grouped_findings": {}},
+                        "static_subpath_audit": static_audit,
+                        "static_audit_attempts": [static_audit],
+                        "static_findings": [],
+                    },
+                ),
+                generate_patcher,
+                mock.patch.object(runner, "sync_generated_outputs_to_shared_repo", return_value=[]),
+            ]
+
+            exit_code = self._run_with_patches(patches)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(generate_mock.call_count, 1)
+            dockerfile_text = (repo_dir / "Dockerfile").read_text(encoding="utf-8")
+            self.assertIn("RUN npm install --global pnpm", dockerfile_text)
+            result_path = root / "jobs" / "demo-subpath" / "job-123" / "output" / "result.json"
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["artifacts"]["deterministic_dockerfile_repairs"],
+                ["provided pnpm with npm global install"],
+            )
+
+    def test_source_phase_restores_dockerfile_when_regeneration_loses_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "incoming" / "demo-subpath"
+            repo_dir = root / "repo-work"
+            source_dir.mkdir(parents=True)
+            repo_dir.mkdir(parents=True)
+            (source_dir / "package.json").write_text('{"name":"demo-subpath"}\n', encoding="utf-8")
+            args = self._make_args(source_dir, build=False, run=False)
+            analysis = {
+                "service_runtime": "node",
+                "has_nextjs_ts_config": True,
+                "requires_build_step": True,
+                "facts": [],
+            }
+            static_audit = {
+                "framework": "nextjs",
+                "proxy_mode": "preserve_prefix",
+                "scanned_files": [],
+                "findings": [],
+                "warnings": [],
+            }
+
+            def generate_files(*_args, **_kwargs) -> None:
+                has_feedback = bool(_kwargs.get("validation_findings"))
+                pnpm_install = [] if has_feedback else ["RUN npm install --global pnpm"]
+                (repo_dir / "Dockerfile").write_text(
+                    "\n".join(
+                        [
+                            "FROM node:22-alpine",
+                            *pnpm_install,
+                            "COPY . .",
+                            "RUN npm run build",
+                            'CMD ["./node_modules/.bin/next", "start"]',
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                    "# PROJECT_ONBOARDING\n## 4 运行参数\n",
+                    encoding="utf-8",
+                )
+
+            generate_mock = mock.Mock(side_effect=generate_files)
+            patches = self._base_patches(root, source_dir, repo_dir, args) + [
+                mock.patch.object(runner, "collect_repo_analysis", return_value=analysis),
+                mock.patch.object(runner, "summarize_analysis", return_value={"project_slug": "demo-subpath"}),
+                mock.patch.object(
+                    runner,
+                    "subpath_prepare_subpath_sources",
+                    return_value={
+                        "plan": self._plan_payload(repo_dir, framework="nextjs"),
+                        "detection_evidence": [],
+                        "proxy_mode": "preserve_prefix",
+                        "rewritten_files": [],
+                        "auto_fixed_files": [],
+                        "rewrite_report": {"changed_files": [], "applied_codes": [], "grouped_findings": {}},
+                        "static_subpath_audit": static_audit,
+                        "static_audit_attempts": [static_audit],
+                        "static_findings": [],
+                    },
+                ),
+                mock.patch.object(runner, "invoke_codex_generation", new=generate_mock),
+                mock.patch.object(
+                    runner,
+                    "validate_generated_files",
+                    side_effect=[(["PROJECT_ONBOARDING.md needs additional operator context"], []), ([], [])],
+                ),
+                mock.patch.object(runner, "sync_generated_outputs_to_shared_repo", return_value=[]),
+            ]
+
+            exit_code = self._run_with_patches(patches)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(generate_mock.call_count, 2)
+            self.assertIn(
+                "RUN npm install --global pnpm",
+                (repo_dir / "Dockerfile").read_text(encoding="utf-8"),
+            )
+            result_path = root / "jobs" / "demo-subpath" / "job-123" / "output" / "result.json"
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["artifacts"]["dockerfile_capability_regressions"],
+                ["pnpm runtime availability"],
+            )
+
     def test_source_phase_returns_subpath_static_audit_failed_with_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

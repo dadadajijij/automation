@@ -176,6 +176,129 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertEqual(signature_a, signature_b)
             self.assertNotIn("source", signature_a)
 
+    def test_resolve_git_source_revision_uses_peeled_tag_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "fetch.log"
+            tag_object = "1" * 40
+            tag_commit = "2" * 40
+            with mock.patch.object(
+                runner,
+                "run_command",
+                return_value=runner.CommandResult(
+                    args=[],
+                    returncode=0,
+                    stdout=(
+                        f"{tag_object}\trefs/tags/v1.2.3\n"
+                        f"{tag_commit}\trefs/tags/v1.2.3^{{}}\n"
+                    ),
+                ),
+            ):
+                revision = runner.resolve_git_source_revision(
+                    "git@github.com:example/demo.git",
+                    "v1.2.3",
+                    log_path,
+                )
+
+            self.assertEqual(revision, tag_commit)
+
+    def test_prepare_shared_repo_reuses_git_cache_when_remote_revision_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_repo_dir = root / "repo"
+            metadata_path = root / "repo-state.json"
+            revision = "a" * 40
+            shared_repo_dir.mkdir()
+            runner.write_json(
+                metadata_path,
+                runner.git_source_signature("git@github.com:example/demo.git", "main", revision),
+            )
+
+            with mock.patch.object(runner, "resolve_git_source_revision", return_value=revision), mock.patch.object(
+                runner,
+                "clone_git_source",
+            ) as clone:
+                repo_dir, reused, _carried = runner.prepare_shared_repo(
+                    source_type="git",
+                    source="git@github.com:example/demo.git",
+                    ref="main",
+                    fetch_log_path=root / "fetch.log",
+                    shared_repo_dir=shared_repo_dir,
+                    shared_repo_metadata_path=metadata_path,
+                )
+
+            self.assertEqual(repo_dir, shared_repo_dir)
+            self.assertTrue(reused)
+            clone.assert_not_called()
+
+    def test_prepare_shared_repo_refreshes_git_cache_when_remote_revision_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_repo_dir = root / "repo"
+            metadata_path = root / "repo-state.json"
+            old_revision = "a" * 40
+            new_revision = "b" * 40
+            shared_repo_dir.mkdir()
+            (shared_repo_dir / "README.md").write_text("old\n", encoding="utf-8")
+            runner.write_json(
+                metadata_path,
+                runner.git_source_signature("git@github.com:example/demo.git", "main", old_revision),
+            )
+
+            def clone_into_staging(_source, _ref, destination, _log_path, _runner_log_path) -> None:
+                destination.mkdir()
+                (destination / "README.md").write_text("new\n", encoding="utf-8")
+
+            with mock.patch.object(runner, "resolve_git_source_revision", return_value=new_revision), mock.patch.object(
+                runner,
+                "clone_git_source",
+                side_effect=clone_into_staging,
+            ) as clone, mock.patch.object(runner, "git_head_commit", return_value=new_revision):
+                repo_dir, reused, _carried = runner.prepare_shared_repo(
+                    source_type="git",
+                    source="git@github.com:example/demo.git",
+                    ref="main",
+                    fetch_log_path=root / "fetch.log",
+                    shared_repo_dir=shared_repo_dir,
+                    shared_repo_metadata_path=metadata_path,
+                )
+
+            self.assertEqual(repo_dir, shared_repo_dir)
+            self.assertFalse(reused)
+            clone.assert_called_once()
+            self.assertEqual((shared_repo_dir / "README.md").read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(
+                runner.read_json(metadata_path),
+                runner.git_source_signature("git@github.com:example/demo.git", "main", new_revision),
+            )
+
+    def test_prepare_shared_repo_does_not_use_git_cache_when_remote_revision_lookup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_repo_dir = root / "repo"
+            metadata_path = root / "repo-state.json"
+            shared_repo_dir.mkdir()
+            runner.write_json(
+                metadata_path,
+                runner.git_source_signature("git@github.com:example/demo.git", "main", "a" * 40),
+            )
+
+            with mock.patch.object(
+                runner,
+                "resolve_git_source_revision",
+                side_effect=RuntimeError("remote lookup failed"),
+            ), mock.patch.object(runner, "clone_git_source") as clone:
+                with self.assertRaisesRegex(RuntimeError, "remote lookup failed"):
+                    runner.prepare_shared_repo(
+                        source_type="git",
+                        source="git@github.com:example/demo.git",
+                        ref="main",
+                        fetch_log_path=root / "fetch.log",
+                        shared_repo_dir=shared_repo_dir,
+                        shared_repo_metadata_path=metadata_path,
+                    )
+
+            clone.assert_not_called()
+
     def test_prepare_shared_repo_carries_forward_existing_dockerfile_for_local_source_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1817,6 +1940,161 @@ class RunnerProjectSlugTests(unittest.TestCase):
                 "Dockerfile prunes devDependencies even though next.config.ts requires TypeScript to remain available at runtime",
                 findings,
             )
+
+    def test_validate_generated_files_accepts_nextjs_ts_config_with_globally_installed_pnpm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            (repo_dir / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "next-npm-service",
+                        "private": True,
+                        "scripts": {"build": "next build", "start": "next start"},
+                        "dependencies": {"next": "^15.1.0", "react": "^19.0.0", "react-dom": "^19.0.0"},
+                        "devDependencies": {"typescript": "^5.7.0"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "package-lock.json").write_text("{}\n", encoding="utf-8")
+            (repo_dir / "next.config.ts").write_text("export default {}\n", encoding="utf-8")
+            (repo_dir / "Dockerfile").write_text(
+                "\n".join(
+                    [
+                        "FROM node:22-bookworm-slim",
+                        "WORKDIR /app",
+                        "COPY package.json package-lock.json ./",
+                        "RUN npm ci",
+                        "RUN npm install --global pnpm",
+                        "COPY . .",
+                        "RUN npm run build",
+                        'CMD ["./node_modules/.bin/next", "start"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (repo_dir / "PROJECT_ONBOARDING.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_ONBOARDING",
+                        "## 1 项目基础信息",
+                        "## 2 代码和版本信息",
+                        "## 3 启动信息",
+                        "## 4 运行参数",
+                        "## 5 配置与密钥",
+                        "## 6 存储信息",
+                        "## 7 证据与判断说明",
+                        "## 8 待确认问题",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            findings, warnings = runner.validate_generated_files(
+                repo_dir,
+                source_type="git",
+                source="https://example.com/demo.git",
+                ref="main",
+            )
+
+            self.assertEqual(findings, [])
+            self.assertEqual(warnings, [])
+
+    def test_repair_deterministic_dockerfile_findings_adds_pnpm_for_nextjs_ts_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            dockerfile_path = repo_dir / "Dockerfile"
+            dockerfile_path.write_text(
+                "\n".join(
+                    [
+                        "FROM node:22-alpine",
+                        "WORKDIR /app",
+                        "COPY package.json package-lock.json ./",
+                        "RUN npm ci",
+                        "COPY . .",
+                        "RUN npm run build",
+                        'CMD ["./node_modules/.bin/next", "start"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            findings = [
+                "Dockerfile may not provide pnpm at runtime even though next.config.ts can trigger pnpm-based TypeScript installation during next start"
+            ]
+            analysis = {"has_nextjs_ts_config": True, "requires_build_step": True}
+
+            repairs = runner.repair_deterministic_dockerfile_findings(repo_dir, findings, analysis)
+
+            self.assertEqual(repairs, ["provided pnpm with npm global install"])
+            self.assertIn("RUN npm install --global pnpm", dockerfile_path.read_text(encoding="utf-8"))
+            self.assertTrue(runner.dockerfile_provides_pnpm(dockerfile_path.read_text(encoding="utf-8")))
+
+    def test_regressed_dockerfile_capabilities_reports_lost_pnpm_and_build_step(self) -> None:
+        analysis = {"has_nextjs_ts_config": True, "requires_build_step": True}
+        before = "\n".join(
+            [
+                "FROM node:22-alpine",
+                "RUN npm install --global pnpm",
+                "COPY . .",
+                "RUN npm run build",
+                'CMD ["./node_modules/.bin/next", "start"]',
+            ]
+        )
+        after = "\n".join(
+            [
+                "FROM node:22-alpine",
+                "COPY . .",
+                'CMD ["./node_modules/.bin/next", "start"]',
+            ]
+        )
+
+        regressions = runner.regressed_dockerfile_capabilities(
+            runner.dockerfile_runtime_capabilities(before, analysis),
+            runner.dockerfile_runtime_capabilities(after, analysis),
+        )
+
+        self.assertEqual(regressions, ["application build step", "pnpm runtime availability"])
+
+    def test_repair_deterministic_dockerfile_findings_removes_invalid_port_and_prune_and_adds_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir)
+            dockerfile_path = repo_dir / "Dockerfile"
+            dockerfile_path.write_text(
+                "\n".join(
+                    [
+                        "FROM node:22-alpine",
+                        "ENV PORT=UNKNOWN",
+                        "EXPOSE UNKNOWN",
+                        "RUN pnpm install && pnpm prune --prod",
+                        'CMD ["node", "server.js"]',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            findings = [
+                "Dockerfile prunes devDependencies even though next.config.ts requires TypeScript to remain available at runtime",
+                "Dockerfile uses UNKNOWN in EXPOSE for a runtime-critical port; omit EXPOSE when the port is not confirmed",
+                "Dockerfile sets PORT=UNKNOWN; omit the PORT default until a concrete port is confirmed",
+                "Dockerfile does not install sqlite3 even though runtime evidence indicates sqlite3 is required",
+                "Dockerfile does not install ffmpeg even though runtime evidence indicates ffmpeg is required",
+            ]
+
+            repairs = runner.repair_deterministic_dockerfile_findings(repo_dir, findings, {})
+
+            repaired = dockerfile_path.read_text(encoding="utf-8")
+            self.assertIn("preserved TypeScript dependencies by removing production prune", repairs)
+            self.assertIn("removed UNKNOWN runtime port placeholders", repairs)
+            self.assertIn("installed runtime package sqlite3", repairs)
+            self.assertIn("installed runtime package ffmpeg", repairs)
+            self.assertNotIn("UNKNOWN", repaired)
+            self.assertNotIn("pnpm prune --prod", repaired)
+            self.assertIn("RUN apk add --no-cache sqlite3", repaired)
+            self.assertIn("RUN apk add --no-cache ffmpeg", repaired)
 
     def test_parse_onboarding_run_spec_ignores_unknown_placeholder_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

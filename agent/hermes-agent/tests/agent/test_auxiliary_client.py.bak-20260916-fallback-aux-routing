@@ -107,38 +107,6 @@ class TestAuxiliaryMaxTokensParam:
 
 
 class TestResolveTaskProviderModel:
-    def test_runtime_route_overrides_static_auxiliary_task_config(self):
-        """A fallback route must take precedence within its current session."""
-        static_config = {
-            "provider": "custom",
-            "model": "primary-vision",
-            "base_url": "https://primary.example/v1",
-            "api_key": "primary-key",
-            "api_mode": "chat_completions",
-        }
-        runtime = {
-            "auxiliary_routes": {
-                "vision": {
-                    "provider": "custom",
-                    "model": "fallback-vision",
-                    "base_url": "https://fallback.example/v1",
-                    "api_key": "fallback-key",
-                    "api_mode": "codex_responses",
-                }
-            }
-        }
-
-        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=static_config):
-            resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
-                task="vision", main_runtime=runtime
-            )
-
-        assert resolved_provider == "custom"
-        assert model == "fallback-vision"
-        assert base_url == "https://fallback.example/v1"
-        assert api_key == "fallback-key"
-        assert api_mode == "codex_responses"
-
     @pytest.mark.parametrize(
         "provider",
         [

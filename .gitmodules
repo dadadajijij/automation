@@ -1,3 +1,6 @@
 [submodule "agent/skills/agora-skills"]
 	path = agent/skills/agora-skills
 	url = ssh://git@git.agoralab.co/ai/agora-skills.git
+[submodule "agent/skills/orobas-agora-support"]
+	path = agent/skills/orobas-agora-support
+	url = git@github.com:JamieLiu67/orobas-agora-support.git

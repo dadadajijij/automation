@@ -68,6 +68,7 @@ from subpath import (
     is_vue_cli_project as subpath_is_vue_cli_project,
     normalize_python_hint_path as subpath_normalize_python_hint_path,
     prepare_subpath_sources as subpath_prepare_subpath_sources,
+    find_python_embedded_html_files as subpath_find_python_embedded_html_files,
     resolve_entrypoint_relative_dir as subpath_resolve_entrypoint_relative_dir,
     resolve_python_hint_directory as subpath_resolve_python_hint_directory,
     rewrite_frontend_subpath_urls as subpath_rewrite_frontend_subpath_urls,
@@ -81,9 +82,11 @@ from subpath import (
     rewrite_frontend_eventsource_urls as subpath_rewrite_frontend_eventsource_urls,
     rewrite_frontend_return_value_urls as subpath_rewrite_frontend_return_value_urls,
     rewrite_origin_based_subpath_logic as subpath_rewrite_origin_based_subpath_logic,
+    rewrite_python_embedded_html_subpath_urls as subpath_rewrite_python_embedded_html_subpath_urls,
     run_runtime_subpath_audit as subpath_run_runtime_subpath_audit,
     run_static_subpath_audit as subpath_run_static_subpath_audit,
     runtime_subpath_phase as subpath_runtime_subpath_phase,
+    scan_python_embedded_html_findings as subpath_scan_python_embedded_html_findings,
     scan_subpath_findings as subpath_scan_subpath_findings,
     vite_project_roots as subpath_vite_project_roots,
     workspace_frontend_package_dirs as subpath_workspace_frontend_package_dirs,
@@ -109,6 +112,7 @@ CODEX_GENERATION_RETRY_DELAY_SECONDS = 2
 GIT_CLONE_TIMEOUT_SECONDS = 180
 GIT_CLONE_MAX_ATTEMPTS = 3
 GIT_CLONE_RETRY_DELAY_SECONDS = 2
+GIT_REMOTE_REVISION_TIMEOUT_SECONDS = 30
 RUN_READY_TIMEOUT_SECONDS = 60
 RUN_READY_POLL_INTERVAL_SECONDS = 2
 DEFAULT_EXTERNAL_ACCESS_HOST = "athena.agoralab.co"
@@ -900,12 +904,15 @@ def local_source_signature(source: Path, dst: Path) -> Dict[str, object]:
     }
 
 
-def git_source_signature(source: str, ref: Optional[str]) -> Dict[str, object]:
-    return {
+def git_source_signature(source: str, ref: Optional[str], resolved_commit: Optional[str] = None) -> Dict[str, object]:
+    signature: Dict[str, object] = {
         "source_type": "git",
         "source": source,
         "ref": ref,
     }
+    if resolved_commit:
+        signature["resolved_commit"] = resolved_commit
+    return signature
 
 
 def shared_repo_matches(
@@ -1003,6 +1010,108 @@ def diagnose_git_failure(output: str) -> Optional[str]:
     if "repository not found" in lowered and "github.com" in lowered:
         return "Git fetch failed because the repository is private or unavailable to the current credentials."
     return None
+
+
+def resolve_git_source_revision(
+    source: str,
+    ref: Optional[str],
+    log_path: Path,
+) -> str:
+    if ref and re.fullmatch(r"[0-9a-fA-F]{40}", ref):
+        return ref.lower()
+
+    ref_patterns = ["HEAD"]
+    if ref:
+        normalized_ref = ref if ref.startswith("refs/") else f"refs/heads/{ref}"
+        ref_patterns = [normalized_ref]
+        if not ref.startswith("refs/"):
+            ref_patterns.extend([f"refs/tags/{ref}", f"refs/tags/{ref}^{{}}"])
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    source_attempts: List[Tuple[str, str]] = []
+    ssh_url = github_https_to_ssh_url(source)
+    if ssh_url:
+        source_attempts.append((ssh_url, "ssh"))
+    source_attempts.append((source, "https" if source.startswith("https://") else "ssh"))
+    last_output = ""
+
+    for source_url, transport in source_attempts:
+        askpass_dir: Optional[Path] = None
+        try:
+            for attempt in range(1, GIT_CLONE_MAX_ATTEMPTS + 1):
+                git_env = dict(os.environ)
+                git_env["GIT_TERMINAL_PROMPT"] = "0"
+                if transport == "https" and source_url.startswith("https://github.com/") and token:
+                    if askpass_dir is not None:
+                        remove_path(askpass_dir)
+                    askpass_dir = Path(tempfile.mkdtemp(prefix="git-askpass-", dir="/tmp"))
+                    askpass_path = askpass_dir / "askpass.sh"
+                    write_text(
+                        askpass_path,
+                        "#!/bin/sh\n"
+                        'case "$1" in\n'
+                        '*Username*) printf "%s\\n" "x-access-token" ;;\n'
+                        '*Password*) printf "%s\\n" "$GITHUB_TOKEN" ;;\n'
+                        '*) printf "%s\\n" "" ;;\n'
+                        "esac\n",
+                    )
+                    askpass_path.chmod(0o700)
+                    git_env["GIT_ASKPASS"] = str(askpass_path)
+                    git_env["GITHUB_TOKEN"] = token
+                command = ["git"]
+                if transport == "https":
+                    command.extend(["-c", "http.version=HTTP/1.1"])
+                command.extend(["ls-remote", source_url, *ref_patterns])
+                append_text(
+                    log_path,
+                    f"[git_remote_revision_attempt] transport={transport} attempt={attempt} args={json.dumps(command, ensure_ascii=False)}\n",
+                )
+                result = run_command(
+                    command,
+                    env=git_env,
+                    log_path=log_path,
+                    timeout=GIT_REMOTE_REVISION_TIMEOUT_SECONDS,
+                )
+                if result.returncode == 0:
+                    revisions: Dict[str, str] = {}
+                    for line in result.stdout.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 2 and re.fullmatch(r"[0-9a-fA-F]{40}", parts[0]):
+                            revisions[parts[1]] = parts[0].lower()
+                    if ref is None and revisions.get("HEAD"):
+                        return revisions["HEAD"]
+                    if ref:
+                        tag_ref = f"refs/tags/{ref}"
+                        branch_ref = f"refs/heads/{ref}"
+                        revision = revisions.get(f"{tag_ref}^{{}}") or revisions.get(branch_ref) or revisions.get(tag_ref)
+                        if revision:
+                            return revision
+                    last_output = f"remote ref {ref or 'HEAD'} was not found"
+                    break
+                last_output = result.stdout
+                if attempt >= GIT_CLONE_MAX_ATTEMPTS or not should_retry_git_failure(last_output):
+                    break
+                append_text(
+                    log_path,
+                    f"[git_remote_revision_retry] transport={transport} attempt={attempt} sleeping_seconds={GIT_CLONE_RETRY_DELAY_SECONDS}\n",
+                )
+                time.sleep(GIT_CLONE_RETRY_DELAY_SECONDS)
+        finally:
+            if askpass_dir is not None:
+                remove_path(askpass_dir)
+        if last_output:
+            append_text(
+                log_path,
+                f"[git_remote_revision_transport_failed] transport={transport} diagnosis={diagnose_git_failure(last_output) or 'UNKNOWN'}\n",
+            )
+    raise RuntimeError(f"git remote revision lookup failed:\n{last_output}")
+
+
+def git_head_commit(repo_dir: Path) -> str:
+    result = run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    revision = result.stdout.strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise RuntimeError(f"could not resolve cloned repository HEAD:\n{result.stdout}")
+    return revision
 
 
 def clone_git_source(source: str, ref: Optional[str], dst: Path, log_path: Path, runner_log_path: Optional[Path]) -> None:
@@ -3071,6 +3180,34 @@ def find_frontend_rewrite_targets(repo_dir: Path) -> List[Path]:
     )
 
 
+def find_python_embedded_html_files(repo_dir: Path) -> List[Path]:
+    return subpath_find_python_embedded_html_files(
+        repo_dir,
+        collect_matching_files=collect_matching_files,
+        read_text_if_exists=read_text_if_exists,
+    )
+
+
+def scan_python_embedded_html_findings(repo_dir: Path, project_slug: str) -> List[SubpathAuditFinding]:
+    return subpath_scan_python_embedded_html_findings(
+        repo_dir,
+        project_slug,
+        collect_matching_files=collect_matching_files,
+        read_text_if_exists=read_text_if_exists,
+    )
+
+
+def rewrite_python_embedded_html_subpath_urls(file_path: Path, base_path: str, repo_dir: Path) -> bool:
+    return subpath_rewrite_python_embedded_html_subpath_urls(
+        file_path,
+        base_path,
+        repo_dir,
+        read_text=read_text,
+        write_text=write_text,
+        read_text_if_exists=read_text_if_exists,
+    )
+
+
 def discover_runtime_root_frontend_files(repo_dir: Path, *, include_code_files: bool) -> List[Path]:
     return subpath_discover_runtime_root_frontend_files(
         repo_dir,
@@ -3430,9 +3567,10 @@ def prepare_shared_repo(
         remove_path(shared_repo_dir)
         staging_dir.replace(shared_repo_dir)
     else:
-        signature = git_source_signature(source, ref)
         if fetch_log_path is None:
             raise ValueError("fetch_log_path is required for git sources")
+        resolved_revision = resolve_git_source_revision(source, ref, fetch_log_path)
+        signature = git_source_signature(source, ref, resolved_revision)
         if shared_repo_matches(signature, shared_repo_dir, shared_repo_metadata_path):
             return shared_repo_dir, True, carried_forward_outputs
         staging_dir = shared_repo_dir.parent / f"{shared_repo_dir.name}.tmp-{utc_now_stamp()}"
@@ -3444,6 +3582,7 @@ def prepare_shared_repo(
                 remove_path(generated_path)
         remove_path(shared_repo_dir)
         staging_dir.replace(shared_repo_dir)
+        signature = git_source_signature(source, ref, git_head_commit(shared_repo_dir))
 
     write_json(shared_repo_metadata_path, signature)
     return shared_repo_dir, False, carried_forward_outputs
@@ -3788,6 +3927,156 @@ def normalize_dockerfile_install_text(docker_text: str) -> str:
     return re.sub(r"\\\s*\n\s*", " ", docker_text)
 
 
+def dockerfile_provides_pnpm(docker_text: str) -> bool:
+    """Return whether the Dockerfile contains an accepted pnpm availability signal."""
+    normalized = normalize_dockerfile_install_text(docker_text)
+    patterns = [
+        r"\bcorepack\s+enable\b",
+        r"\bcorepack\s+(?:prepare|install)\s+pnpm(?:@[^\s;&|]+)?\b[^\n;&|]*\s--activate\b",
+        r"\bpnpm\s+(?:install|i)\b",
+        r"\bnpm\s+(?:install|i)\b(?=[^\n;&|]*\s(?:--global|-g)\b)(?=[^\n;&|]*\bpnpm(?:@[^\s;&|]+)?\b)",
+        r"\bnpm\s+(?:--global|-g)\s+(?:install|i)\b(?=[^\n;&|]*\bpnpm(?:@[^\s;&|]+)?\b)",
+    ]
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
+
+
+def dockerfile_runtime_capabilities(docker_text: str, analysis: Dict[str, object]) -> Dict[str, bool]:
+    has_nextjs_ts_config = bool(analysis.get("has_nextjs_ts_config"))
+    requires_build_step = bool(analysis.get("requires_build_step"))
+    return {
+        "json_entrypoint": "CMD [" in docker_text or "ENTRYPOINT [" in docker_text,
+        "build_step": not requires_build_step or dockerfile_has_build_step(docker_text),
+        "pnpm_runtime": not has_nextjs_ts_config or dockerfile_provides_pnpm(docker_text),
+        "nextjs_typescript_retained": not has_nextjs_ts_config
+        or not re.search(r"\b(?:pnpm\s+prune\s+--prod|npm\s+prune\s+--omit=dev)\b", docker_text),
+    }
+
+
+def regressed_dockerfile_capabilities(
+    previous: Dict[str, bool],
+    current: Dict[str, bool],
+) -> List[str]:
+    labels = {
+        "json_entrypoint": "JSON-form CMD or ENTRYPOINT",
+        "build_step": "application build step",
+        "pnpm_runtime": "pnpm runtime availability",
+        "nextjs_typescript_retained": "Next.js TypeScript runtime dependency retention",
+    }
+    return [labels[key] for key, was_available in previous.items() if was_available and not current.get(key, False)]
+
+
+def repair_deterministic_dockerfile_findings(
+    repo_dir: Path,
+    findings: List[str],
+    analysis: Dict[str, object],
+) -> List[str]:
+    dockerfile_path = repo_dir / "Dockerfile"
+    if not dockerfile_path.exists():
+        return []
+    original = read_text(dockerfile_path)
+    rewritten = original
+    repairs: List[str] = []
+    pnpm_finding = (
+        "Dockerfile may not provide pnpm at runtime even though next.config.ts can trigger "
+        "pnpm-based TypeScript installation during next start"
+    )
+    if pnpm_finding in findings and not dockerfile_provides_pnpm(rewritten):
+        from_match = re.search(r"^FROM\s+[^\n]+\n", rewritten, re.MULTILINE | re.IGNORECASE)
+        if from_match:
+            rewritten = (
+                rewritten[: from_match.end()]
+                + "\nRUN npm install --global pnpm\n"
+                + rewritten[from_match.end() :]
+            )
+            repairs.append("provided pnpm with npm global install")
+
+    prune_finding = "Dockerfile prunes devDependencies even though next.config.ts requires TypeScript to remain available at runtime"
+    if prune_finding in findings:
+        without_prune = re.sub(
+            r"\s*&&\s*(?:pnpm\s+prune\s+--prod|npm\s+prune\s+--omit=dev)",
+            "",
+            rewritten,
+            flags=re.IGNORECASE,
+        )
+        without_prune = re.sub(
+            r"^\s*RUN\s+(?:pnpm\s+prune\s+--prod|npm\s+prune\s+--omit=dev)\s*\n?",
+            "",
+            without_prune,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+        if without_prune != rewritten:
+            rewritten = without_prune
+            repairs.append("preserved TypeScript dependencies by removing production prune")
+
+    unknown_port_findings = {
+        "Dockerfile uses UNKNOWN in EXPOSE for a runtime-critical port; omit EXPOSE when the port is not confirmed",
+        "Dockerfile sets PORT=UNKNOWN; omit the PORT default until a concrete port is confirmed",
+    }
+    if unknown_port_findings.intersection(findings):
+        without_unknown_ports = re.sub(
+            r"^\s*(?:EXPOSE\s+UNKNOWN\b|ENV\s+PORT\s*=\s*UNKNOWN\b)\s*\n?",
+            "",
+            rewritten,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+        if without_unknown_ports != rewritten:
+            rewritten = without_unknown_ports
+            repairs.append("removed UNKNOWN runtime port placeholders")
+
+    def add_system_package(package_name: str, finding: str) -> None:
+        nonlocal rewritten
+        if finding not in findings or package_name in rewritten:
+            return
+        from_lines = re.findall(r"^FROM\s+([^\s]+)", rewritten, re.MULTILINE | re.IGNORECASE)
+        if len(from_lines) != 1:
+            return
+        base_image = from_lines[0].lower()
+        from_match = re.search(r"^FROM\s+[^\n]+\n", rewritten, re.MULTILINE | re.IGNORECASE)
+        if from_match is None:
+            return
+        if "alpine" in base_image:
+            install_command = f"RUN apk add --no-cache {package_name}"
+        elif any(token in base_image for token in ("debian", "ubuntu", "bookworm", "bullseye", "slim")):
+            install_command = (
+                f"RUN apt-get update && apt-get install -y --no-install-recommends {package_name} "
+                "&& rm -rf /var/lib/apt/lists/*"
+            )
+        else:
+            return
+        rewritten = rewritten[: from_match.end()] + f"\n{install_command}\n" + rewritten[from_match.end() :]
+        repairs.append(f"installed runtime package {package_name}")
+
+    add_system_package(
+        "sqlite3",
+        "Dockerfile does not install sqlite3 even though runtime evidence indicates sqlite3 is required",
+    )
+    add_system_package(
+        "ffmpeg",
+        "Dockerfile does not install ffmpeg even though runtime evidence indicates ffmpeg is required",
+    )
+
+    missing_build_findings = {
+        "Dockerfile is missing an application build step even though package.json.scripts.build exists",
+        "Dockerfile start command appears to require built artifacts, but no build step was detected",
+    }
+    if missing_build_findings.intersection(findings) and not dockerfile_has_build_step(rewritten):
+        build_commands = analysis.get("required_build_commands", [])
+        if isinstance(build_commands, list) and len(build_commands) == 1 and isinstance(build_commands[0], str):
+            build_command = build_commands[0].strip()
+            if build_command:
+                insertion = f"RUN {build_command}\n\n"
+                command_match = re.search(r"^\s*(?:CMD|ENTRYPOINT)\s+", rewritten, re.MULTILINE | re.IGNORECASE)
+                if command_match:
+                    rewritten = rewritten[: command_match.start()] + insertion + rewritten[command_match.start() :]
+                else:
+                    rewritten = rewritten.rstrip() + "\n\n" + insertion
+                repairs.append(f"added required build command {build_command}")
+
+    if rewritten != original:
+        write_text(dockerfile_path, rewritten)
+    return repairs
+
+
 def dockerfile_uses_requirements_txt_install(docker_text: str) -> bool:
     normalized = normalize_dockerfile_install_text(docker_text)
     patterns = [
@@ -3884,14 +4173,15 @@ def validate_generated_files(
             dockerfile_findings.append("Dockerfile start command appears to require built artifacts, but no build step was detected")
         elif isinstance(node_entry_command, str) and "dist/" in node_entry_command and not has_build_step:
             dockerfile_findings.append("Dockerfile start command appears to require built artifacts, but no build step was detected")
-        if package_manager == "pnpm" and "pnpm" in docker_text and "corepack enable" not in docker_text and "pnpm install" not in docker_text:
+        pnpm_available = dockerfile_provides_pnpm(docker_text)
+        if package_manager == "pnpm" and "pnpm" in docker_text and not pnpm_available:
             warnings.append("Dockerfile references pnpm but does not clearly enable or install pnpm in the image")
         if has_nextjs_ts_config:
             runs_next_start = bool(re.search(r'next["\s,-]+start|\bnext start\b', docker_text))
             if runs_next_start:
                 if "typescript" not in docker_text and "pnpm install" in docker_text and "pnpm prune --prod" in docker_text:
                     dockerfile_findings.append("Dockerfile prunes devDependencies even though next.config.ts requires TypeScript to remain available at runtime")
-                if "corepack enable" not in docker_text and '"pnpm"' not in docker_text and "pnpm " not in docker_text:
+                if not pnpm_available:
                     dockerfile_findings.append("Dockerfile may not provide pnpm at runtime even though next.config.ts can trigger pnpm-based TypeScript installation during next start")
         if "sqlite3" in system_dependencies and "sqlite3" not in docker_text and "sqlite" not in docker_text:
             dockerfile_findings.append("Dockerfile does not install sqlite3 even though runtime evidence indicates sqlite3 is required")
@@ -4505,6 +4795,8 @@ def main() -> int:
                 ensure_cra_homepage_fn=ensure_cra_homepage,
                 find_frontend_rewrite_targets=find_frontend_rewrite_targets,
                 rewrite_frontend_subpath_urls=rewrite_frontend_subpath_urls,
+                find_python_embedded_html_files=find_python_embedded_html_files,
+                rewrite_python_embedded_html_subpath_urls=rewrite_python_embedded_html_subpath_urls,
             ),
             run_static_subpath_audit=lambda repo_dir_arg, slug_arg, plan_arg: subpath_run_static_subpath_audit(
                 repo_dir_arg,
@@ -4514,6 +4806,8 @@ def main() -> int:
                 detect_frontend_runtime_roots=detect_frontend_runtime_roots,
                 vite_project_roots=vite_project_roots,
                 read_text=read_text,
+                find_python_embedded_html_files=find_python_embedded_html_files,
+                scan_python_embedded_html_findings=scan_python_embedded_html_findings,
             ),
             auto_fix_subpath_issues=lambda repo_dir_arg, slug_arg, plan_arg: subpath_auto_fix_subpath_issues(
                 repo_dir_arg,
@@ -4577,6 +4871,8 @@ def main() -> int:
                     read_text=read_text,
                     write_text=write_text,
                 ),
+                find_python_embedded_html_files=find_python_embedded_html_files,
+                rewrite_python_embedded_html_subpath_urls=rewrite_python_embedded_html_subpath_urls,
                 sorted_unique=sorted_unique,
             ),
             sorted_unique=sorted_unique,
@@ -4804,9 +5100,33 @@ def main() -> int:
             args.ref,
             generation_mode,
         )
+        deterministic_repairs: List[str] = []
+        if findings and not prebuilt_outputs and generation_mode != "onboarding_only":
+            deterministic_repairs = repair_deterministic_dockerfile_findings(repo_dir, findings, analysis)
+            if deterministic_repairs:
+                artifacts["deterministic_dockerfile_repairs"] = deterministic_repairs
+                result["artifacts"] = artifacts
+                append_text(
+                    runner_log_path,
+                    f"[{datetime.now(timezone.utc).isoformat()}] deterministic_dockerfile_repairs repairs={json_dumps_safe(deterministic_repairs)}\n",
+                )
+                findings, warnings = validate_generated_files(
+                    repo_dir,
+                    args.source_type,
+                    args.source,
+                    args.ref,
+                    generation_mode,
+                )
         retried_after_validation = False
         if findings and not prebuilt_outputs:
             retried_after_validation = True
+            dockerfile_path = repo_dir / "Dockerfile"
+            previous_dockerfile = read_text(dockerfile_path) if dockerfile_path.exists() else None
+            previous_capabilities = (
+                dockerfile_runtime_capabilities(previous_dockerfile, analysis)
+                if previous_dockerfile is not None
+                else {}
+            )
             append_text(
                 runner_log_path,
                 f"[{datetime.now(timezone.utc).isoformat()}] validation_retry findings={json_dumps_safe(findings)} warnings={json_dumps_safe(warnings)}\n",
@@ -4824,6 +5144,25 @@ def main() -> int:
                 validation_warnings=warnings,
                 runner_log_path=runner_log_path,
             )
+            if previous_dockerfile is not None and dockerfile_path.exists():
+                current_dockerfile = read_text(dockerfile_path)
+                regressions = regressed_dockerfile_capabilities(
+                    previous_capabilities,
+                    dockerfile_runtime_capabilities(current_dockerfile, analysis),
+                )
+                if regressions:
+                    write_text(dockerfile_path, previous_dockerfile)
+                    artifacts["dockerfile_capability_regressions"] = regressions
+                    result["artifacts"] = artifacts
+                    append_warning(
+                        result,
+                        "Discarded regenerated Dockerfile because it removed required capabilities: "
+                        + ", ".join(regressions),
+                    )
+                    append_text(
+                        runner_log_path,
+                        f"[{datetime.now(timezone.utc).isoformat()}] dockerfile_capability_regression restored_previous=true regressions={json_dumps_safe(regressions)}\n",
+                    )
             generated_files = []
             for name in ("Dockerfile", "PROJECT_ONBOARDING.md"):
                 if (repo_dir / name).exists():

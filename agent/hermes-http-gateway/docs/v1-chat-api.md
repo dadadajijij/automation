@@ -149,7 +149,7 @@ URL 校验：
 - 会检查响应 `Content-Type` 和图片文件魔数，不能只靠 URL 后缀伪装。
 - 传给 Hermes 时，图片按顺序追加为多个 `--image <local_image_path>`。
 - 有图片附件时同样会追加 `--attachment-root <session_attachment_dir>`。
-- prompt 里会追加 `附件图片：` 段落，每张图片以 `@file:<local_image_path>` 引用。
+- prompt 里会追加自然语言提示，例如 `本轮请求包含 2 张图片附件，请结合随请求传入的图片进行回答。`；图片路径不会以 `@file:` 形式注入 prompt。
 
 `type=file` 的行为：
 
@@ -214,8 +214,7 @@ curl -X POST "http://127.0.0.1:8011/v1/chat" \
 ```text
 <question.text>
 
-附件图片：
-- @file:/tmp/hermes/2026-08-26/demo-session/<sha256>.png
+本轮请求包含 1 张图片附件，请结合随请求传入的图片进行回答。
 ```
 
 有文件时：
