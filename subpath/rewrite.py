@@ -259,6 +259,28 @@ def wrap_runtime_tool_base_expr(path_expr: str) -> str:
     return f'(Reflect.get(window, "withToolBase")?.({path_expr}) ?? {path_expr})'
 
 
+_JSX_ROOT_RELATIVE_PATH_ATTRIBUTE_PATTERN = re.compile(
+    r'(?P<prefix><[A-Za-z][A-Za-z0-9:.-]*\b[^>]*?\bpath\s*=\s*)'
+    r'(?P<quote>["\'])(?P<url>/(?!/)[^"\']*)(?P=quote)'
+)
+
+
+def rewrite_jsx_root_relative_path_attributes(text: str) -> str:
+    """Rewrite JSX path attributes without producing invalid JSX syntax.
+
+    The generic JavaScript assignment rewrite also matches ``path="/"`` in
+    JSX. JSX requires an expression attribute to be wrapped in braces, so
+    handle this shape before the generic rules run.
+    """
+
+    def replace_attribute(match: re.Match[str]) -> str:
+        quote = match.group("quote")
+        url = f"{quote}{match.group('url')}{quote}"
+        return f"{match.group('prefix')}{{{wrap_runtime_tool_base_expr(url)}}}"
+
+    return _JSX_ROOT_RELATIVE_PATH_ATTRIBUTE_PATTERN.sub(replace_attribute, text)
+
+
 _INLINE_HTML_API_FETCH_PATH_PATTERN = re.compile(
     r"(?P<header>"
     r"(?:async\s+)?function\s+api\s*\(\s*"
@@ -439,7 +461,7 @@ def _rewrite_dynamic_html_attr_fragments_in_js_text(text: str) -> str:
 
 
 def _rewrite_client_request_text(text: str) -> str:
-    rewritten = text
+    rewritten = rewrite_jsx_root_relative_path_attributes(text)
     rewritten = _rewrite_request_api_text(rewritten)
     rewritten = _rewrite_navigation_text(rewritten)
     rewritten = _rewrite_eventsource_text(rewritten)

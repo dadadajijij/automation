@@ -11,6 +11,7 @@ from subpath.adapters import (
     auto_fix_nextjs_subpath_issues,
     ensure_cra_homepage,
     ensure_nextjs_helper_module,
+    ensure_vite_preview_allowed_host,
     ensure_vite_base_config,
     ensure_vue_cli_public_path,
 )
@@ -35,6 +36,39 @@ class SubpathAdaptersTests(unittest.TestCase):
 
             self.assertEqual(changed, ["vite.config.ts"])
             self.assertIn('base: "/tools2/demo-vite/"', config_path.read_text(encoding="utf-8"))
+
+    def test_ensure_vite_preview_allowed_host_adds_host_to_function_config(self) -> None:
+        original = (
+            "import { defineConfig } from 'vite'\n"
+            "export default defineConfig(() => {\n"
+            "  return {\n"
+            "    base: './',\n"
+            "  }\n"
+            "})\n"
+        )
+        rewritten = ensure_vite_preview_allowed_host(original, "athena.agoralab.co")
+        self.assertIn(
+            'preview: { allowedHosts: ["athena.agoralab.co"] },',
+            rewritten,
+        )
+
+    def test_ensure_vite_preview_allowed_host_merges_existing_array_and_is_idempotent(self) -> None:
+        original = (
+            "export default {\n"
+            "  preview: { allowedHosts: ['localhost'] },\n"
+            "}\n"
+        )
+        once = ensure_vite_preview_allowed_host(original, "athena.agoralab.co")
+        twice = ensure_vite_preview_allowed_host(once, "athena.agoralab.co")
+        self.assertIn("allowedHosts: ['localhost', \"athena.agoralab.co\"]", once)
+        self.assertEqual(once, twice)
+
+    def test_ensure_vite_preview_allowed_host_preserves_true(self) -> None:
+        original = "export default { preview: { allowedHosts: true } }\n"
+        self.assertEqual(
+            ensure_vite_preview_allowed_host(original, "athena.agoralab.co"),
+            original,
+        )
 
     def test_ensure_vue_cli_public_path_writes_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

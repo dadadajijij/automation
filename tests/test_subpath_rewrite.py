@@ -49,6 +49,28 @@ class SubpathRewriteTests(unittest.TestCase):
         twice = self._rewrite_request_api_text(once)
         self.assertEqual(twice, once)
 
+    def test_rewrite_client_request_text_keeps_jsx_path_attributes_valid(self) -> None:
+        original = '<Route path="/" element={<Home />} />'
+        rewritten = subpath_rewrite._rewrite_client_request_text(original)
+        self.assertIn(
+            'path={(Reflect.get(window, "withToolBase")?.("/") ?? "/")}',
+            rewritten,
+        )
+        self.assertNotIn('path=(', rewritten)
+        self.assertEqual(
+            subpath_rewrite._rewrite_client_request_text(rewritten),
+            rewritten,
+        )
+
+    def test_rewrite_client_request_text_rewrites_js_path_assignments(self) -> None:
+        rewritten = subpath_rewrite._rewrite_client_request_text(
+            'const path = "/api/jobs";\n'
+        )
+        self.assertIn(
+            'const path = (Reflect.get(window, "withToolBase")?.("/api/jobs") ?? "/api/jobs");',
+            rewritten,
+        )
+
     def test_rewrite_inline_html_api_fetch_path_rewrites_wrapped_fetch_path(self) -> None:
         rewritten = self._rewrite_inline_html_api_fetch_path(
             "async function api(path, options) {\n"

@@ -3308,6 +3308,7 @@ def ensure_vite_base_config(repo_dir: Path, project_slug: str) -> List[str]:
         vite_config_file=vite_config_file,
         read_text=read_text,
         write_text=write_text,
+        preview_allowed_host=DEFAULT_EXTERNAL_ACCESS_HOST,
     )
 
 
@@ -4788,6 +4789,7 @@ def main() -> int:
                     parse_package_json=parse_package_json,
                     read_text=read_text,
                     write_text=write_text,
+                    preview_allowed_host=DEFAULT_EXTERNAL_ACCESS_HOST,
                 ),
                 apply_nextjs_subpath_adapter_fn=apply_nextjs_subpath_adapter,
                 apply_vite_subpath_adapter_fn=apply_vite_subpath_adapter,

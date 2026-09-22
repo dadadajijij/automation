@@ -62,5 +62,8 @@
   "csfanzha": {
     "port": "8014:3000",
     "env_file":"/home/devops/ka/data/csfanzha/env"
+  },
+  "abtestcompare": {
+  "port": "8015:4173"
   }
 }

@@ -12,6 +12,124 @@ NEXTJS_RUNTIME_SHIM_BASENAME = "ka_tool_base_runtime"
 NEXTJS_WINDOW_TYPES_BASENAME = "ka_tool_window"
 
 
+def _vite_allowed_host_literal(host: str) -> str:
+    return json.dumps(host, ensure_ascii=True)
+
+
+def _matching_brace_index(text: str, open_index: int) -> Optional[int]:
+    depth = 0
+    quote: Optional[str] = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    index = open_index
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            index += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            index += 2
+            continue
+        if char in "'\"`":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _vite_config_object_span(text: str, property_name: str) -> Optional[tuple[int, int]]:
+    match = re.search(rf"\b{re.escape(property_name)}\s*:\s*\{{", text)
+    if not match:
+        return None
+    open_index = text.find("{", match.start(), match.end())
+    close_index = _matching_brace_index(text, open_index)
+    if close_index is None:
+        return None
+    return open_index, close_index
+
+
+def _insert_vite_object_property(text: str, open_index: int, property_text: str) -> str:
+    if text[open_index + 1 :].startswith("\n"):
+        return text[: open_index + 1] + f"\n  {property_text}" + text[open_index + 1 :]
+    return text[: open_index + 1] + f" {property_text} " + text[open_index + 1 :]
+
+
+def ensure_vite_preview_allowed_host(text: str, host: Optional[str]) -> str:
+    """Add one exact external host to Vite's preview.allowedHosts setting."""
+    normalized_host = host.strip() if isinstance(host, str) else ""
+    if not normalized_host:
+        return text
+
+    preview_span = _vite_config_object_span(text, "preview")
+    if preview_span is None:
+        for pattern in (r"defineConfig\s*\(\s*\{", r"\breturn\s*\{", r"export\s+default\s+\{"):
+            match = re.search(pattern, text)
+            if match:
+                open_index = text.find("{", match.start(), match.end())
+                return _insert_vite_object_property(
+                    text,
+                    open_index,
+                    f"preview: {{ allowedHosts: [{_vite_allowed_host_literal(normalized_host)}] }},",
+                )
+        return text
+
+    open_index, close_index = preview_span
+    preview_text = text[open_index + 1 : close_index]
+    allowed_match = re.search(
+        r"\ballowedHosts\s*:\s*(?P<value>\[[^\]]*\]|true|['\"][^'\"]*['\"])",
+        preview_text,
+        flags=re.DOTALL,
+    )
+    if allowed_match is None:
+        insertion = f"allowedHosts: [{_vite_allowed_host_literal(normalized_host)}],"
+        return text[: open_index + 1] + f"\n  {insertion}" + text[open_index + 1 :]
+
+    value = allowed_match.group("value")
+    if value == "true":
+        return text
+    if value.startswith("["):
+        if re.search(rf"['\"]{re.escape(normalized_host)}['\"]", value):
+            return text
+        inner = value[1:-1].rstrip()
+        separator = ", " if inner else ""
+        replacement = f"[{inner}{separator}{_vite_allowed_host_literal(normalized_host)}]"
+    else:
+        replacement = f"[{value}, {_vite_allowed_host_literal(normalized_host)}]"
+    value_start = open_index + 1 + allowed_match.start("value")
+    value_end = open_index + 1 + allowed_match.end("value")
+    return text[:value_start] + replacement + text[value_end:]
+
+
 def _shared_repo_root(plan: SubpathPlan) -> Optional[Path]:
     if not plan.projects:
         return None
@@ -50,6 +168,7 @@ def ensure_vite_base_config(
     vite_config_file: Callable[[Path], Optional[Path]],
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
+    preview_allowed_host: Optional[str] = None,
 ) -> List[str]:
     config_path = vite_config_file(repo_dir)
     if config_path is None:
@@ -67,6 +186,7 @@ def ensure_vite_base_config(
     if "base:" not in rewritten:
         rewritten = re.sub(r"(defineConfig\(\s*\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
         rewritten = re.sub(r"(export\s+default\s+\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
+    rewritten = ensure_vite_preview_allowed_host(rewritten, preview_allowed_host)
     if rewritten != original:
         write_text(config_path, rewritten)
         return [config_path.relative_to(repo_dir).as_posix()]
@@ -79,6 +199,7 @@ def ensure_vite_base_config_for_project(
     *,
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
+    preview_allowed_host: Optional[str] = None,
 ) -> List[str]:
     for config_path in project.config_files:
         if config_path.name.startswith("vite.config.") or ("declaration" in project.evidence and config_path.suffix in {".ts", ".js", ".mjs", ".cjs"}):
@@ -95,6 +216,7 @@ def ensure_vite_base_config_for_project(
             if "base:" not in rewritten:
                 rewritten = re.sub(r"(defineConfig\(\s*\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
                 rewritten = re.sub(r"(export\s+default\s+\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
+            rewritten = ensure_vite_preview_allowed_host(rewritten, preview_allowed_host)
             if rewritten != original:
                 write_text(config_path, rewritten)
                 try:
@@ -524,9 +646,16 @@ def apply_framework_config_adapter(
     parse_package_json: Callable[[Path], dict],
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
+    preview_allowed_host: Optional[str] = None,
 ) -> List[str]:
     if project.adapter == "vite":
-        return ensure_vite_base_config_for_project(project, project_slug, read_text=read_text, write_text=write_text)
+        return ensure_vite_base_config_for_project(
+            project,
+            project_slug,
+            read_text=read_text,
+            write_text=write_text,
+            preview_allowed_host=preview_allowed_host,
+        )
     if project.adapter == "nextjs":
         return ensure_nextjs_basepath_config_for_project(project, project_slug, read_text=read_text, write_text=write_text)
     if project.adapter == "vue_cli":
@@ -543,6 +672,7 @@ def apply_framework_config_adapters(
     parse_package_json: Callable[[Path], dict],
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
+    preview_allowed_host: Optional[str] = None,
 ) -> List[str]:
     changed: List[str] = []
     repo_root = _shared_repo_root(plan)
@@ -553,6 +683,7 @@ def apply_framework_config_adapters(
             parse_package_json=parse_package_json,
             read_text=read_text,
             write_text=write_text,
+            preview_allowed_host=preview_allowed_host,
         ):
             if "/" in item:
                 changed.append(item)
