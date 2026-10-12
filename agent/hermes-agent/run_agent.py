@@ -8554,6 +8554,16 @@ class AIAgent:
         task_finished = False
         relay_outcome = "failed"
 
+        try:
+            from agent.private_skill_access import bind_task_private_skills
+
+            bind_task_private_skills(
+                effective_task_id,
+                getattr(self, "_preloaded_private_skills", []) or [],
+            )
+        except Exception:
+            logger.debug("Failed to bind selected private skills to turn", exc_info=True)
+
         def _stop_durable_turn_lease_refresher() -> None:
             nonlocal durable_turn_lease_turn_active
             with durable_turn_lease_activity_lock:
@@ -8965,6 +8975,12 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    try:
+                        from agent.private_skill_access import clear_task_private_skills
+
+                        clear_task_private_skills(effective_task_id)
+                    except Exception:
+                        logger.debug("Failed to clear selected private skills", exc_info=True)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

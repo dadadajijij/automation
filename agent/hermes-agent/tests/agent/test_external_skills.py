@@ -115,3 +115,82 @@ class TestExternalSkillView:
             result = json.loads(skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]
+
+
+class TestPrivateExternalSkills:
+    def test_private_skill_requires_preload_path(self, hermes_home, tmp_path):
+        common_dir = tmp_path / "common-skills"
+        common_skill = common_dir / "common-skill"
+        common_skill.mkdir(parents=True)
+        (common_skill / "SKILL.md").write_text(
+            "---\nname: common-skill\ndescription: Common\n---\n\nCommon body.\n"
+        )
+        private_dir = tmp_path / "private-skills"
+        private_skill = private_dir / "private-skill"
+        private_skill.mkdir(parents=True)
+        (private_skill / "SKILL.md").write_text(
+            "---\nname: private-skill\ndescription: Private\n---\n\nPrivate body.\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            "skills:\n"
+            "  external_dirs:\n"
+            f"    - {common_dir}\n"
+            "  private_external_dirs:\n"
+            f"    - {private_dir}\n"
+        )
+        local_skills = hermes_home / "skills"
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from agent.skill_commands import build_preloaded_skills_prompt, scan_skill_commands
+            from agent.skill_utils import (
+                _external_dirs_cache_clear,
+                get_external_skills_dirs,
+                get_private_external_skills_dirs,
+            )
+            from tools.skills_tool import _find_all_skills, skill_view
+
+            _external_dirs_cache_clear()
+            assert get_external_skills_dirs() == [common_dir.resolve()]
+            assert get_private_external_skills_dirs() == [private_dir.resolve()]
+            assert [item["name"] for item in _find_all_skills()] == ["common-skill"]
+            assert "/common-skill" in scan_skill_commands()
+            assert "/private-skill" not in scan_skill_commands()
+
+            common_prompt, common_loaded, common_missing = build_preloaded_skills_prompt(
+                ["common-skill"]
+            )
+            assert common_loaded == ["common-skill"]
+            assert common_missing == []
+            assert "Common body." in common_prompt
+
+            public_view = json.loads(skill_view("private-skill"))
+            assert public_view["success"] is False
+
+            private_grants = []
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["private-skill"],
+                private_skill_out=private_grants,
+            )
+            assert loaded == ["private-skill"]
+            assert missing == []
+            assert "Private body." not in prompt
+            assert 'skill_view(name="private-skill")' in prompt
+            assert private_grants == [
+                {"name": "private-skill", "skill_dir": str(private_skill)}
+            ]
+
+            from agent.private_skill_access import (
+                bind_task_private_skills,
+                clear_task_private_skills,
+            )
+
+            bind_task_private_skills("private-turn", private_grants)
+            try:
+                allowed_view = json.loads(skill_view("private-skill", task_id="private-turn"))
+                assert allowed_view["success"] is True
+                assert "Private body." in allowed_view["content"]
+            finally:
+                clear_task_private_skills("private-turn")

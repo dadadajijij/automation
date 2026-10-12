@@ -982,26 +982,139 @@ def inspect_skill(identifier: str) -> Optional[dict]:
     return out
 
 
-def do_list(source_filter: str = "all",
-            enabled_only: bool = False,
-            console: Optional[Console] = None) -> None:
+def _scoped_skill_entries(scope: str) -> list[dict[str, str]]:
+    """Return operator-visible skills from configured common/private roots.
+
+    This is deliberately owned by the CLI listing surface. Agent-facing
+    ``skills_list`` and ``skill_view`` continue to use discoverable/common
+    sources only; listing private skill metadata must never widen those tools.
+    """
+    from agent.skill_utils import (
+        EXCLUDED_SKILL_DIRS,
+        get_external_skills_dirs,
+        get_private_external_skills_dirs,
+        iter_skill_index_files,
+    )
+    from tools.skills_tool import _parse_frontmatter, skill_matches_environment, skill_matches_platform
+
+    roots: list[tuple[str, Path]] = []
+    if scope in {"common", "managed"}:
+        roots.extend(("common", root) for root in get_external_skills_dirs())
+    if scope in {"private", "managed"}:
+        roots.extend(("private", root) for root in get_private_external_skills_dirs())
+
+    entries: list[dict[str, str]] = []
+    seen_paths: set[Path] = set()
+    for visibility, root in roots:
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            try:
+                resolved = skill_md.resolve()
+            except OSError:
+                resolved = skill_md
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            try:
+                frontmatter, _body = _parse_frontmatter(
+                    skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                )
+            except OSError:
+                continue
+            if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter):
+                continue
+            try:
+                relative = skill_md.relative_to(root)
+                category = relative.parts[0] if len(relative.parts) >= 3 else ""
+            except ValueError:
+                category = ""
+            entries.append(
+                {
+                    "name": str(frontmatter.get("name") or skill_md.parent.name),
+                    "category": category,
+                    "scope": visibility,
+                    "root": str(root),
+                    "description": str(frontmatter.get("description") or "").strip(),
+                    "version": str(frontmatter.get("version") or "").strip(),
+                }
+            )
+    return sorted(entries, key=lambda item: (item["scope"], item["category"], item["name"]))
+
+
+def _do_scoped_list(
+    scope: str,
+    *,
+    enabled_only: bool,
+    as_json: bool,
+    console: Console,
+) -> None:
+    from agent.skill_utils import get_disabled_skill_names
+
+    disabled_names = get_disabled_skill_names()
+    entries = _scoped_skill_entries(scope)
+    if enabled_only:
+        entries = [entry for entry in entries if entry["name"] not in disabled_names]
+
+    for entry in entries:
+        entry["enabled"] = entry["name"] not in disabled_names
+
+    if as_json:
+        console.print_json(
+            json.dumps({"scope": scope, "skills": entries}, ensure_ascii=False)
+        )
+        return
+
+    table = Table(title=f"{scope.title()} Skills")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Category", style="dim")
+    table.add_column("Scope", style="dim")
+    table.add_column("Root", style="dim", overflow="fold")
+    table.add_column("Status", style="dim")
+    for entry in entries:
+        enabled = bool(entry["enabled"])
+        table.add_row(
+            entry["name"],
+            entry["category"],
+            entry["scope"],
+            entry["root"],
+            "[bold green]enabled[/]" if enabled else "[dim red]disabled[/]",
+        )
+    console.print(table)
+    suffix = " enabled shown" if enabled_only else " total"
+    console.print(f"[dim]{len(entries)}{suffix}[/]\n")
+
+
+def do_list(
+    source_filter: str = "all",
+    enabled_only: bool = False,
+    console: Optional[Console] = None,
+    scope: str = "discoverable",
+    as_json: bool = False,
+) -> None:
     """List installed skills, distinguishing hub, builtin, and local skills.
 
     Args:
         source_filter: ``all`` | ``hub`` | ``builtin`` | ``local``.
         enabled_only: If True, hide disabled skills from the output.
+        scope: ``discoverable`` (default), ``common``, ``private``, or
+            ``managed``. Non-default scopes are operator-only directory views.
 
     Enabled/disabled state is resolved against the currently active profile's
     config — ``hermes -p <profile> skills list`` reads that profile's
     ``skills.disabled`` list because ``-p`` swaps ``HERMES_HOME`` at process
     start.  No explicit profile flag needed here.
     """
+    c = console or _console
+    if scope != "discoverable":
+        _do_scoped_list(scope, enabled_only=enabled_only, as_json=as_json, console=c)
+        return
+
     from tools.skills_hub import HubLockFile, ensure_hub_dirs
     from tools.skills_sync import _read_manifest
     from tools.skills_tool import _find_all_skills
     from agent.skill_utils import get_disabled_skill_names
 
-    c = console or _console
     ensure_hub_dirs()
     lock = HubLockFile()
     hub_installed = {e["name"]: e for e in lock.list_installed()}
@@ -1829,6 +1942,8 @@ def skills_command(args) -> None:
         do_list(
             source_filter=args.source,
             enabled_only=getattr(args, "enabled_only", False),
+            scope=getattr(args, "scope", "discoverable"),
+            as_json=getattr(args, "json", False),
         )
     elif action == "check":
         do_check(name=getattr(args, "name", None))

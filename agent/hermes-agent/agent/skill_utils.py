@@ -504,13 +504,13 @@ def _normalize_string_set(values) -> Set[str]:
 
 # ── External skills directories ──────────────────────────────────────────
 
-# (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
+# (config_path_str, mtime_ns, config_key) -> resolved external dirs list. Keyed by
 # mtime_ns so a config.yaml edit mid-run is picked up automatically;
 # otherwise every call would re-read + re-YAML-parse the 15KB config,
 # which becomes the dominant cost of ``hermes`` startup when ~120 skills
 # each trigger a category lookup during banner construction (10+ seconds
 # of pure waste).
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int, str], List[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -519,8 +519,8 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-def get_external_skills_dirs() -> List[Path]:
-    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
+def _get_configured_skills_dirs(config_key: str) -> List[Path]:
+    """Read one configured skill directory group and return validated paths.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
     path.  Only directories that actually exist are returned.  Duplicates and
@@ -539,7 +539,7 @@ def get_external_skills_dirs() -> List[Path]:
     # the full YAML parse, so the fast path is nearly free.
     try:
         stat = config_path.stat()
-        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
+        cache_key: Tuple[str, int, str] = (str(config_path), stat.st_mtime_ns, config_key)
     except OSError:
         cache_key = None  # type: ignore[assignment]
 
@@ -557,7 +557,7 @@ def get_external_skills_dirs() -> List[Path]:
     if not isinstance(skills_cfg, dict):
         return []
 
-    raw_dirs = skills_cfg.get("external_dirs")
+    raw_dirs = skills_cfg.get(config_key)
     if not raw_dirs:
         result: List[Path] = []
         if cache_key is not None:
@@ -600,6 +600,25 @@ def get_external_skills_dirs() -> List[Path]:
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
+
+
+def get_external_skills_dirs() -> List[Path]:
+    """Return common skills from ``skills.external_dirs``.
+
+    ``external_dirs`` is intentionally the discoverable/common source for
+    backward compatibility. Normal skill listing, slash commands, and the
+    agent-facing ``skill_view`` only consult this group.
+    """
+    return _get_configured_skills_dirs("external_dirs")
+
+
+def get_private_external_skills_dirs() -> List[Path]:
+    """Return preload-only skills from ``skills.private_external_dirs``.
+
+    Callers must not add these directories to normal discovery surfaces. They
+    are resolved exclusively by the CLI ``-s/--skills`` preload path.
+    """
+    return _get_configured_skills_dirs("private_external_dirs")
 
 
 def get_all_skills_dirs() -> List[Path]:
@@ -981,6 +1000,19 @@ def is_external_skill_path(path) -> bool:
     except Exception:
         pass
     for root in roots:
+        resolved_root = _resolve_for_skill_ownership(root)
+        try:
+            candidate.relative_to(resolved_root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def is_private_external_skill_path(path) -> bool:
+    """Return True when *path* is below ``skills.private_external_dirs``."""
+    candidate = _resolve_for_skill_ownership(path)
+    for root in get_private_external_skills_dirs():
         resolved_root = _resolve_for_skill_ownership(root)
         try:
             candidate.relative_to(resolved_root)

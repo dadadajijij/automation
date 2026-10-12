@@ -229,21 +229,30 @@ def _resolve_skill_commands_home() -> str:
     return str(get_hermes_home())
 
 
-def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
-    """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
+def _load_skill_payload(
+    skill_identifier: str,
+    task_id: str | None = None,
+    *,
+    include_private: bool = False,
+) -> tuple[dict[str, Any], Path | None, str] | None:
+    """Load a skill by name/path and return (loaded_payload, skill_dir, display_name).
+
+    ``include_private`` is reserved for the trusted CLI ``-s`` preload path.
+    Agent-facing slash commands and normal skill lookup leave it false, so
+    preload-only sources cannot be discovered after a session starts.
+    """
     raw_identifier = (skill_identifier or "").strip()
     if not raw_identifier:
         return None
 
     try:
-        from tools.skills_tool import SKILLS_DIR, skill_view
+        from tools.skills_tool import SKILLS_DIR, preload_skill_view, skill_view
         from agent.skill_utils import normalize_skill_lookup_name
 
         normalized = normalize_skill_lookup_name(raw_identifier)
 
-        loaded_skill = json.loads(
-            skill_view(normalized, task_id=task_id, preprocess=False)
-        )
+        loader = preload_skill_view if include_private else skill_view
+        loaded_skill = json.loads(loader(normalized, task_id=task_id, preprocess=False))
     except Exception:
         return None
 
@@ -267,6 +276,42 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             skill_dir = None
 
     return loaded_skill, skill_dir, skill_name
+
+
+def _private_skill_activation_message(loaded_skill: dict[str, Any], skill_name: str) -> str:
+    """Build the compact prompt block used for a selected private skill."""
+    description = str(loaded_skill.get("description") or "").strip()
+    if len(description) > 800:
+        description = description[:797].rstrip() + "..."
+
+    activation = ""
+    try:
+        from agent.skill_utils import parse_frontmatter
+
+        raw = str(loaded_skill.get("raw_content") or loaded_skill.get("content") or "")
+        frontmatter, _body = parse_frontmatter(raw)
+        metadata = frontmatter.get("metadata")
+        hermes_metadata = metadata.get("hermes") if isinstance(metadata, dict) else None
+        raw_activation = hermes_metadata.get("activation") if isinstance(hermes_metadata, dict) else None
+        if isinstance(raw_activation, list):
+            activation = "\n".join(str(item).strip() for item in raw_activation if str(item).strip())
+        elif raw_activation:
+            activation = str(raw_activation).strip()
+    except Exception:
+        activation = ""
+    if len(activation) > 2000:
+        activation = activation[:1997].rstrip() + "..."
+
+    parts = [
+        f'[IMPORTANT: The private skill "{skill_name}" was explicitly selected for this session.]',
+        "It is not part of the general skill catalog. Before performing work governed by it, "
+        f'load its complete instructions with skill_view(name="{skill_name}").',
+    ]
+    if description:
+        parts.extend(["", f"Description: {description}"])
+    if activation:
+        parts.extend(["", "Activation rules:", activation])
+    return "\n".join(parts)
 
 
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
@@ -839,6 +884,7 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    private_skill_out: Optional[list[dict[str, str]]] = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
@@ -868,15 +914,29 @@ def build_preloaded_skills_prompt(
             continue
         seen.add(identifier)
 
-        loaded = _load_skill_payload(identifier, task_id=task_id)
+        loaded = _load_skill_payload(
+            identifier,
+            task_id=task_id,
+            include_private=True,
+        )
         if not loaded:
             missing.append(identifier)
+            try:
+                from agent.gateway_audit import record_task_skill
+                record_task_skill(task_id, identifier, "failed", reason="skill_load_failed")
+            except Exception:
+                pass
             continue
 
         loaded_skill, skill_dir, skill_name = loaded
 
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)
+            try:
+                from agent.gateway_audit import record_task_skill
+                record_task_skill(task_id, skill_name, "unavailable", reason="skill_disabled")
+            except Exception:
+                pass
             continue
 
         # Track active usage for Curator lifecycle management (#17782)
@@ -886,19 +946,40 @@ def build_preloaded_skills_prompt(
         except Exception:
             pass  # Non-critical
 
-        activation_note = (
-            f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '
-            "preloaded. Treat its instructions as active guidance for the duration of this "
-            "session unless the user overrides them.]"
-        )
-        prompt_parts.append(
-            _build_skill_message(
-                loaded_skill,
-                skill_dir,
-                activation_note,
-                session_id=task_id,
+        is_private = False
+        if skill_dir is not None:
+            try:
+                from agent.skill_utils import is_private_external_skill_path
+
+                is_private = is_private_external_skill_path(skill_dir)
+            except Exception:
+                pass
+
+        if is_private:
+            prompt_parts.append(_private_skill_activation_message(loaded_skill, skill_name))
+            if private_skill_out is not None:
+                private_skill_out.append(
+                    {"name": skill_name, "skill_dir": str(skill_dir)}
+                )
+        else:
+            activation_note = (
+                f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '
+                "preloaded. Treat its instructions as active guidance for the duration of this "
+                "session unless the user overrides them.]"
             )
-        )
+            prompt_parts.append(
+                _build_skill_message(
+                    loaded_skill,
+                    skill_dir,
+                    activation_note,
+                    session_id=task_id,
+                )
+            )
         loaded_names.append(skill_name)
+        try:
+            from agent.gateway_audit import record_task_skill
+            record_task_skill(task_id, skill_name, "succeeded", reason="skill_loaded")
+        except Exception:
+            pass
 
     return "\n\n".join(prompt_parts), loaded_names, missing

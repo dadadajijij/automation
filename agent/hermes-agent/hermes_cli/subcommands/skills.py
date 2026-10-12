@@ -144,6 +144,21 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         help="Hide disabled skills. Use with -p <profile> to see exactly "
         "which skills will load for that profile.",
     )
+    skills_list.add_argument(
+        "--scope",
+        default="discoverable",
+        choices=["discoverable", "common", "private", "managed"],
+        help=(
+            "Skill visibility scope: discoverable (default), common "
+            "(skills.external_dirs), private "
+            "(skills.private_external_dirs), or managed (common + private)."
+        ),
+    )
+    skills_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Output scoped skill metadata as JSON for automation.",
+    )
 
     skills_check = skills_subparsers.add_parser(
         "check", help="Check installed hub skills for updates"

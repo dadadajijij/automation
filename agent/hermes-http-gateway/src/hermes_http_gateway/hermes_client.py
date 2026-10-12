@@ -21,12 +21,14 @@ class HermesInvocationError(RuntimeError):
         stdout: str = "",
         stderr: str = "",
         usage: dict[str, Any] | None = None,
+        skill_audit: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
         self.usage = usage
+        self.skill_audit = skill_audit
 
 
 class HermesInvocationCancelled(HermesInvocationError):
@@ -41,14 +43,39 @@ class HermesRunResult:
     stderr: str
     returncode: int
     usage: dict[str, Any] | None
+    skill_audit: dict[str, Any] | None = None
 
 
-def _base_env(settings: Settings) -> dict[str, str]:
+def _base_env(settings: Settings, *, skill_audit_path: Path | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("HERMES_YOLO_MODE", "1")
     if settings.source_tag:
         env.setdefault("HERMES_SESSION_SOURCE", settings.source_tag)
+    if skill_audit_path is not None:
+        # Hermes writes compact per-Skill events here. The file is unique per
+        # invocation and is removed by the gateway after it is read.
+        env["HERMES_GATEWAY_SKILL_AUDIT_FILE"] = str(skill_audit_path)
     return env
+
+
+def _prompt_with_report_delivery(settings: Settings, prompt: str) -> str:
+    # A per-turn host directive also reaches resumed sessions with cached prompts.
+    delivery = (
+        "[HTTP Gateway report delivery]\n"
+        "This request is served by the HTTP Gateway. When a Skill creates an HTML "
+        "investigation report, use local-file delivery for this request, overriding "
+        "any Skill instructions to publish through StaticSpaces. "
+        f"Write one self-contained .html report under {settings.report_source_root}. "
+        "Verify that it exists, is nonempty, has valid HTML structure, and contains "
+        "no credentials. Keep the local file. Do not load the static-spaces Skill, "
+        "run publish_verified_html.py, call a publishing API, or request publishing "
+        "credentials. In the final reply give the short investigation conclusion "
+        "and the absolute local HTML path. Do not include HTML source or file diffs, "
+        "invent a download URL, or claim publication succeeded or failed. "
+        "The Gateway will copy the report and replace its path with an "
+        "HTTPS link that opens the static HTML report after this reply.\n\n[User request]\n"
+    )
+    return delivery + prompt
 
 
 def _build_hermes_command(
@@ -57,6 +84,7 @@ def _build_hermes_command(
     profile: str,
     model: str | None = None,
     provider: str | None = None,
+    private_skill_ids: list[str] | None = None,
 ) -> list[str]:
     cmd = [settings.hermes_bin]
     if profile:
@@ -65,6 +93,9 @@ def _build_hermes_command(
         cmd.extend(["-m", model])
     if provider:
         cmd.extend(["--provider", provider])
+    for skill_id in private_skill_ids or []:
+        if skill_id:
+            cmd.extend(["-s", skill_id])
     return cmd
 
 
@@ -73,6 +104,29 @@ def _read_usage_file(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _read_skill_audit_file(path: Path) -> dict[str, Any] | None:
+    """Read a Hermes Skill audit envelope from JSON or newline-delimited JSON."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            return value if any(key in value for key in ("skills", "events", "version")) else {"events": [value]}
+        return {"events": value}
+    except json.JSONDecodeError:
+        events: list[Any] = []
+        for line in raw.splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                events.append(item)
+        return {"events": events} if events else None
 
 
 def _make_usage_path() -> Path:
@@ -92,12 +146,13 @@ def _run_command(
     *,
     run_key: str | None,
     run_generation: int | None,
+    skill_audit_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     _raise_if_cancelled(run_key, run_generation)
     process = subprocess.Popen(
         cmd,
         cwd=str(settings.hermes_workdir),
-        env=_base_env(settings),
+        env=_base_env(settings, skill_audit_path=skill_audit_path),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -129,17 +184,21 @@ def run_first_turn(
     profile: str,
     model: str | None = None,
     provider: str | None = None,
+    private_skill_ids: list[str] | None = None,
     image_paths: list[Path] | None = None,
     attachment_root: Path | None = None,
     run_key: str | None = None,
     run_generation: int | None = None,
 ) -> HermesRunResult:
+    prompt = _prompt_with_report_delivery(settings, prompt)
     usage_path = _make_usage_path()
+    skill_audit_path = _make_usage_path()
     cmd = _build_hermes_command(
         settings,
         profile=profile,
         model=model or settings.default_model,
         provider=provider or settings.default_provider,
+        private_skill_ids=private_skill_ids,
     )
     images = image_paths or []
     if images or attachment_root:
@@ -157,13 +216,27 @@ def run_first_turn(
             cmd,
             run_key=run_key,
             run_generation=run_generation,
+            skill_audit_path=skill_audit_path,
         )
     except FileNotFoundError as exc:
         raise HermesInvocationError(f"Hermes binary not found: {settings.hermes_bin}") from exc
+    except HermesInvocationCancelled:
+        raise
+    except HermesInvocationError as exc:
+        raise HermesInvocationError(
+            str(exc),
+            returncode=exc.returncode,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            usage=usage,
+            skill_audit=skill_audit,
+        ) from exc
     finally:
         usage = _read_usage_file(usage_path)
+        skill_audit = _read_skill_audit_file(skill_audit_path)
         try:
             usage_path.unlink(missing_ok=True)
+            skill_audit_path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -174,6 +247,7 @@ def run_first_turn(
             stdout=completed.stdout,
             stderr=completed.stderr,
             usage=usage,
+            skill_audit=skill_audit,
         )
 
     session_id = None
@@ -190,6 +264,7 @@ def run_first_turn(
         stderr=completed.stderr,
         returncode=completed.returncode,
         usage=usage,
+        skill_audit=skill_audit,
     )
 
 
@@ -201,17 +276,21 @@ def run_resume_turn(
     profile: str,
     model: str | None = None,
     provider: str | None = None,
+    private_skill_ids: list[str] | None = None,
     image_paths: list[Path] | None = None,
     attachment_root: Path | None = None,
     run_key: str | None = None,
     run_generation: int | None = None,
 ) -> HermesRunResult:
+    prompt = _prompt_with_report_delivery(settings, prompt)
     usage_path = _make_usage_path()
+    skill_audit_path = _make_usage_path()
     cmd = _build_hermes_command(
         settings,
         profile=profile,
         model=model or settings.default_model,
         provider=provider or settings.default_provider,
+        private_skill_ids=private_skill_ids,
     )
     images = image_paths or []
     cmd.extend(["chat", "--resume", hermes_session_id, "-Q", "-q", prompt, "--usage-file", str(usage_path)])
@@ -226,13 +305,27 @@ def run_resume_turn(
             cmd,
             run_key=run_key,
             run_generation=run_generation,
+            skill_audit_path=skill_audit_path,
         )
     except FileNotFoundError as exc:
         raise HermesInvocationError(f"Hermes binary not found: {settings.hermes_bin}") from exc
+    except HermesInvocationCancelled:
+        raise
+    except HermesInvocationError as exc:
+        raise HermesInvocationError(
+            str(exc),
+            returncode=exc.returncode,
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            usage=usage,
+            skill_audit=skill_audit,
+        ) from exc
     finally:
         usage = _read_usage_file(usage_path)
+        skill_audit = _read_skill_audit_file(skill_audit_path)
         try:
             usage_path.unlink(missing_ok=True)
+            skill_audit_path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -243,6 +336,7 @@ def run_resume_turn(
             stdout=completed.stdout,
             stderr=completed.stderr,
             usage=usage,
+            skill_audit=skill_audit,
         )
 
     session_id = hermes_session_id
@@ -258,4 +352,5 @@ def run_resume_turn(
         stderr=completed.stderr,
         returncode=completed.returncode,
         usage=usage,
+        skill_audit=skill_audit,
     )

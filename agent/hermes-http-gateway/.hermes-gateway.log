@@ -8612,3 +8612,92 @@ INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8003 (Press CTRL+C to quit)
 INFO:     127.0.0.1:59918 - "GET /health HTTP/1.1" 200 OK
+INFO:     Started server process [4103480]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('127.0.0.1', 8003): address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Started server process [4110651]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8003 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [4110651]
+INFO:     Started server process [4110767]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8003 (Press CTRL+C to quit)
+INFO:     127.0.0.1:43852 - "POST /v1/chat HTTP/1.1" 200 OK
+INFO:     114.92.76.101:0 - "GET /v1/reports/rtc-32-publishers-role-clarification.html/65b3e7be8f8829c2e988e4b2209365e2d880eb4c9584a9f02aa0e8f056ffff23 HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-32-publishers-role-clarification.html/65b3e7be8f8829c2e988e4b2209365e2d880eb4c9584a9f02aa0e8f056ffff23 HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-32-publishers-role-clarification.html/65b3e7be8f8829c2e988e4b2209365e2d880eb4c9584a9f02aa0e8f056ffff23 HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-32-publishers-role-clarification.html/65b3e7be8f8829c2e988e4b2209365e2d880eb4c9584a9f02aa0e8f056ffff23 HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-32-publishers-role-clarification.html/65b3e7be8f8829c2e988e4b2209365e2d880eb4c9584a9f02aa0e8f056ffff23 HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-32-publishers-role-clarification.html/65b3e7be8f8829c2e988e4b2209365e2d880eb4c9584a9f02aa0e8f056ffff23 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:39868 - "POST /v1/chat HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-uid-range-clarification.html/cf070997ca8fd2581d965a46458435ab7d84d70e8272f1a21115ac1788cf14ee HTTP/1.1" 200 OK
+INFO:     222.71.59.2:0 - "GET /v1/reports/rtc-uid-range-clarification.html/cf070997ca8fd2581d965a46458435ab7d84d70e8272f1a21115ac1788cf14ee HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=admin-playground HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/admin-playground HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=admin-playground HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/admin-playground HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations/f29df0cf-142b-4752-881f-90674d52567b/timeline HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations/R%3A150707549702875_1688856448353761.71b60816/timeline HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations/R%3A150707549702875_1688856448353761.71b60816/timeline HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=admin-playground HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/admin-playground HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations/R%3A150707549702875_1688856448353761.71b60816/timeline HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/dashboard HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations?user_id=guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/users/guest HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /capabilities?scope=private HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations/R%3A150707549702875_1688856448353761.71b60816/timeline HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/api/conversations/R%3A150707549702875_1688856448353761.71b60816/timeline HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47452 - "GET / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:47468 - "GET /static-preview HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:47478 - "GET /tools2/api-examples-web HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:47482 - "GET /tools2/api-examples-web/ HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:47492 - "GET /api/health HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:47502 - "GET /health HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "GET /admin/chat HTTP/1.1" 200 OK
+INFO:     117.136.120.247:0 - "POST /admin/api/chat HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [4110767]

@@ -97,14 +97,27 @@ class _FakeForm(dict):
 
 
 class GatewayTests(unittest.TestCase):
-    def test_search_route_is_not_shadowed(self):
+    def test_public_message_route_is_registered(self):
         paths = [getattr(route, "path", "") for route in gateway.app.routes]
         self.assertIn("/v1/chat", paths)
+        self.assertIn("/v1/messages", paths)
+        self.assertIn("/v1/capabilities", paths)
+        self.assertIn("/v1/users/{user_id}/private-skills", paths)
+        self.assertIn("/admin/v1/dashboard", paths)
+        self.assertIn("/admin/v1/capabilities", paths)
+        self.assertIn("/admin/v1/users/{user_id}", paths)
+        self.assertIn("/admin/v1/conversations/{session_id}/timeline", paths)
         self.assertNotIn("/v1/chat/{session_id}", paths)
         self.assertNotIn("/v1/sessions/{session_id}", paths)
         self.assertNotIn("/v1/chat/{session_id}/messages", paths)
         self.assertNotIn("/v1/sessions/{session_id}/search", paths)
-        self.assertLess(paths.index("/v1/sessions/search"), paths.index("/v1/sessions/{session_id}/messages"))
+        self.assertNotIn("/v1/sessions/search", paths)
+        self.assertNotIn("/v1/sessions/{session_id}/messages", paths)
+        self.assertNotIn("/admin/api/summary", paths)
+        self.assertNotIn("/admin/api/users", paths)
+        self.assertNotIn("/admin/api/users/{user_id}/private-skills", paths)
+        self.assertNotIn("/admin/api/conversations/{session_id}", paths)
+        self.assertNotIn("/admin/api/conversations/{session_id}/messages", paths)
 
     def test_default_provider_requires_default_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +137,10 @@ class GatewayTests(unittest.TestCase):
     def test_chat_request_rejects_title_field(self):
         with self.assertRaises(Exception):
             _chat_request("hi", title="custom title")
+
+    def test_chat_request_rejects_profile_field(self):
+        with self.assertRaises(Exception):
+            _chat_request("hi", profile="tool_less")
 
     def test_chat_request_rejects_legacy_string_question(self):
         with self.assertRaises(Exception):
@@ -308,7 +325,7 @@ class GatewayTests(unittest.TestCase):
         self.assertIsNone(second["user_id"])
         self.assertEqual(seen, [("alice", None), (None, None)])
 
-    def test_chat_resume_can_infer_user_and_profile_from_session_id(self):
+    def test_chat_resume_uses_default_profile_for_new_sessions(self):
         calls: list[tuple[str, str]] = []
 
         def fake_first_turn(settings, *, prompt, profile, model=None, provider=None, image_paths=None, attachment_root=None, run_key=None, run_generation=None):
@@ -349,7 +366,6 @@ class GatewayTests(unittest.TestCase):
                         request=_chat_request(
                             "如何分析音画不同步问题",
                             user_id="toolless",
-                            profile="tool_less",
                             session_id="12a0015d-1428-4cd4-b3fc-4b0b33d33cd3",
                         ),
                     )
@@ -369,10 +385,10 @@ class GatewayTests(unittest.TestCase):
 
         self.assertEqual(second["answer"], "second answer")
         self.assertEqual(second["user_id"], "toolless")
-        self.assertEqual(second["hermes_profile"], "tool_less")
-        self.assertEqual(calls, [("first", "tool_less"), ("resume", "tool_less")])
+        self.assertNotIn("hermes_profile", second)
+        self.assertEqual(calls, [("first", "default"), ("resume", "default")])
 
-    def test_chat_resume_rejects_explicit_user_or_profile_mismatch(self):
+    def test_chat_resume_rejects_explicit_user_mismatch(self):
         def fake_first_turn(settings, *, prompt, profile, model=None, provider=None, image_paths=None, attachment_root=None, run_key=None, run_generation=None):
             return HermesRunResult(
                 answer="first answer",
@@ -397,7 +413,6 @@ class GatewayTests(unittest.TestCase):
                         request=_chat_request(
                             "hello",
                             user_id="toolless",
-                            profile="tool_less",
                             session_id="demo-session",
                         ),
                     )
@@ -417,24 +432,10 @@ class GatewayTests(unittest.TestCase):
                         )
                     )
 
-                with self.assertRaises(HTTPException) as profile_ctx:
-                    asyncio.run(
-                        gateway._run_chat_turn(
-                            settings,
-                            user_id=None,
-                            session_id=first["session_id"],
-                            request=_chat_request(
-                                "again",
-                                profile="default",
-                                session_id=first["session_id"],
-                            ),
-                        )
-                    )
             finally:
                 gateway.run_first_turn = original_first
 
         self.assertEqual(user_ctx.exception.status_code, 409)
-        self.assertEqual(profile_ctx.exception.status_code, 409)
 
     def test_chat_creates_and_resumes_session(self):
         calls: list[tuple[str, str]] = []
@@ -495,11 +496,11 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(calls, [("first", "hello"), ("resume", "again")])
         self.assertEqual(
             set(first),
-            {"session_id", "hermes_session_id", "user_id", "hermes_profile", "answer"},
+            {"session_id", "hermes_session_id", "user_id", "answer"},
         )
         self.assertEqual(
             set(second),
-            {"session_id", "hermes_session_id", "user_id", "hermes_profile", "answer"},
+            {"session_id", "hermes_session_id", "user_id", "answer"},
         )
 
     def test_new_chat_turn_supersedes_inflight_same_session(self):
@@ -648,7 +649,7 @@ class GatewayTests(unittest.TestCase):
                 cookies={settings.admin_cookie_name: admin["session_token"]},
                 app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
             )
-            payload = gateway.admin_conversation_messages(request, "timeline-session")
+            payload = gateway.admin_conversation_timeline(request, "timeline-session")
 
         self.assertEqual([row["status"] for row in payload["requests"]], ["completed", "failed", "superseded"])
         self.assertEqual(len(payload["timeline"]), 4)
@@ -822,7 +823,6 @@ class GatewayTests(unittest.TestCase):
                             "请分析这个文件",
                             session_id="demo-session",
                             user_id="alice",
-                            profile="default",
                             attachments=[
                                 gateway.ChatAttachment(url="https://example.com/a.txt", type="file"),
                             ],
@@ -887,7 +887,6 @@ class GatewayTests(unittest.TestCase):
                             ),
                             session_id="empty-text-file-session",
                             user_id="alice",
-                            profile="default",
                         ),
                     )
                 )
@@ -953,7 +952,6 @@ class GatewayTests(unittest.TestCase):
                             "请分析这张图",
                             session_id="demo-session",
                             user_id="alice",
-                            profile="default",
                             attachments=[
                                 gateway.ChatAttachment(
                                     url="https://example.com/image-1.png",
@@ -1010,6 +1008,59 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(cmd.count("--image"), 2)
         self.assertIn(str(img1), cmd)
         self.assertIn(str(img2), cmd)
+
+    def test_gateway_report_delivery_reaches_first_attachment_and_resume_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(_make_settings(Path(tmp)), report_source_root=Path(tmp) / "reports")
+            original = "请分析这个问题"
+            completed = SimpleNamespace(returncode=0, stdout="final answer", stderr="")
+            for mode in ("first", "attachment", "resume"):
+                with (
+                    self.subTest(mode=mode),
+                    mock.patch.object(gateway_hermes_client, "_run_command", return_value=completed) as run,
+                    mock.patch.object(gateway_hermes_client, "_read_usage_file", return_value={"session_id": "hermes-1"}),
+                ):
+                    if mode == "resume":
+                        gateway_hermes_client.run_resume_turn(
+                            settings, prompt=original, profile="default", hermes_session_id="hermes-1",
+                        )
+                    else:
+                        gateway_hermes_client.run_first_turn(
+                            settings, prompt=original, profile="default",
+                            attachment_root=Path(tmp) if mode == "attachment" else None,
+                        )
+                    cmd = run.call_args.args[1]
+                    flag = "-z" if mode == "first" else "-q"
+                    prompt = cmd[cmd.index(flag) + 1]
+                    self.assertTrue(prompt.startswith("[HTTP Gateway report delivery]"))
+                    self.assertTrue(prompt.endswith("[User request]\n" + original))
+                    self.assertIn(str(settings.report_source_root), prompt)
+                    self.assertIn("Do not load the static-spaces Skill", prompt)
+                    self.assertIn("or claim publication succeeded or failed", prompt)
+
+    def test_hermes_client_repeats_private_skill_flags(self):
+        class FakeProcess:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "answer\n", ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            with mock.patch.object(gateway_hermes_client.subprocess, "Popen", return_value=FakeProcess()) as popen_mock:
+                with mock.patch.object(gateway_hermes_client, "_read_usage_file", return_value={"session_id": "hermes-1"}):
+                    gateway_hermes_client.run_first_turn(
+                        settings,
+                        prompt="analyze",
+                        profile="default",
+                        private_skill_ids=["qa-jira-issue-list-retro", "qoe-diagnose-expert"],
+                    )
+
+        cmd = popen_mock.call_args.args[0]
+        self.assertEqual(cmd.count("-s"), 2)
+        self.assertLess(cmd.index("-s"), cmd.index("-z"))
+        self.assertIn("qa-jira-issue-list-retro", cmd)
+        self.assertIn("qoe-diagnose-expert", cmd)
 
     def test_hermes_client_passes_attachment_root(self):
         class FakeProcess:
@@ -1109,7 +1160,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(target.name, "demo-session")
             self.assertFalse((root / "2020-01-01").exists())
 
-    def test_session_messages_can_filter_with_query(self):
+    def test_messages_supports_session_reads_and_search(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = _make_settings(Path(tmp))
             _init_temp_db(settings)
@@ -1145,14 +1196,58 @@ class GatewayTests(unittest.TestCase):
                 app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
             )
 
-            all_messages = gateway.session_messages(request, "sess-a", user_id="alice")
-            filtered = gateway.session_messages(request, "sess-a", user_id="alice", q="hello")
+            all_messages = gateway.messages(request, user_id="alice", session_id="sess-a")
+            filtered = gateway.messages(request, user_id="alice", session_id="sess-a", q="hello")
+            global_results = gateway.messages(request, user_id="alice", q="hello")
 
         self.assertEqual(len(all_messages["messages"]), 2)
+        self.assertEqual(all_messages["conversation"]["session_id"], "sess-a")
+        self.assertEqual(all_messages["limit"], 20)
+        self.assertEqual(all_messages["offset"], 0)
         self.assertEqual(len(filtered["messages"]), 1)
         self.assertEqual(filtered["messages"][0]["content"], "hello world")
         self.assertEqual(filtered["messages"][0]["model"], "gpt-5.5")
         self.assertEqual(filtered["messages"][0]["provider"], "sub2api")
+        self.assertIsNone(global_results["conversation"])
+        self.assertEqual(len(global_results["messages"]), 1)
+
+    def test_messages_requires_search_query_without_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            request = SimpleNamespace(
+                headers={},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+
+            with self.assertRaises(HTTPException) as ctx:
+                gateway.messages(request, user_id="alice")
+
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_messages_returns_404_for_missing_or_other_user_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            gateway_db.create_conversation(
+                settings,
+                external_session_id="sess-a",
+                user_id="alice",
+                hermes_profile="default",
+                title="Alpha chat",
+            )
+            request = SimpleNamespace(
+                headers={},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+
+            with self.assertRaises(HTTPException) as missing:
+                gateway.messages(request, user_id="alice", session_id="missing")
+            with self.assertRaises(HTTPException) as other_user:
+                gateway.messages(request, user_id="bob", session_id="sess-a")
+
+        self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(other_user.exception.status_code, 404)
 
     def test_admin_db_queries_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1203,6 +1298,32 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["external_session_id"], "sess-a")
 
+    def test_admin_dashboard_returns_summary_and_filtered_users(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            gateway_db.upsert_user(settings, "alice", "default")
+            gateway_db.upsert_user(settings, "bob", "default")
+            gateway_db.create_conversation(
+                settings,
+                external_session_id="sess-a",
+                user_id="alice",
+                hermes_profile="default",
+                title="Alpha chat",
+            )
+            admin = gateway_db.create_admin_session(settings, username="admin", ttl_seconds=3600)
+            request = SimpleNamespace(
+                cookies={settings.admin_cookie_name: admin["session_token"]},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+
+            payload = gateway.admin_dashboard(request, user_query="ali", user_limit=10)
+
+        self.assertEqual(payload["summary"]["users"], 2)
+        self.assertEqual(payload["summary"]["conversations"], 1)
+        self.assertEqual([user["user_id"] for user in payload["users"]], ["alice"])
+        self.assertEqual(payload["user_pagination"], {"limit": 10, "offset": 0})
+
     def test_request_runtime_audit_is_persisted_for_admin_timeline(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = _make_settings(Path(tmp))
@@ -1244,6 +1365,152 @@ class GatewayTests(unittest.TestCase):
 
         self.assertEqual(payload["runtime_audit"], audit)
 
+    def test_admin_can_bind_and_unbind_private_skills_for_guest(self):
+        catalog = [
+            {
+                "id": "qa-jira-issue-list-retro",
+                "name": "qa-jira-issue-list-retro",
+                "category": "agora-skills",
+                "description": "Jira retro",
+                "version": "1.0.0",
+                "enabled": True,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            admin = gateway_db.create_admin_session(settings, username="admin", ttl_seconds=3600)
+            request = SimpleNamespace(
+                headers={"x-csrf-token": gateway._admin_csrf_token(admin["session_token"])},
+                cookies={settings.admin_cookie_name: admin["session_token"]},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            with mock.patch.object(gateway, "list_private_skills", return_value=catalog):
+                saved = gateway.update_admin_user(
+                    request,
+                    "guest",
+                    gateway.AdminUserUpdate(private_skill_ids=["qa-jira-issue-list-retro"]),
+                )
+                detail = gateway.admin_user(request, "guest")
+                cleared = gateway.update_admin_user(
+                    request,
+                    "guest",
+                    gateway.AdminUserUpdate(private_skill_ids=[]),
+                )
+
+        self.assertEqual(saved["private_skills"]["bound_skill_ids"], ["qa-jira-issue-list-retro"])
+        self.assertEqual(detail["private_skills"]["user_id"], "guest")
+        self.assertEqual(detail["private_skills"]["bound_skill_ids"], ["qa-jira-issue-list-retro"])
+        self.assertEqual(cleared["private_skills"]["bound_skill_ids"], [])
+
+    def test_capabilities_returns_private_catalog_separately(self):
+        catalog = [{"id": "skill-a", "name": "skill-a", "category": "agora-skills", "enabled": True}]
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            admin = gateway_db.create_admin_session(settings, username="admin", ttl_seconds=3600)
+            request = SimpleNamespace(
+                headers={},
+                cookies={settings.admin_cookie_name: admin["session_token"]},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            with mock.patch.object(gateway, "list_private_skills", return_value=catalog):
+                payload = gateway.capabilities(request, scope="private")
+                user = gateway.admin_user(request, "guest")
+
+        self.assertEqual(payload, {"scope": "private", "profile": "default", "skills": catalog})
+        self.assertNotIn("available_private_skills", user["private_skills"])
+        self.assertEqual(user["private_skills"]["bound_skill_ids"], [])
+
+    def test_public_private_skill_capabilities_and_bindings_use_gateway_key(self):
+        catalog = [
+            {"id": "skill-active", "name": "skill-active", "enabled": True},
+            {"id": "skill-disabled", "name": "skill-disabled", "enabled": False},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(_make_settings(Path(tmp)), gateway_api_key="gateway-secret")
+            _init_temp_db(settings)
+            request = SimpleNamespace(
+                headers={"x-gateway-key": "gateway-secret"},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            with mock.patch.object(gateway, "list_private_skills", return_value=catalog):
+                capabilities = gateway.public_capabilities(request, scope="private")
+                saved = gateway.update_public_user_private_skills(
+                    request,
+                    "customer-a",
+                    gateway.PublicPrivateSkillBindingsUpdate(skill_ids=["skill-active"]),
+                )
+                detail = gateway.public_user_private_skills(request, "customer-a")
+
+        self.assertEqual(capabilities["skills"], catalog)
+        self.assertEqual(saved["active_skill_ids"], ["skill-active"])
+        self.assertEqual(detail["bound_skill_ids"], ["skill-active"])
+        self.assertEqual(detail["unavailable_skill_ids"], [])
+
+    def test_public_private_skill_binding_rejects_invalid_skill(self):
+        catalog = [{"id": "skill-active", "name": "skill-active", "enabled": True}]
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(_make_settings(Path(tmp)), gateway_api_key="gateway-secret")
+            _init_temp_db(settings)
+            request = SimpleNamespace(
+                headers={"x-gateway-key": "gateway-secret"},
+                app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
+            )
+            with mock.patch.object(gateway, "list_private_skills", return_value=catalog):
+                with self.assertRaises(HTTPException) as ctx:
+                    gateway.update_public_user_private_skills(
+                        request,
+                        "customer-a",
+                        gateway.PublicPrivateSkillBindingsUpdate(skill_ids=["missing"]),
+                    )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.detail, {"invalid_private_skill_ids": ["missing"]})
+
+    def test_bound_private_skills_are_forwarded_on_first_and_resume(self):
+        catalog = [
+            {
+                "id": "qa-jira-issue-list-retro",
+                "name": "qa-jira-issue-list-retro",
+                "category": "agora-skills",
+                "description": "Jira retro",
+                "version": "1.0.0",
+                "enabled": True,
+            }
+        ]
+        calls: list[tuple[str, list[str]]] = []
+
+        def fake_first_turn(settings, *, private_skill_ids=None, **kwargs):
+            calls.append(("first", list(private_skill_ids or [])))
+            return HermesRunResult("first", "hermes-1", "first", "", 0, {"session_id": "hermes-1"})
+
+        def fake_resume_turn(settings, *, private_skill_ids=None, **kwargs):
+            calls.append(("resume", list(private_skill_ids or [])))
+            return HermesRunResult("second", kwargs["hermes_session_id"], "second", "", 0, None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            gateway_db.get_or_create_user(settings, "guest")
+            gateway_db.replace_user_private_skill_bindings(
+                settings,
+                user_id="guest",
+                skill_ids=["qa-jira-issue-list-retro"],
+            )
+            with (
+                mock.patch.object(gateway, "list_private_skills", return_value=catalog),
+                mock.patch.object(gateway, "run_first_turn", side_effect=fake_first_turn),
+                mock.patch.object(gateway, "run_resume_turn", side_effect=fake_resume_turn),
+            ):
+                first = asyncio.run(gateway._run_chat_turn(settings, user_id="guest", session_id=None, request=_chat_request("first")))
+                asyncio.run(gateway._run_chat_turn(settings, user_id="guest", session_id=first["session_id"], request=_chat_request("second", session_id=first["session_id"])))
+
+        self.assertEqual(calls, [
+            ("first", ["qa-jira-issue-list-retro"]),
+            ("resume", ["qa-jira-issue-list-retro"]),
+        ])
+
     def test_admin_login_helpers(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = _make_settings(Path(tmp))
@@ -1267,7 +1534,7 @@ class GatewayTests(unittest.TestCase):
 
     def test_admin_pages_render(self):
         login = render_login_page(username_default="admin", password_configured=True)
-        dash = render_dashboard_page(username="admin")
+        dash = render_dashboard_page(username="admin", csrf_token="csrf")
         chat = render_chat_page(
             username="admin",
             csrf_token="csrf",
@@ -1288,8 +1555,8 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn("els.userFilter.value = state.selectedUser", dash)
         self.assertIn("grid-template-columns: minmax(0, .72fr) minmax(0, 1fr) minmax(0, 1.9fr);", dash)
         self.assertIn('"publicBasePath": "/tools2/hermes-gateway"', chat)
-        self.assertIn("adminPath('/api/chat')", chat)
-        self.assertIn("'/' + 'admin' + suffix", chat)
+        self.assertIn("adminPath('/chat')", chat)
+        self.assertIn("'/' + 'admin' + '/v1' + suffix", chat)
         self.assertIn("const requestKeys = new Set", dash)
         self.assertIn("const visibleItems = items.filter", dash)
         self.assertIn("row.event_type === 'request' ? '用户请求' : esc(row.role)", dash)
@@ -1300,6 +1567,18 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("formatDuration(stage.duration_ms)", dash)
         self.assertIn("实际主模型", dash)
         self.assertIn("展开模型执行详情", dash)
+        self.assertIn("Private Skills", dash)
+        self.assertIn("skill-binding-group", dash)
+        self.assertIn("const skillGroups = skills.reduce", dash)
+        self.assertIn("savePrivateSkills", dash)
+        self.assertIn("/dashboard", dash)
+        self.assertIn("/capabilities?scope=private", dash)
+        self.assertIn("'/' + 'admin' + '/v1' + suffix", dash)
+        self.assertIn("/timeline", dash)
+        self.assertIn("private_skill_ids", dash)
+        self.assertIn("'content-type': 'application/json', ...(options.headers || {})", dash)
+        self.assertNotIn("/api/summary", dash)
+        self.assertNotIn("/private-skills", dash)
         self.assertIn("csrf", chat)
 
     def test_env_file_loader_keeps_existing_values(self):

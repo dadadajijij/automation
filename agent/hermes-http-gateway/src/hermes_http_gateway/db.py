@@ -114,6 +114,18 @@ def init_db(settings: Settings) -> None:
                 CREATE INDEX IF NOT EXISTS idx_request_stage_events_request_created
                   ON request_stage_events(request_event_id, created_at, id);
 
+                CREATE TABLE IF NOT EXISTS user_private_skill_bindings (
+                  user_id TEXT NOT NULL,
+                  skill_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (user_id, skill_id),
+                  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_private_skill_bindings_user
+                  ON user_private_skill_bindings(user_id, skill_id);
+
                 CREATE VIRTUAL TABLE IF NOT EXISTS session_search USING fts5(
                   user_id UNINDEXED,
                   external_session_id UNINDEXED,
@@ -201,6 +213,43 @@ def get_or_create_user(settings: Settings, user_id: str) -> dict[str, Any]:
 
 def set_user_default_profile(settings: Settings, user_id: str, profile: str) -> dict[str, Any]:
     return upsert_user(settings, user_id, profile)
+
+
+def list_user_private_skill_bindings(settings: Settings, user_id: str) -> list[dict[str, Any]]:
+    with _connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, skill_id, created_at, updated_at
+            FROM user_private_skill_bindings
+            WHERE user_id = ?
+            ORDER BY skill_id ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def replace_user_private_skill_bindings(
+    settings: Settings,
+    *,
+    user_id: str,
+    skill_ids: Iterable[str],
+) -> list[dict[str, Any]]:
+    normalized = sorted({str(skill_id).strip() for skill_id in skill_ids if str(skill_id).strip()})
+    now = now_iso()
+    with _connect(settings.database_url) as conn:
+        conn.execute(
+            "DELETE FROM user_private_skill_bindings WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.executemany(
+            """
+            INSERT INTO user_private_skill_bindings (user_id, skill_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(user_id, skill_id, now, now) for skill_id in normalized],
+        )
+    return list_user_private_skill_bindings(settings, user_id)
 
 
 def create_admin_session(
@@ -683,17 +732,26 @@ def list_conversations(settings: Settings, user_id: str, limit: int = 50, offset
         return [dict(row) for row in rows]
 
 
-def list_messages(settings: Settings, user_id: str, external_session_id: str) -> list[dict[str, Any]]:
+def list_messages(
+    settings: Settings,
+    user_id: str,
+    external_session_id: str,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    query = """
+        SELECT id, external_session_id, user_id, role, kind, content, model, provider, created_at
+        FROM messages
+        WHERE user_id = ? AND external_session_id = ?
+        ORDER BY created_at ASC
+    """
+    values: list[Any] = [user_id, external_session_id]
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        values.extend((limit, offset))
     with _connect(settings.database_url) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, external_session_id, user_id, role, kind, content, model, provider, created_at
-            FROM messages
-            WHERE user_id = ? AND external_session_id = ?
-            ORDER BY created_at ASC
-            """,
-            (user_id, external_session_id),
-        ).fetchall()
+        rows = conn.execute(query, values).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -839,6 +897,7 @@ def search_messages(
     query: str,
     external_session_id: str | None = None,
     limit: int = 20,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     pattern = f"%{query.strip()}%"
     if pattern == "%%":
@@ -864,8 +923,18 @@ def search_messages(
                 OR s.kind LIKE ? COLLATE NOCASE
               )
             ORDER BY s.created_at DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (user_id, external_session_id, external_session_id, pattern, pattern, pattern, pattern, limit),
+            (
+                user_id,
+                external_session_id,
+                external_session_id,
+                pattern,
+                pattern,
+                pattern,
+                pattern,
+                limit,
+                offset,
+            ),
         ).fetchall()
         return [dict(row) for row in rows]

@@ -124,6 +124,63 @@ def test_do_list_platform_env_is_ignored(three_source_env, monkeypatch):
     assert seen["platform"] is None
 
 
+def test_list_scope_parser_accepts_private_scope():
+    import argparse
+    from hermes_cli.subcommands.skills import build_skills_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_skills_parser(subparsers, cmd_skills=lambda _args: None)
+
+    args = parser.parse_args(["skills", "list", "--scope", "private"])
+
+    assert args.scope == "private"
+
+
+def test_scoped_list_keeps_private_out_of_common_view(tmp_path, monkeypatch):
+    from agent.skill_utils import _external_dirs_cache_clear
+    from hermes_cli.skills_hub import _scoped_skill_entries, do_list
+    import tools.skills_tool as skills_tool
+
+    home = tmp_path / ".hermes"
+    local = home / "skills"
+    common = tmp_path / "common"
+    private = tmp_path / "private"
+    for root, name in ((common, "common-demo"), (private, "private-demo")):
+        skill_dir = root / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name}\n---\n\n{name} body\n",
+            encoding="utf-8",
+        )
+    local.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "skills:\n"
+        f"  external_dirs:\n    - {common}\n"
+        f"  private_external_dirs:\n    - {private}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", local)
+    _external_dirs_cache_clear()
+    try:
+        assert [entry["name"] for entry in _scoped_skill_entries("common")] == ["common-demo"]
+        assert [entry["name"] for entry in _scoped_skill_entries("private")] == ["private-demo"]
+        assert [entry["name"] for entry in _scoped_skill_entries("managed")] == [
+            "common-demo",
+            "private-demo",
+        ]
+
+        sink = StringIO()
+        do_list(scope="private", console=Console(file=sink, force_terminal=False, color_system=None))
+        output = sink.getvalue()
+        assert "private-demo" in output
+        assert "common-demo" not in output
+    finally:
+        _external_dirs_cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Cross-registry hijack regression tests
 #

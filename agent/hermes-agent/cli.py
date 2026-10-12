@@ -5542,6 +5542,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_cli.prompt_stash import PromptStash as _PromptStash
         self._prompt_stash = _PromptStash()
         self.preloaded_skills: list[str] = []
+        self.preloaded_private_skills: list[dict[str, str]] = []
         self._startup_skills_line_shown = False
         # Background --skills preload (started by cmd_chat; joined by
         # finalize_preloaded_skills before any agent is built).
@@ -8340,7 +8341,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         result = getattr(self, "_preload_skills_result", None)
         if not result:
             return
-        skills_prompt, loaded_skills, missing_skills = result
+        skills_prompt, loaded_skills, missing_skills, *result_extra = result
+        self.preloaded_private_skills = (
+            list(result_extra[0]) if result_extra and isinstance(result_extra[0], list) else []
+        )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
             # If at least one skill loaded, degrade gracefully: skip the
@@ -14027,6 +14031,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _on_tool_start(self, tool_call_id: str, function_name: str, function_args: dict):
         """Capture local before-state for write-capable tools."""
+        if getattr(self, "tool_progress_mode", "all") == "off":
+            return
         try:
             from agent.display import capture_local_edit_snapshot
 
@@ -14038,6 +14044,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
         """Render file edits with inline diff after write-capable tools complete."""
+        snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
+        if getattr(self, "tool_progress_mode", "all") == "off":
+            return
         # A top-level delegate_task dispatches in the background and re-enters as
         # a fresh turn when done. Say so once — no spinner, nothing to poll — so
         # the idle prompt doesn't read as "nothing happened" (⛓ tracks the work).
@@ -14053,7 +14062,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"\033[2m\u21a9 Background {noun} running — I'll resume when {tail}. Keep chatting.\033[0m")
                 except Exception:
                     pass
-        snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
         try:
             from agent.display import render_edit_diff_with_delta
 
@@ -20651,10 +20659,23 @@ def main(
         # so no agent can be built with the skills missing.
         def _load_preloaded_skills() -> None:
             try:
-                cli._preload_skills_result = build_preloaded_skills_prompt(
-                    parsed_skills,
-                    task_id=cli.session_id,
-                )
+                private_skills: list[dict[str, str]] = []
+                try:
+                    preload_result = build_preloaded_skills_prompt(
+                        parsed_skills,
+                        task_id=cli.session_id,
+                        private_skill_out=private_skills,
+                    )
+                except TypeError as exc:
+                    # Third-party callers and older extensions may still
+                    # provide the pre-activation three-argument helper.
+                    if "private_skill_out" not in str(exc):
+                        raise
+                    preload_result = build_preloaded_skills_prompt(
+                        parsed_skills,
+                        task_id=cli.session_id,
+                    )
+                cli._preload_skills_result = (*preload_result, private_skills)
             except Exception as exc:  # surfaced by finalize below
                 cli._preload_skills_error = exc
 

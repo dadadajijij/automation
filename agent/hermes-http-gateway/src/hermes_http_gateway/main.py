@@ -9,14 +9,14 @@ import time
 import uuid
 import shutil
 from dataclasses import dataclass
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .admin_ui import render_chat_page, render_dashboard_page, render_login_page
@@ -53,17 +53,20 @@ from .db import (
     list_messages_by_session,
     list_request_events_by_session,
     list_request_stages_by_session,
+    list_user_private_skill_bindings,
     list_users,
     list_conversations,
     list_messages,
     search_messages,
     search_messages_admin,
     record_request_stage,
-    set_user_default_profile,
+    replace_user_private_skill_bindings,
     touch_admin_session,
     update_conversation,
 )
 from .hermes_client import HermesInvocationCancelled, HermesInvocationError, run_first_turn, run_resume_turn
+from .skills_catalog import PrivateSkillCatalogError, list_private_skills
+from .reports import cleanup_reports, get_report_download, publish_report_answer
 from .locks import (
     begin_attachment_download,
     begin_session_turn,
@@ -78,6 +81,7 @@ from .locks import (
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 DEFAULT_USER_ID = "guest"
+DEFAULT_HERMES_PROFILE = "default"
 MAX_AUDIT_BODY_BYTES = 64 * 1024
 SENSITIVE_URL_QUERY_KEYS = {"key", "api_key", "apikey", "token", "access_token", "signature", "sig", "auth"}
 
@@ -108,12 +112,18 @@ class ChatRequest(BaseModel):
     question: ChatQuestion
     user_id: str | None = Field(default=None, max_length=120)
     session_id: str | None = Field(default=None, max_length=120)
-    profile: str | None = Field(default=None, max_length=120)
 
 
-class ProfileUpdate(BaseModel):
-    user_id: str | None = Field(default=None, max_length=120)
-    default_hermes_profile: str = Field(min_length=1, max_length=120)
+class AdminUserUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    private_skill_ids: list[str] = Field(default_factory=list, max_length=10)
+
+
+class PublicPrivateSkillBindingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_ids: list[str] = Field(default_factory=list, max_length=10)
 
 
 class AdminLoginRequest(BaseModel):
@@ -263,8 +273,8 @@ def _conversation_title(question: str) -> str:
 
 
 def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "session_id": row["external_session_id"],
+        return {
+            "session_id": row["external_session_id"],
         "user_id": row["user_id"],
         "hermes_session_id": row["hermes_session_id"],
         "hermes_profile": row["hermes_profile"],
@@ -275,6 +285,12 @@ def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "message_count": row.get("message_count"),
     }
+
+
+def _public_conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = _conversation_payload(row)
+    payload.pop("hermes_profile", None)
+    return payload
 
 
 def _message_payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -327,12 +343,112 @@ def _runtime_audit_from_usage(usage: dict[str, Any] | None) -> dict[str, Any] | 
     safe_events = [item for item in events[:64] if isinstance(item, dict)]
     main = audit.get("main") if isinstance(audit.get("main"), dict) else {}
     result: dict[str, Any] = {"version": audit.get("version", 1), "events": safe_events}
+    skills = audit.get("skills")
+    if isinstance(skills, list):
+        result["skills"] = [item for item in skills[:64] if isinstance(item, dict)]
     if main:
         result["main"] = main
     context_window = audit.get("context_window")
     if isinstance(context_window, int) and context_window > 0:
         result["context_window"] = context_window
     return result
+
+
+def _runtime_audit_with_private_skills(
+    usage: dict[str, Any] | None,
+    private_skills: list[dict[str, Any]],
+    skill_audit: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    audit = _runtime_audit_from_usage(usage) or {}
+    if private_skills:
+        audit["private_skills"] = private_skills
+    usage_skill_audit = None
+    if isinstance(audit.get("skills"), list):
+        usage_skill_audit = {"version": audit.get("version", 1), "skills": audit["skills"]}
+    normalized = _normalize_skill_audit(skill_audit or usage_skill_audit, private_skills)
+    if normalized is not None:
+        audit["skill_audit"] = normalized
+    return audit or None
+
+
+_SKILL_STATUSES = {"selected", "running", "succeeded", "failed", "timeout", "skipped", "unavailable", "unknown", "partial"}
+
+
+def _normalize_skill_audit(
+    payload: dict[str, Any] | None,
+    private_skills: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Keep a small, safe Skill execution summary for request auditing.
+
+    Hermes versions may return either ``skills`` or event-style records. A
+    missing producer signal is represented as ``unknown`` rather than inferred
+    from the overall Hermes exit code.
+    """
+    if not isinstance(payload, dict):
+        if not private_skills:
+            return None
+        return {
+            "version": 1,
+            "telemetry": "missing",
+            "skills": [
+                {
+                    "id": item.get("id"),
+                    "status": "unknown",
+                    "source": item.get("source", "user_binding"),
+                    "reason": "Hermes did not emit Skill audit telemetry",
+                }
+                for item in private_skills
+            ],
+        }
+
+    raw_items = payload.get("skills")
+    if not isinstance(raw_items, list):
+        raw_items = payload.get("events")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    skills: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_items[:128]:
+        if not isinstance(raw, dict):
+            continue
+        skill_id = raw.get("skill_id") or raw.get("id") or raw.get("name") or raw.get("task")
+        if not isinstance(skill_id, str) or not skill_id.strip():
+            continue
+        skill_id = skill_id.strip()[:160]
+        status = str(raw.get("status") or "unknown").strip().lower()
+        if status not in _SKILL_STATUSES:
+            status = "unknown"
+        item: dict[str, Any] = {"id": skill_id, "status": status}
+        for key in ("duration_ms", "invocation_count", "error_type", "reason", "summary", "services"):
+            value = raw.get(key)
+            if key == "services" and isinstance(value, dict):
+                item[key] = {
+                    str(name)[:80]: str(state)[:40]
+                    for name, state in list(value.items())[:16]
+                }
+            elif key in {"duration_ms", "invocation_count"} and isinstance(value, (int, float)):
+                item[key] = max(0, value)
+            elif isinstance(value, str) and value.strip():
+                item[key] = value.strip()[:240]
+        skills.append(item)
+        seen.add(skill_id)
+
+    for private in private_skills:
+        skill_id = str(private.get("id") or "").strip()
+        if skill_id and skill_id not in seen:
+            skills.append({
+                "id": skill_id,
+                "status": "unknown",
+                "source": private.get("source", "user_binding"),
+                "reason": "Skill was selected but emitted no execution result",
+            })
+    if not skills and not private_skills:
+        return None
+    return {
+        "version": payload.get("version", 1),
+        "telemetry": "received",
+        "skills": skills[:128],
+    }
 
 
 def _actual_runtime(usage: dict[str, Any] | None, fallback_model: str | None, fallback_provider: str | None) -> tuple[str | None, str | None]:
@@ -550,7 +666,6 @@ def _ensure_conversation(
     *,
     user_id: str | None,
     session_id: str | None,
-    profile: str | None,
     title: str | None,
 ) -> tuple[str, dict[str, Any]]:
     requested_user_id = _resolve_user_id(user_id)
@@ -564,22 +679,16 @@ def _ensure_conversation(
                 status_code=409,
                 detail="session already belongs to a different user",
             )
-        if profile and existing["hermes_profile"] != profile:
-            raise HTTPException(
-                status_code=409,
-                detail="session already belongs to a different Hermes profile",
-            )
         return existing["user_id"], existing
 
-    user = get_or_create_user(settings, requested_user_id)
-    effective_profile = profile or user["default_hermes_profile"] or settings.hermes_profile_default
+    get_or_create_user(settings, requested_user_id)
     return (
         requested_user_id,
         create_conversation(
             settings,
             external_session_id=external_session_id,
             user_id=requested_user_id,
-            hermes_profile=effective_profile,
+            hermes_profile=DEFAULT_HERMES_PROFILE,
             title=title,
         ),
     )
@@ -607,9 +716,16 @@ async def _run_chat_turn(
         settings,
         user_id=user_id,
         session_id=session_id or request.session_id,
-        profile=request.profile,
         title=_conversation_title(question_text),
     )
+
+    if conversation["hermes_profile"] != DEFAULT_HERMES_PROFILE:
+        conversation = update_conversation(
+            settings,
+            external_session_id=conversation["external_session_id"],
+            user_id=user_id,
+            hermes_profile=DEFAULT_HERMES_PROFILE,
+        ) or conversation
 
     external_session_id = conversation["external_session_id"]
     request_event = create_request_event(
@@ -621,6 +737,26 @@ async def _run_chat_turn(
         provider=effective_provider,
         request_body=request_body,
     )
+
+    private_skills: list[dict[str, Any]] = []
+    private_catalog_error: str | None = None
+    private_catalog_started_at = time.perf_counter()
+    try:
+        catalog = await asyncio.to_thread(list_private_skills, settings)
+        catalog_by_id = {str(item["id"]): item for item in catalog if item.get("enabled")}
+        for binding in list_user_private_skill_bindings(settings, user_id):
+            skill = catalog_by_id.get(str(binding["skill_id"]))
+            if skill is None:
+                continue
+            private_skills.append(
+                {
+                    "id": skill["id"],
+                    "version": skill.get("version") or "",
+                    "source": "user_binding",
+                }
+            )
+    except PrivateSkillCatalogError as exc:
+        private_catalog_error = str(exc)
 
     def finish_request(
         status: str,
@@ -645,6 +781,15 @@ async def _run_chat_turn(
             stage=stage,
             duration_ms=(time.perf_counter() - started_at) * 1000,
             detail=detail,
+        )
+
+    if private_catalog_error:
+        record_stage("解析私有 Skills", private_catalog_started_at, private_catalog_error)
+    else:
+        record_stage(
+            "解析私有 Skills",
+            private_catalog_started_at,
+            ", ".join(item["id"] for item in private_skills) or "无绑定",
         )
 
     run_key = f"{user_id}:{external_session_id}"
@@ -754,6 +899,11 @@ async def _run_chat_turn(
 
         try:
             hermes_started_at = time.perf_counter()
+            hermes_skill_kwargs = (
+                {"private_skill_ids": [item["id"] for item in private_skills]}
+                if private_skills
+                else {}
+            )
             if conversation["hermes_session_id"]:
                 result = await asyncio.to_thread(
                     run_resume_turn,
@@ -767,6 +917,7 @@ async def _run_chat_turn(
                     attachment_root=attachment_root,
                     run_key=run_key,
                     run_generation=run_generation,
+                    **hermes_skill_kwargs,
                 )
             else:
                 result = await asyncio.to_thread(
@@ -780,7 +931,17 @@ async def _run_chat_turn(
                     attachment_root=attachment_root,
                     run_key=run_key,
                     run_generation=run_generation,
+                    **hermes_skill_kwargs,
                 )
+            _ensure_turn_current(run_key, run_generation)
+            published_answer = await asyncio.to_thread(
+                publish_report_answer,
+                settings,
+                result.answer,
+                user_id=user_id,
+                session_id=external_session_id,
+                request_id=request_event["id"],
+            )
             _ensure_turn_current(run_key, run_generation)
         except HermesInvocationCancelled as exc:
             record_stage("Hermes CLI 运行", hermes_started_at, "被后续请求中断")
@@ -817,7 +978,9 @@ async def _run_chat_turn(
                 "failed",
                 http_status=502,
                 error_detail=str(exc),
-                runtime_audit=_runtime_audit_from_usage(exc.usage),
+                runtime_audit=_runtime_audit_with_private_skills(
+                    exc.usage, private_skills, exc.skill_audit
+                ),
             )
             raise HTTPException(
                 status_code=502,
@@ -871,7 +1034,7 @@ async def _run_chat_turn(
             user_id=user_id,
             role="assistant",
             kind="chat",
-            content=result.answer,
+            content=published_answer,
             title=conversation["title"],
             model=actual_model,
             provider=actual_provider,
@@ -882,15 +1045,16 @@ async def _run_chat_turn(
         finish_request(
             "completed",
             http_status=200,
-            runtime_audit=_runtime_audit_from_usage(result.usage),
+            runtime_audit=_runtime_audit_with_private_skills(
+                result.usage, private_skills, result.skill_audit
+            ),
         )
 
         response = {
             "session_id": external_session_id,
             "hermes_session_id": conversation["hermes_session_id"] or result.session_id,
             "user_id": user_id,
-            "hermes_profile": conversation["hermes_profile"],
-            "answer": result.answer,
+            "answer": published_answer,
         }
         return response
 
@@ -909,7 +1073,6 @@ async def _admin_chat_request(request: Request, settings: Settings) -> dict[str,
     text = str(form.get("text", ""))
     user_id = str(form.get("user_id", "")).strip() or "admin-playground"
     session_id = str(form.get("session_id", "")).strip() or str(uuid.uuid4())
-    profile = str(form.get("profile", "")).strip() or None
     uploads = [item for item in form.getlist("files") if hasattr(item, "read")]
 
     external_session_id = _validate_session_id(session_id)
@@ -926,7 +1089,6 @@ async def _admin_chat_request(request: Request, settings: Settings) -> dict[str,
             question=ChatQuestion(text=text, attachments=question_attachments),
             user_id=user_id,
             session_id=session_id,
-            profile=profile,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -941,7 +1103,6 @@ async def _admin_chat_request(request: Request, settings: Settings) -> dict[str,
                 "text": text,
                 "user_id": user_id,
                 "session_id": session_id,
-                "profile": profile,
                 "files": [
                     {
                         "type": "image",
@@ -967,13 +1128,26 @@ async def _admin_chat_request(request: Request, settings: Settings) -> dict[str,
     )
 
 
+async def _report_cleanup_loop(settings: Settings) -> None:
+    while True:
+        await asyncio.to_thread(cleanup_reports, settings)
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_env_file()
     settings = load_settings()
     init_db(settings)
+    get_or_create_user(settings, DEFAULT_USER_ID)
     app.state.settings = settings
-    yield
+    report_cleanup_task = asyncio.create_task(_report_cleanup_loop(settings))
+    try:
+        yield
+    finally:
+        report_cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await report_cleanup_task
 
 
 app = FastAPI(title="Hermes HTTP Gateway", version="0.1.0", lifespan=lifespan)
@@ -1043,7 +1217,11 @@ def admin_page(request: Request):
     if session is None:
         return RedirectResponse(_public_path(settings, "/admin/login"), status_code=302)
     return HTMLResponse(
-        render_dashboard_page(username=session["username"], public_base_path=settings.public_base_path)
+        render_dashboard_page(
+            username=session["username"],
+            csrf_token=_admin_csrf_token(str(session["session_token"])),
+            public_base_path=settings.public_base_path,
+        )
     )
 
 
@@ -1062,32 +1240,123 @@ def admin_chat_page(request: Request):
     )
 
 
-@app.post("/admin/api/chat")
+@app.post("/admin/v1/chat")
 async def admin_chat(request: Request):
     settings = _settings(request)
     return await _admin_chat_request(request, settings)
 
 
-@app.get("/admin/api/summary")
-def admin_summary(request: Request):
+@app.get("/admin/v1/dashboard")
+def admin_dashboard(
+    request: Request,
+    user_query: str | None = None,
+    user_limit: int = 100,
+    user_offset: int = 0,
+):
     settings = _settings(request)
     _require_admin_session(request, settings)
     return {
-        "users": count_users(settings),
-        "conversations": count_conversations(settings),
-        "messages": count_messages(settings),
-        "requests": count_request_events(settings),
+        "summary": {
+            "users": count_users(settings),
+            "conversations": count_conversations(settings),
+            "messages": count_messages(settings),
+            "requests": count_request_events(settings),
+        },
+        "users": list_users(
+            settings,
+            limit=user_limit,
+            offset=user_offset,
+            query=user_query,
+        ),
+        "user_pagination": {"limit": user_limit, "offset": user_offset},
     }
 
 
-@app.get("/admin/api/users")
-def admin_users(request: Request, query: str | None = None, limit: int = 100, offset: int = 0):
+def _private_skill_catalog_or_503(settings: Settings) -> list[dict[str, Any]]:
+    try:
+        return list_private_skills(settings)
+    except PrivateSkillCatalogError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/admin/v1/capabilities")
+def capabilities(request: Request, scope: str = "private"):
     settings = _settings(request)
     _require_admin_session(request, settings)
-    return {"users": list_users(settings, limit=limit, offset=offset, query=query)}
+    if scope != "private":
+        raise HTTPException(status_code=400, detail="Only scope=private is supported")
+    return {
+        "scope": "private",
+        "profile": DEFAULT_HERMES_PROFILE,
+        "skills": _private_skill_catalog_or_503(settings),
+    }
 
 
-@app.get("/admin/api/conversations")
+def _admin_private_skills_binding_payload(settings: Settings, user_id: str) -> dict[str, Any]:
+    bound_skill_ids = [item["skill_id"] for item in list_user_private_skill_bindings(settings, user_id)]
+    return {
+        "user_id": user_id,
+        "bound_skill_ids": bound_skill_ids,
+    }
+
+
+def _replace_private_skill_bindings(
+    settings: Settings,
+    *,
+    user_id: str,
+    skill_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    catalog = _private_skill_catalog_or_503(settings)
+    enabled_ids = {str(item["id"]) for item in catalog if item.get("enabled")}
+    requested_ids = [skill_id.strip() for skill_id in skill_ids if skill_id.strip()]
+    invalid_ids = sorted(set(requested_ids) - enabled_ids)
+    if invalid_ids:
+        raise HTTPException(status_code=422, detail={"invalid_private_skill_ids": invalid_ids})
+    bindings = replace_user_private_skill_bindings(
+        settings,
+        user_id=user_id,
+        skill_ids=requested_ids,
+    )
+    return bindings, catalog
+
+
+@app.get("/admin/v1/users/{user_id}")
+def admin_user(request: Request, user_id: str):
+    settings = _settings(request)
+    _require_admin_session(request, settings)
+    resolved_user_id = _resolve_user_id(user_id)
+    user = get_or_create_user(settings, resolved_user_id)
+    return {
+        "user": user,
+        "private_skills": _admin_private_skills_binding_payload(settings, resolved_user_id),
+    }
+
+
+@app.patch("/admin/v1/users/{user_id}")
+def update_admin_user(
+    request: Request,
+    user_id: str,
+    body: AdminUserUpdate,
+):
+    settings = _settings(request)
+    session = _require_admin_session(request, settings)
+    _require_admin_csrf(request, session)
+    resolved_user_id = _resolve_user_id(user_id)
+    user = get_or_create_user(settings, resolved_user_id)
+    bindings, _ = _replace_private_skill_bindings(
+        settings,
+        user_id=resolved_user_id,
+        skill_ids=body.private_skill_ids,
+    )
+    return {
+        "user": user,
+        "private_skills": {
+            "bound_skill_ids": [item["skill_id"] for item in bindings],
+        },
+    }
+
+
+@app.get("/admin/v1/conversations")
 def admin_conversations(
     request: Request,
     query: str | None = None,
@@ -1108,18 +1377,8 @@ def admin_conversations(
     }
 
 
-@app.get("/admin/api/conversations/{session_id}")
-def admin_conversation_detail(request: Request, session_id: str):
-    settings = _settings(request)
-    _require_admin_session(request, settings)
-    conversation = get_conversation_by_session(settings, _validate_session_id(session_id))
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return {"conversation": _conversation_payload(conversation)}
-
-
-@app.get("/admin/api/conversations/{session_id}/messages")
-def admin_conversation_messages(request: Request, session_id: str):
+@app.get("/admin/v1/conversations/{session_id}/timeline")
+def admin_conversation_timeline(request: Request, session_id: str):
     settings = _settings(request)
     _require_admin_session(request, settings)
     conversation_id = _validate_session_id(session_id)
@@ -1146,7 +1405,7 @@ def admin_conversation_messages(request: Request, session_id: str):
     }
 
 
-@app.get("/admin/api/search")
+@app.get("/admin/v1/search")
 def admin_search(
     request: Request,
     q: str,
@@ -1167,22 +1426,85 @@ def admin_search(
     }
 
 
-@app.get("/v1/users/me")
-def get_me(request: Request, user_id: str | None = None):
+def _report_response(request: Request, download_token: str, filename: str):
+    try:
+        path, filename = get_report_download(
+            _settings(request), download_token, expected_filename=filename
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Report not found or expired") from exc
+    return FileResponse(
+        path,
+        media_type="text/html",
+        headers={
+            "Content-Disposition": "inline",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+@app.get("/v1/reports/{filename}/{download_token}")
+def report_page(request: Request, filename: str, download_token: str):
+    return _report_response(request, download_token, filename)
+
+
+@app.get("/v1/capabilities")
+def public_capabilities(request: Request, scope: str = "private"):
+    settings = _settings(request)
+    _require_gateway_key(request, settings)
+    if scope != "private":
+        raise HTTPException(status_code=400, detail="Only scope=private is supported")
+    return {
+        "scope": "private",
+        "profile": DEFAULT_HERMES_PROFILE,
+        "skills": _private_skill_catalog_or_503(settings),
+    }
+
+
+def _public_private_skill_binding_payload(
+    settings: Settings, user_id: str
+) -> dict[str, Any]:
+    catalog = _private_skill_catalog_or_503(settings)
+    bound_skill_ids = [
+        item["skill_id"] for item in list_user_private_skill_bindings(settings, user_id)
+    ]
+    available_ids = {str(item["id"]) for item in catalog if item.get("enabled")}
+    return {
+        "user_id": user_id,
+        "profile": DEFAULT_HERMES_PROFILE,
+        "bound_skill_ids": bound_skill_ids,
+        "active_skill_ids": [skill_id for skill_id in bound_skill_ids if skill_id in available_ids],
+        "unavailable_skill_ids": [skill_id for skill_id in bound_skill_ids if skill_id not in available_ids],
+    }
+
+
+@app.get("/v1/users/{user_id}/private-skills")
+def public_user_private_skills(request: Request, user_id: str):
     settings = _settings(request)
     _require_gateway_key(request, settings)
     resolved_user_id = _resolve_user_id(user_id)
-    user = get_or_create_user(settings, resolved_user_id)
-    return {"user": user}
+    get_or_create_user(settings, resolved_user_id)
+    return _public_private_skill_binding_payload(settings, resolved_user_id)
 
 
-@app.put("/v1/users/me")
-def update_me(request: Request, body: ProfileUpdate):
+@app.put("/v1/users/{user_id}/private-skills")
+def update_public_user_private_skills(
+    request: Request,
+    user_id: str,
+    body: PublicPrivateSkillBindingsUpdate,
+):
     settings = _settings(request)
     _require_gateway_key(request, settings)
-    resolved_user_id = _resolve_user_id(body.user_id)
-    user = set_user_default_profile(settings, resolved_user_id, body.default_hermes_profile.strip())
-    return {"user": user}
+    resolved_user_id = _resolve_user_id(user_id)
+    get_or_create_user(settings, resolved_user_id)
+    _replace_private_skill_bindings(
+        settings,
+        user_id=resolved_user_id,
+        skill_ids=body.skill_ids,
+    )
+    return _public_private_skill_binding_payload(settings, resolved_user_id)
 
 
 @app.get("/v1/sessions")
@@ -1192,67 +1514,64 @@ def sessions(request: Request, user_id: str | None = None, limit: int = 50, offs
     resolved_user_id = _resolve_user_id(user_id)
     return {
         "sessions": [
-            _conversation_payload(row)
+            _public_conversation_payload(row)
             for row in list_conversations(settings, resolved_user_id, limit=limit, offset=offset)
         ]
     }
 
 
-@app.get("/v1/sessions/search")
-def session_search(
+@app.get("/v1/messages")
+def messages(
     request: Request,
-    q: str,
-    user_id: str | None = None,
-    session_id: str | None = None,
-    limit: int = 20,
-):
-    settings = _settings(request)
-    _require_gateway_key(request, settings)
-    resolved_user_id = _resolve_user_id(user_id)
-    results = search_messages(
-        settings,
-        user_id=resolved_user_id,
-        query=q,
-        external_session_id=_validate_session_id(session_id) if session_id else None,
-        limit=limit,
-    )
-    return {"results": results}
-
-
-@app.get("/v1/sessions/{session_id}/messages")
-def session_messages(
-    request: Request,
-    session_id: str,
     user_id: str | None = None,
     q: str | None = None,
+    session_id: str | None = None,
     limit: int = 20,
+    offset: int = 0,
 ):
     settings = _settings(request)
     _require_gateway_key(request, settings)
     resolved_user_id = _resolve_user_id(user_id)
-    conversation_id = _validate_session_id(session_id)
-    conversation = get_conversation(settings, resolved_user_id, conversation_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if q:
-        messages = [
+    query = (q or "").strip()
+    if not session_id and not query:
+        raise HTTPException(status_code=422, detail="q is required when session_id is not provided")
+
+    conversation = None
+    conversation_id = None
+    if session_id:
+        conversation_id = _validate_session_id(session_id)
+        conversation = get_conversation(settings, resolved_user_id, conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+    if query:
+        result_messages = [
             _search_message_payload(row)
             for row in search_messages(
                 settings,
                 user_id=resolved_user_id,
-                query=q,
+                query=query,
                 external_session_id=conversation_id,
                 limit=limit,
+                offset=offset,
             )
         ]
     else:
-        messages = [
+        result_messages = [
             _message_payload(row)
-            for row in list_messages(settings, resolved_user_id, conversation["external_session_id"])
+            for row in list_messages(
+                settings,
+                resolved_user_id,
+                conversation["external_session_id"],
+                limit=limit,
+                offset=offset,
+            )
         ]
     return {
-        "conversation": _conversation_payload(conversation),
-        "messages": messages,
+        "conversation": _public_conversation_payload(conversation) if conversation else None,
+        "messages": result_messages,
+        "limit": limit,
+        "offset": offset,
     }
 
 

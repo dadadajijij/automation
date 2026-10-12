@@ -12,6 +12,7 @@
 - Hermes 只放本机或内网
 - 每个外部 `session_id` 对应一个 Hermes 会话
 - 会话与消息都落盘到本地 SQLite
+- Private Skills 绑定关系落盘到 SQLite，并按 `user_id` 生效
 
 ## 入口规则
 
@@ -21,13 +22,13 @@
 - 新请求没有 `session_id` 时，网关会自动创建一个
 - 同一 `session_id` 会复用同一个 Hermes 会话
 - 同一 `user_id + session_id` 的新请求会替代旧的未完成请求；如果旧请求正在下载附件，会先等附件下载完成并合并到新请求
-- 已存在的 `session_id` 会自动继承原会话的 `user_id` 和 `profile`
-- 只有显式传入的 `user_id` 或 `profile` 与已有会话不一致时才会报错
+- 所有业务请求固定使用 Hermes `default` profile，调用端不传 profile
+- 私有 skills 由管理员按 `user_id` 绑定；绑定后网关自动追加 Hermes `-s`
 
 ## 运行
 
 ```bash
-cd /Users/panweikui/Pwk-Coding/automation/agent/hermes-http-gateway
+cd /home/devops/ka/automation/agent/hermes-http-gateway
 uv sync
 ```
 
@@ -39,23 +40,74 @@ uv run hermes-http-gateway
 
 启动时会自动读取同目录下的 `.env`。
 
+也可以使用项目自带脚本后台运行：
+
+```bash
+bash scripts/hermes-gateway.sh start
+bash scripts/hermes-gateway.sh status
+bash scripts/hermes-gateway.sh restart
+bash scripts/hermes-gateway.sh stop
+```
+
+脚本默认监听 `127.0.0.1:8003`，日志写入项目根目录 `.hermes-gateway.log`，PID 写入 `.hermes-gateway.pid`。脚本使用 Bash，请使用 `bash scripts/hermes-gateway.sh ...` 或直接执行脚本。
+
+当前服务器使用：
+
+```text
+HOST=127.0.0.1
+PORT=8003
+PUBLIC_BASE_PATH=/tools2/hermes-gateway
+HERMES_TIMEOUT_SECONDS=1200
+```
+
+`load_settings()` 在没有 `.env` 或环境变量时的代码默认端口是 `8011`、Hermes 超时是 `300` 秒；`scripts/hermes-gateway.sh` 的默认监听端口是 `8003`。部署时以实际 `.env` 或启动命令为准。
+
 Hermes 二进制会优先自动寻找：
 
-1. `/Users/panweikui/Pwk-Coding/automation/agent/hermes-agent/.venv/bin/hermes`
-2. `/Users/panweikui/Pwk-Coding/automation/agent/hermes-agent/hermes`
+1. `$HERMES_WORKDIR/.venv/bin/hermes`
+2. `$HERMES_WORKDIR/hermes`
 3. `PATH` 里的 `hermes`
+
+### 主要配置项
+
+| 配置项 | 默认值 | 作用 |
+|---|---:|---|
+| `HOST` | `0.0.0.0` | Gateway 监听地址；脚本默认使用 `127.0.0.1` |
+| `PORT` | `8011` | Gateway 监听端口；当前部署为 `8003` |
+| `DATABASE_URL` | `./data/hermes_gateway.sqlite` | SQLite 数据库路径 |
+| `HERMES_BIN` | 自动探测 | Hermes 可执行文件路径 |
+| `HERMES_WORKDIR` | 相邻 `hermes-agent` 目录 | Hermes 工作目录 |
+| `GATEWAY_API_KEY` | 空 | 配置后保护 `/v1/*` |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / 空 | 管理员登录凭据 |
+| `PUBLIC_BASE_PATH` | 空 | 反向代理子路径，例如 `/tools2/hermes-gateway` |
+| `HERMES_TIMEOUT_SECONDS` | `300` | 单次 Hermes CLI 等待上限；当前部署为 `1200` |
+| `DEFAULT_MODEL` | 空 | 服务端默认模型，不由调用方覆盖 |
+| `DEFAULT_PROVIDER` | 空 | 服务端默认 provider；配置时必须同时有 `DEFAULT_MODEL` |
+| `HERMES_SOURCE_TAG` | `tool` | 写入 Hermes 会话来源标识 |
+| `ATTACHMENT_MAX_BYTES` | `10MB` | 单个附件最大字节数 |
+| `ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS` | `30` | 单个附件下载超时 |
+| `ATTACHMENT_MAX_IMAGES` | `8` | 单次最多图片数 |
+| `ATTACHMENT_REDIRECT_LIMIT` | `3` | 附件下载最大跳转次数 |
+| `ATTACHMENT_STORAGE_ROOT` | `/tmp/hermes` | 附件临时保存根目录 |
+| `ATTACHMENT_RETENTION_DAYS` | `3` | 附件目录保留天数 |
+| `REPORT_SOURCE_ROOT` | `~/.hermes/cache/documents` | 允许发布的 HTML 报告源目录 |
+| `REPORT_STORAGE_ROOT` | `./data/reports` | 报告页面副本及有效期信息的持久化目录 |
+| `REPORT_PUBLIC_BASE_URL` | `https://athena.agoralab.co/tools2/hermes-gateway` | 完整的外部网关地址，包含部署前缀 |
+| `REPORT_RETENTION_DAYS` | `7` | 报告链接及副本的保留天数 |
+| `REPORT_MAX_BYTES` | `10485760` | 单个 HTML 报告最大字节数 |
+
+业务流量始终固定使用 Hermes `default` profile，`HERMES_PROFILE_DEFAULT` 不会改变此行为。
 
 ## 接口
 
-接口和 Hermes 参数的详细对应关系见 [docs/interface-hermes-mapping.md](./docs/interface-hermes-mapping.md)。
-`POST /v1/chat` 的详细参数和传参逻辑见 [docs/v1-chat-api.md](./docs/v1-chat-api.md)。
+对外调用方请使用精简版 [docs/v1-api-reference-public.md](./docs/v1-api-reference-public.md)。完整 `/v1` 参考见 [docs/v1-api-reference.md](./docs/v1-api-reference.md)；接口和 Hermes 参数的详细对应关系见 [docs/interface-hermes-mapping.md](./docs/interface-hermes-mapping.md)，`POST /v1/chat` 的附件和传参细节见 [docs/v1-chat-api.md](./docs/v1-chat-api.md)。
 
 ### `POST /v1/chat`
 
 创建或续聊一个会话。
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/chat \
+curl -X POST http://127.0.0.1:8003/v1/chat \
   -H 'content-type: application/json' \
   -d '{"user_id":"alice","question":{"text":"帮我总结一下今天的重点"}}'
 ```
@@ -63,7 +115,7 @@ curl -X POST http://127.0.0.1:8011/v1/chat \
 带图片 URL：
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/chat \
+curl -X POST http://127.0.0.1:8003/v1/chat \
   -H 'content-type: application/json' \
   -d '{
     "question": {
@@ -76,8 +128,7 @@ curl -X POST http://127.0.0.1:8011/v1/chat \
       ]
     },
     "session_id": "demo-session",
-    "user_id": "alice",
-    "profile": "default"
+    "user_id": "alice"
   }'
 ```
 
@@ -91,17 +142,19 @@ curl -X POST http://127.0.0.1:8011/v1/chat \
 列出当前用户的会话。
 
 ```bash
-curl 'http://127.0.0.1:8011/v1/sessions?user_id=alice'
+curl 'http://127.0.0.1:8003/v1/sessions?user_id=alice'
 ```
 
 不传 `user_id` 时默认查询 `guest`。
 
-### `GET /v1/sessions/{session_id}/messages`
+### `GET /v1/messages`
 
-查看指定会话历史。需要会话内搜索时，在同一个接口上追加 `q`：
+统一查询消息：带 `session_id` 时读取一个会话的消息；同时带 `session_id` 和 `q` 时搜索该会话；只带 `q` 时搜索当前用户全部会话。全局搜索必须提供非空 `q`。所有模式支持 `limit`（默认 `20`）和 `offset`（默认 `0`）。
 
 ```bash
-curl 'http://127.0.0.1:8011/v1/sessions/demo-session/messages?user_id=alice&q=hello'
+curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&session_id=demo-session'
+curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&session_id=demo-session&q=hello'
+curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&q=hello'
 ```
 
 ### `POST /v1/chat`
@@ -109,22 +162,18 @@ curl 'http://127.0.0.1:8011/v1/sessions/demo-session/messages?user_id=alice&q=he
 创建会话或向指定会话继续发送消息。指定会话时，把 `session_id` 放在请求体里。
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/chat \
+curl -X POST http://127.0.0.1:8003/v1/chat \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-session","user_id":"alice","question":{"text":"继续聊这个话题"}}'
 ```
 
-如果该 `session_id` 已经存在，也可以省略 `user_id` 和 `profile`：
+如果该 `session_id` 已经存在，也可以省略 `user_id`：
 
 ```bash
-curl -X POST http://127.0.0.1:8011/v1/chat \
+curl -X POST http://127.0.0.1:8003/v1/chat \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo-session","question":{"text":"继续聊这个话题"}}'
 ```
-
-### `GET /v1/users/me`
-
-查看当前用户的默认 Hermes profile。
 
 ### `GET /admin`
 
@@ -136,7 +185,7 @@ curl -X POST http://127.0.0.1:8011/v1/chat \
 
 ### `GET /admin/chat`
 
-管理员在线对话页，支持输入文本并直接上传本地图片或文件。页面通过管理员 Cookie 和 CSRF token 调用 `POST /admin/api/chat`，不会向浏览器暴露 `GATEWAY_API_KEY`。上传附件与 `POST /v1/chat` 的 URL 附件会复用同一套 Hermes 调用、会话和消息记录逻辑。
+管理员在线对话页，支持输入文本并直接上传本地图片或文件。页面通过管理员 Cookie 和 CSRF token 调用 `POST /admin/v1/chat`，不会向浏览器暴露 `GATEWAY_API_KEY`。上传附件与 `POST /v1/chat` 的 URL 附件会复用同一套 Hermes 调用、会话和消息记录逻辑。
 
 服务部署在反向代理子路径时，设置 `PUBLIC_BASE_PATH`。例如当前部署路径为 `/tools2/hermes-gateway`：
 
@@ -146,16 +195,30 @@ PUBLIC_BASE_PATH=/tools2/hermes-gateway
 
 之后从 `https://athena.agoralab.co/tools2/hermes-gateway/admin/chat` 访问页面。
 
+管理员在管理面板选择用户后，可勾选其 private skills。网关仅会将该用户已绑定且当前启用的 private skill 转为 Hermes `-s <skill>` 参数；`guest` 用户会在服务启动时自动创建，也可在同一页面管理绑定。
+
+管理员页面使用的业务 API 为 `GET /admin/v1/dashboard`、`GET /admin/v1/capabilities?scope=private`、`GET/PATCH /admin/v1/users/{user_id}`、`GET /admin/v1/conversations`、`GET /admin/v1/conversations/{session_id}/timeline`、`GET /admin/v1/search` 与 `POST /admin/v1/chat`。所有接口均由管理员 Cookie 保护，写操作还要求页面下发的 CSRF token。
+
+### HTML 报告页面
+
+两个聊天入口都会将回复中 `REPORT_SOURCE_ROOT` 下明确给出的单个 `.html` 文件路径替换为 HTTPS 报告页面链接。网关保存独立文件副本，历史消息与当前回答包含相同链接。源文件清理或网关重启不影响未过期的副本。
+
+网关在每次 Hermes CLI 请求中加入报告交付说明，包括已有会话续聊。报告 Skill 在该场景下只生成本地 HTML，跳过 StaticSpaces 发布和凭据检查；Hermes 静默模式不输出文件 diff 预览，避免将 HTML 源码混入回答。
+
+`GET /v1/reports/{filename}/{download_token}` 使用原始报告文件名和 256 位随机访问凭证，无需 Gateway Key 或管理员 Cookie；持有链接即可打开页面。默认有效期 7 天，过期、无效凭证或文件名不匹配时返回 `404`。HTML 以页面形式直接打开。文件丢失、超过大小限制或真实路径越界时，回答中的路径替换为“报告暂不可用”，其余聊天结论正常返回。
+
+网关在启动后及每小时清理过期报告，发布新报告时也会清理。当前 Nginx 的 `/tools2/hermes-gateway/v1/` 代理覆盖报告接口，无需新增静态目录映射。
+
 ## 测试
 
 ```bash
-cd /Users/panweikui/Pwk-Coding/automation/agent/hermes-http-gateway
+cd /home/devops/ka/automation/agent/hermes-http-gateway
 .venv/bin/python -m unittest discover -s tests
 ```
 
 ## 认证
 
-- 业务用户标识使用 `user_id`，POST 接口放 JSON body，GET 接口放 query
+- 业务用户标识使用 `user_id`，POST 接口放 JSON body，GET 接口放 query；业务请求固定使用 Hermes `default` profile
 - `user_id` 不传时缺省值是 `guest`；已有会话命中时会继承原会话用户
 - 如果设置了 `GATEWAY_API_KEY`，还需要 `X-Gateway-Key` 或 `Authorization: Bearer ...`
 - 管理页和管理 API 需要先登录，账号密码来自 `ADMIN_USERNAME` / `ADMIN_PASSWORD`

@@ -6,6 +6,8 @@
 
 调用方只需要保存和传递网关返回的 `session_id`。`hermes_session_id` 是 Hermes CLI 内部会话 ID，网关会持久化并在续聊时自动使用，外部一般不需要处理。
 
+完整的对外 `/v1` 接口目录见 [v1-api-reference.md](./v1-api-reference.md)；包含管理员接口的完整内部目录见 [api-reference.md](./api-reference.md)。
+
 ## 1. 接口概览
 
 `POST /v1/chat` 同时承担两类行为：
@@ -18,7 +20,7 @@
 最小请求：
 
 ```bash
-curl -X POST "http://127.0.0.1:8011/v1/chat" \
+curl -X POST "http://127.0.0.1:8003/v1/chat" \
   -H "Content-Type: application/json" \
   -d '{
     "question": {
@@ -34,7 +36,6 @@ curl -X POST "http://127.0.0.1:8011/v1/chat" \
   "session_id": "demo-session",
   "hermes_session_id": "01K3ATEXAMPLEHERMESSESSION",
   "user_id": "alice",
-  "hermes_profile": "default",
   "answer": "Hermes 返回的回答内容"
 }
 ```
@@ -68,7 +69,6 @@ Authorization: Bearer <gateway_api_key>
 | `question.attachments[].type` | 是 | string | `image` 或 `file` | 决定下载校验和传给 Hermes 的方式 |
 | `user_id` | 否 | string | 最长 120 字符 | 新会话不传或传空白时使用 `guest`；已有会话不传时继承原会话用户 |
 | `session_id` | 否 | string | 最长 120 字符；非空传入时去除首尾空白后必须匹配 `^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$` | 外部会话 ID；不传或传空字符串时自动生成 |
-| `profile` | 否 | string | 最长 120 字符 | 新会话传非空值时用于选择 Hermes profile；已有会话传非空值时只做一致性校验 |
 
 会话标题由网关根据 `question.text` 自动生成：非空文本最多保留 80 字符；只有附件且没有文本时标题为 `附件请求`。外部不能传 `title`。
 
@@ -85,8 +85,7 @@ Authorization: Bearer <gateway_api_key>
 
 1. `session_id`：不传或传空字符串则生成 UUID；传入非空值则校验格式后直接使用。
 2. `user_id`：传入非空白值则使用去除首尾空白后的值；否则使用 `guest`。
-3. `profile`：请求传了非空值就使用请求值；否则使用该用户的 `default_hermes_profile`；用户不存在时会先创建用户，并使用服务端 `HERMES_PROFILE_DEFAULT`，默认 `default`。
-4. 网关创建 `conversations` 记录，保存用户消息，调用 Hermes 首轮，再保存助手消息和 `hermes_session_id`。
+3. 网关固定使用 Hermes `default` profile，创建 `conversations` 记录，保存用户消息，调用 Hermes 首轮，再保存助手消息和 `hermes_session_id`。
 
 ### 4.2 续聊已有会话
 
@@ -94,9 +93,7 @@ Authorization: Bearer <gateway_api_key>
 
 1. 如果没有显式传 `user_id`，继承原会话 `user_id`。
 2. 如果显式传了 `user_id`，必须等于原会话 `user_id`，否则返回 `409`。
-3. 如果没有传非空 `profile`，继承原会话 `hermes_profile`。
-4. 如果传了非空 `profile`，必须等于原会话 `hermes_profile`，否则返回 `409`。
-5. 网关使用原会话保存的 `hermes_session_id` 调用 `hermes chat --resume`。
+3. 网关使用原会话保存的 `hermes_session_id` 调用 `hermes chat --resume`，并统一使用 `default` profile。
 
 续聊时调用方推荐只传：
 
@@ -161,7 +158,7 @@ URL 校验：
 附件请求示例：
 
 ```bash
-curl -X POST "http://127.0.0.1:8011/v1/chat" \
+curl -X POST "http://127.0.0.1:8003/v1/chat" \
   -H "Content-Type: application/json" \
   -H "X-Gateway-Key: your_gateway_key" \
   -d '{
@@ -179,8 +176,7 @@ curl -X POST "http://127.0.0.1:8011/v1/chat" \
       ]
     },
     "session_id": "demo-session",
-    "user_id": "alice",
-    "profile": "default"
+    "user_id": "alice"
   }'
 ```
 
@@ -201,7 +197,9 @@ curl -X POST "http://127.0.0.1:8011/v1/chat" \
 
 ## 6. 传给 Hermes 的 prompt
 
-网关保存到消息表里的用户消息内容是原始 `question.text`。真正传给 Hermes 的 prompt 可能会追加附件引用。
+网关保存到消息表里的用户消息内容是原始 `question.text`。实际 CLI prompt 会在本轮问题前加入 `[HTTP Gateway report delivery]` 交付说明，并按需追加附件引用。交付说明要求报告 Skill 只生成、验证并保留本地 HTML，不执行 StaticSpaces 发布，也不输出 HTML 源码或发布凭据错误；Gateway 在回答返回后生成报告页面链接。首轮和续聊都带该说明，不改写此前的会话历史或缓存系统提示词。
+
+以下示例展示本轮问题及附件段落，省略固定的网关交付说明：
 
 无附件时：
 
@@ -223,20 +221,30 @@ curl -X POST "http://127.0.0.1:8011/v1/chat" \
 <question.text>
 
 附件文件：
-- @file:/tmp/hermes/2026-08-26/demo-session/<sha256>.txt
+- @file:/tmp/hermes/<YYYY-MM-DD>/demo-session/<sha256>.txt
 ```
 
-如果 `question.text` 为空但有附件，prompt 只包含附件段落。
+如果 `question.text` 为空但有附件，本轮用户问题部分只包含附件段落，CLI prompt 仍包含固定的网关交付说明。
 
 ## 7. Hermes CLI 调用
 
 网关会在 Hermes 命令前追加服务端配置：
 
-- `-p <profile>`：本会话 Hermes profile。
+- `-p default`：业务请求固定使用 Hermes `default` profile。
 - `-m <DEFAULT_MODEL>`：配置了 `DEFAULT_MODEL` 时追加，外部请求不能覆盖。
 - `--provider <DEFAULT_PROVIDER>`：配置了 `DEFAULT_PROVIDER` 时追加，外部请求不能覆盖。
 
 如果只配置了 `DEFAULT_PROVIDER` 但没有配置 `DEFAULT_MODEL`，`/v1/chat` 会返回 `400`。
+
+网关会读取当前用户在管理员页面绑定的 private skills。只有仍存在于 Hermes 私有目录且处于启用状态的绑定，才会追加为重复的 `-s <skill_id>` 参数。调用方不能在 `/v1/chat` 请求体中直接指定 Skills。
+
+私有目录由以下命令读取，并在网关进程内缓存 45 秒：
+
+```bash
+hermes -p default skills list --scope private --json
+```
+
+目录读取失败时，聊天仍会继续，但本轮不传 private skills，管理员请求时间线会记录该阶段错误。
 
 Hermes 运行环境还会默认设置：
 
@@ -248,7 +256,7 @@ Hermes 运行环境还会默认设置：
 只有在首轮没有附件、没有待提交附件，并且最终 prompt 不包含 `@` 时，才走纯文本快捷调用：
 
 ```bash
-hermes -p <profile> -z <prompt> --usage-file <usage_json_path>
+hermes -p default -z <prompt> --usage-file <usage_json_path>
 ```
 
 ### 7.2 首轮带附件或 attachment root
@@ -256,7 +264,7 @@ hermes -p <profile> -z <prompt> --usage-file <usage_json_path>
 首轮只要有图片、文件、待提交附件，或最终 prompt 包含 `@`，就走 `hermes chat`：
 
 ```bash
-hermes -p <profile> chat -Q -q <prompt> --usage-file <usage_json_path> \
+hermes -p default chat -Q -q <prompt> --usage-file <usage_json_path> \
   --attachment-root <session_attachment_dir> \
   --image <local_image_path_1> \
   --image <local_image_path_2>
@@ -269,7 +277,7 @@ hermes -p <profile> chat -Q -q <prompt> --usage-file <usage_json_path> \
 续聊始终使用 Hermes 内部会话 ID：
 
 ```bash
-hermes -p <profile> chat --resume <hermes_session_id> -Q -q <prompt> --usage-file <usage_json_path>
+hermes -p default chat --resume <hermes_session_id> -Q -q <prompt> --usage-file <usage_json_path>
 ```
 
 如果本轮有附件或 prompt 需要 attachment root，会追加：
@@ -291,10 +299,13 @@ hermes -p <profile> chat --resume <hermes_session_id> -Q -q <prompt> --usage-fil
 | `session_id` | 网关对外会话 ID。后续续聊继续传这个值 |
 | `hermes_session_id` | Hermes 内部会话 ID。通常只用于排查 |
 | `user_id` | 本会话归属用户 |
-| `hermes_profile` | 本会话实际使用的 Hermes profile |
-| `answer` | Hermes stdout 去除首尾空白后的内容 |
+| `answer` | Hermes stdout 去除首尾空白后的内容；已识别的 HTML 报告本地路径会替换为 HTTPS 报告页面链接 |
 
 响应不会返回附件详情、消息详情、会话详情或 usage。相关信息仍会在网关内部保存或用于排查。
+
+两个聊天入口会识别 `REPORT_SOURCE_ROOT`（默认 `~/.hermes/cache/documents`）下明确给出的单个 `.html` 文件，将副本保存到 `REPORT_STORAGE_ROOT`（默认 `./data/reports`），再把路径替换为 `${REPORT_PUBLIC_BASE_URL}/v1/reports/{filename}/{download_token}`。访问凭证无需额外鉴权头，默认保留 7 天；文件名不匹配或过期返回 `404`。HTML 以页面形式直接打开，历史消息保存同一个链接。
+
+单个报告默认最大 10MB。文件不存在、超过限制或真实路径不在允许源目录内时，仅将报告路径替换为“报告暂不可用”，不丢弃聊天结论。
 
 ## 9. 常见错误
 
@@ -306,7 +317,6 @@ hermes -p <profile> chat --resume <hermes_session_id> -Q -q <prompt> --usage-fil
 | `400` | 附件 URL、下载、大小、图片格式校验失败 | 具体错误信息由附件校验返回 |
 | `401` | `GATEWAY_API_KEY` 校验失败 | `Unauthorized` |
 | `409` | 已有会话显式传入了不同的 `user_id` | `session already belongs to a different user` |
-| `409` | 已有会话显式传入了不同的 `profile` | `session already belongs to a different Hermes profile` |
 | `409` | 旧请求被同一 `user_id + session_id` 的新请求替代 | `request superseded by a newer request` |
 | `422` | 请求体结构或字段校验失败，例如缺少 `question`、多余字段、空文本且无附件、附件类型非法、字段超长 | FastAPI/Pydantic 校验详情 |
 | `502` | Hermes CLI 执行失败、超时或二进制不存在 | `Hermes invocation failed` |
@@ -318,5 +328,5 @@ Hermes 调用失败时，`detail` 是对象，包含 `message`、`error`、`stdo
 
 1. 首次请求可以不传 `session_id`，使用响应里的 `session_id` 作为后续会话 ID。
 2. 如果外部系统已经有自己的会话 ID，也可以首次请求就传 `session_id`。
-3. 续聊时只传 `session_id` 和 `question`；不要重复传 `user_id`、`profile`，除非需要显式校验它们和原会话一致。
+3. 续聊时只传 `session_id` 和 `question`；`user_id` 可省略或用于显式校验其与原会话一致。
 4. 外部只需要持久化网关 `session_id`。`hermes_session_id` 可用于排查，但不作为请求参数传入。

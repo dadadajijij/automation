@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -114,6 +114,11 @@ class Settings:
     attachment_redirect_limit: int
     attachment_storage_root: Path
     attachment_retention_days: int
+    report_source_root: Path = field(default_factory=lambda: Path.home() / ".hermes/cache/documents")
+    report_storage_root: Path = field(default_factory=lambda: PROJECT_ROOT / "data/reports")
+    report_public_base_url: str = "https://athena.agoralab.co/tools2/hermes-gateway"
+    report_retention_days: int = 7
+    report_max_bytes: int = 10 * 1024 * 1024
 
 
 def load_settings() -> Settings:
@@ -123,7 +128,8 @@ def load_settings() -> Settings:
         database_url=_env_path("DATABASE_URL", PROJECT_ROOT / "data" / "hermes_gateway.sqlite"),
         hermes_bin=_detect_hermes_bin(),
         hermes_workdir=_default_workdir(),
-        hermes_profile_default=os.environ.get("HERMES_PROFILE_DEFAULT", "default").strip() or "default",
+        # Business traffic is intentionally pinned to Hermes' default profile.
+        hermes_profile_default="default",
         gateway_api_key=os.environ.get("GATEWAY_API_KEY", "").strip() or None,
         admin_username=os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin",
         admin_password=os.environ.get("ADMIN_PASSWORD", "").strip() or None,
@@ -142,4 +148,11 @@ def load_settings() -> Settings:
         attachment_redirect_limit=_env_int("ATTACHMENT_REDIRECT_LIMIT", 3),
         attachment_storage_root=_env_path("ATTACHMENT_STORAGE_ROOT", Path("/tmp/hermes")),
         attachment_retention_days=_env_int("ATTACHMENT_RETENTION_DAYS", 3),
+        report_source_root=_env_path("REPORT_SOURCE_ROOT", Path.home() / ".hermes/cache/documents"),
+        report_storage_root=_env_path("REPORT_STORAGE_ROOT", PROJECT_ROOT / "data/reports"),
+        report_public_base_url=os.environ.get(
+            "REPORT_PUBLIC_BASE_URL", "https://athena.agoralab.co/tools2/hermes-gateway"
+        ).strip().rstrip("/"),
+        report_retention_days=_env_int("REPORT_RETENTION_DAYS", 7),
+        report_max_bytes=_env_int("REPORT_MAX_BYTES", 10 * 1024 * 1024),
     )

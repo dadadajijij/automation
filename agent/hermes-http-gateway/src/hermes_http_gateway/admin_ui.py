@@ -239,7 +239,6 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
                 <div class="field"><label for="userId">用户 ID</label><input id="userId" value="admin-playground" maxlength="120" /></div>
                 <div class="field"><label for="sessionId">会话 ID</label><input id="sessionId" maxlength="120" placeholder="留空创建新会话" /></div>
               </div>
-              <div class="field"><label for="profile">Hermes Profile</label><input id="profile" maxlength="120" placeholder="留空使用默认 Profile" /></div>
               <div class="field"><label for="question">问题</label><textarea id="question" maxlength="20000" placeholder="输入问题，或只上传附件"></textarea></div>
               <div class="field"><label for="files">图片或文件</label><input id="files" type="file" multiple /></div>
               <ul class="attachments" id="attachments"></ul>
@@ -255,15 +254,15 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
             window.__HERMES_ADMIN_CHAT__ = {payload};
             const config = window.__HERMES_ADMIN_CHAT__;
             const route = (path) => `${{config.publicBasePath || ''}}${{path}}`;
-            const adminPath = (suffix) => route('/' + 'admin' + suffix);
+              const adminPath = (suffix) => route('/' + 'admin' + '/v1' + suffix);
             const els = {{
               userId: document.getElementById('userId'), sessionId: document.getElementById('sessionId'),
-              profile: document.getElementById('profile'), question: document.getElementById('question'),
+              question: document.getElementById('question'),
               files: document.getElementById('files'), attachments: document.getElementById('attachments'),
               sendBtn: document.getElementById('sendBtn'), newSessionBtn: document.getElementById('newSessionBtn'),
               status: document.getElementById('status'), answer: document.getElementById('answer'),
             }};
-            document.getElementById('dashboardLink').href = adminPath('');
+            document.getElementById('dashboardLink').href = route('/admin');
 
             function formatBytes(value) {{
               if (value < 1024) return `${{value}} B`;
@@ -292,18 +291,17 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
               form.set('text', text);
               form.set('user_id', els.userId.value.trim() || 'admin-playground');
               form.set('session_id', els.sessionId.value.trim());
-              form.set('profile', els.profile.value.trim());
               Array.from(els.files.files || []).forEach((file) => form.append('files', file, file.name));
               els.sendBtn.disabled = true;
               setStatus('Hermes 正在处理附件和请求...');
               els.answer.textContent = '';
               try {{
-                const resp = await fetch(adminPath('/api/chat'), {{
+                const resp = await fetch(adminPath('/chat'), {{
                   method: 'POST', credentials: 'same-origin',
                   headers: {{ 'x-csrf-token': config.csrfToken }}, body: form,
                 }});
                 const data = await resp.json().catch(() => ({{}}));
-                if (resp.status === 401) {{ location.href = adminPath('/login'); return; }}
+                if (resp.status === 401) {{ location.href = route('/admin/login'); return; }}
                 if (!resp.ok) throw new Error(typeof data.detail === 'string' ? data.detail : data.message || resp.statusText);
                 els.sessionId.value = data.session_id || els.sessionId.value;
                 els.answer.textContent = data.answer || '';
@@ -327,8 +325,13 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
     )
 
 
-def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
-    payload = json.dumps({"username": username, "publicBasePath": public_base_path}, ensure_ascii=False)
+def render_dashboard_page(
+    *, username: str, csrf_token: str, public_base_path: str = ""
+) -> str:
+    payload = json.dumps(
+        {"username": username, "csrfToken": csrf_token, "publicBasePath": public_base_path},
+        ensure_ascii=False,
+    )
     return textwrap.dedent(
         f"""\
         <!doctype html>
@@ -543,6 +546,25 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
               font-size: 12px;
             }}
             .notice {{ color: var(--muted); font-size: 12px; }}
+            .skill-bindings {{ margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }}
+            .skill-binding-list {{ display: grid; gap: 8px; margin-top: 10px; }}
+            .skill-binding-groups {{ display: grid; gap: 8px; margin-top: 10px; }}
+            .skill-binding-group {{ border: 1px solid var(--line); }}
+            .skill-binding-group summary {{
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              gap: 10px;
+              padding: 9px 10px;
+              cursor: pointer;
+              color: var(--text);
+            }}
+            .skill-binding-group[open] summary {{ border-bottom: 1px solid var(--line); }}
+            .skill-binding-group .skill-binding-list {{ margin: 0; padding: 10px; }}
+            .skill-binding {{ display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: start; }}
+            .skill-binding input {{ width: auto; margin-top: 3px; }}
+            .skill-binding-name {{ overflow-wrap: anywhere; }}
+            .skill-binding-actions {{ margin-top: 10px; display: flex; justify-content: flex-end; }}
             .foot {{ color: var(--muted); font-size: 12px; }}
             @media (max-width: 1200px) {{
               .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
@@ -589,6 +611,14 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
                     </thead>
                     <tbody id="usersTable"></tbody>
                   </table>
+                  <div class="skill-bindings">
+                    <div class="section-head" style="padding:0 0 10px; border:0;">
+                      <h2 style="font-size:13px;">Private Skills</h2>
+                      <span class="meta" id="privateSkillsMeta">未选择用户</span>
+                    </div>
+                    <div class="skill-binding-list" id="privateSkillsList"><div class="notice">选择用户后管理绑定</div></div>
+                    <div class="skill-binding-actions"><button class="primary" id="savePrivateSkillsBtn" disabled>保存绑定</button></div>
+                  </div>
                 </div>
               </section>
 
@@ -640,8 +670,8 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
             window.__HERMES_ADMIN__ = {payload};
             const basePath = window.__HERMES_ADMIN__.publicBasePath || '';
             const route = (path) => `${{basePath}}${{path}}`;
-            const adminPath = (suffix) => route('/' + 'admin' + suffix);
-            document.getElementById('chatLink').href = adminPath('/chat');
+            const adminPath = (suffix) => route('/' + 'admin' + '/v1' + suffix);
+            document.getElementById('chatLink').href = route('/admin/chat');
             const state = {{
               userFilterText: '',
               selectedUser: '',
@@ -665,6 +695,9 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
               conversationDetail: document.getElementById('conversationDetail'),
               messagesList: document.getElementById('messagesList'),
               searchResults: document.getElementById('searchResults'),
+              privateSkillsMeta: document.getElementById('privateSkillsMeta'),
+              privateSkillsList: document.getElementById('privateSkillsList'),
+              savePrivateSkillsBtn: document.getElementById('savePrivateSkillsBtn'),
             }};
 
             function esc(v) {{
@@ -703,30 +736,36 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
             function renderRuntimeAudit(audit) {{
               if (!audit) return '';
               const events = runtimeEvents(audit);
+              const skillAudit = audit.skill_audit || {{}};
+              const skillResults = Array.isArray(skillAudit.skills) ? skillAudit.skills : [];
               const main = audit.main || {{}};
               const finalRoute = [main.model, main.provider].filter(Boolean).join(' • ');
               const image = [...events].reverse().find((event) => event.kind === 'image_input');
               const vision = [...events].reverse().find((event) => event.kind === 'auxiliary' && event.task === 'vision');
               const fallback = events.some((event) => event.kind === 'main_fallback');
+              const privateSkills = Array.isArray(audit.private_skills) ? audit.private_skills : [];
               const summary = [
                 finalRoute ? `实际主模型：${{finalRoute}}${{fallback ? '（已回退）' : ''}}` : '',
                 image ? `图片：${{image.input_mode || '-'}}` : '',
                 vision ? `视觉：${{[vision.model, vision.provider].filter(Boolean).join(' • ') || '-'}}` : '',
+                privateSkills.length ? `Private skills：${{privateSkills.map((skill) => skill.id).filter(Boolean).join(', ')}}` : '',
+                skillResults.length ? `Skill 状态：${{skillResults.map((skill) => `${{skill.id || '-'}}=${{skill.status || 'unknown'}}`).join(', ')}}` : '',
                 audit.context_window ? `上下文：${{audit.context_window}}` : '',
               ].filter(Boolean);
-              if (!summary.length && !events.length) return '';
-              return `<div class="runtime-audit">${{summary.map((line) => `<div>${{esc(line)}}</div>`).join('')}}${{events.length ? `<details class="runtime-audit-details"><summary>展开模型执行详情</summary>${{events.map((event) => `<div class="runtime-audit-event">${{esc(runtimeLabel(event))}}</div>`).join('')}}</details>` : ''}}</div>`;
+              if (!summary.length && !events.length && !skillResults.length) return '';
+              const skillDetails = skillResults.length ? `<details class="runtime-audit-details"><summary>展开 Skill 执行详情</summary>${{skillResults.map((skill) => `<div class="runtime-audit-event">${{esc(skill.id || '-')}}：${{esc(skill.status || 'unknown')}}${{skill.reason ? `（${{esc(skill.reason)}}）` : ''}}${{skill.duration_ms != null ? ` • ${{formatDuration(skill.duration_ms)}}` : ''}}</div>`).join('')}}</details>` : '';
+              return `<div class="runtime-audit">${{summary.map((line) => `<div>${{esc(line)}}</div>`).join('')}}${{skillDetails}}${{events.length ? `<details class="runtime-audit-details"><summary>展开模型执行详情</summary>${{events.map((event) => `<div class="runtime-audit-event">${{esc(runtimeLabel(event))}}</div>`).join('')}}</details>` : ''}}</div>`;
             }}
 
             async function api(path, options = {{}}) {{
               const resp = await fetch(path, {{
+                ...options,
                 credentials: 'same-origin',
                 headers: {{ 'content-type': 'application/json', ...(options.headers || {{}}) }},
-                ...options,
               }});
               const data = await resp.json().catch(() => ({{}}));
               if (resp.status === 401) {{
-                location.href = adminPath('/login');
+                location.href = route('/admin/login');
                 return data;
               }}
               if (!resp.ok) {{
@@ -749,10 +788,54 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
                   state.selectedUser = row.getAttribute('data-user') || '';
                   state.selectedSession = '';
                   renderConversation(null);
-                  await loadUsers();
+                  await loadDashboard();
                   await loadConversations();
+                  await loadUserDetails();
                 }});
               }});
+            }}
+
+            function renderPrivateSkills(data) {{
+              if (!data) {{
+                els.privateSkillsMeta.textContent = '未选择用户';
+                els.privateSkillsList.innerHTML = '<div class="notice">选择用户后管理绑定</div>';
+                els.savePrivateSkillsBtn.disabled = true;
+                return;
+              }}
+              const bound = new Set(data.bound_skill_ids || []);
+              const unavailable = new Set(data.unavailable_skill_ids || []);
+              els.privateSkillsMeta.textContent = data.user_id;
+              const skills = data.available_private_skills || [];
+              const skillGroups = skills.reduce((groups, skill) => {{
+                const source = skill.category || '未分类';
+                (groups[source] ||= []).push(skill);
+                return groups;
+              }}, {{}});
+              els.privateSkillsList.innerHTML = skills.length ? `<div class="skill-binding-groups">${{Object.entries(skillGroups).map(([source, groupSkills]) => {{
+                const selectedCount = groupSkills.filter((skill) => bound.has(skill.id)).length;
+                return `
+                  <details class="skill-binding-group">
+                    <summary>
+                      <strong>${{esc(source)}}</strong>
+                      <span class="meta">${{selectedCount}} / ${{groupSkills.length}}</span>
+                    </summary>
+                    <div class="skill-binding-list">
+                      ${{groupSkills.map((skill) => `
+                        <label class="skill-binding">
+                          <input type="checkbox" data-private-skill="${{esc(skill.id)}}" ${{bound.has(skill.id) ? 'checked' : ''}} ${{skill.enabled ? '' : 'disabled'}} />
+                          <span class="skill-binding-name"><strong>${{esc(skill.name)}}</strong></span>
+                        </label>
+                      `).join('')}}
+                    </div>
+                  </details>`;
+              }}).join('')}}</div>` : '<div class="notice">当前 default profile 没有可用 private skills</div>';
+              if (unavailable.size) {{
+                const note = document.createElement('div');
+                note.className = 'notice';
+                note.textContent = `失效绑定：${{Array.from(unavailable).join(', ')}}`;
+                els.privateSkillsList.appendChild(note);
+              }}
+              els.savePrivateSkillsBtn.disabled = false;
             }}
 
             function renderConversations(items) {{
@@ -768,8 +851,9 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
                 row.addEventListener('click', async () => {{
                   state.selectedSession = row.getAttribute('data-session') || '';
                   state.selectedUser = row.getAttribute('data-user') || state.selectedUser;
-                  await loadUsers();
+                  await loadDashboard();
                   await loadConversations();
+                  await loadUserDetails();
                   await loadConversation();
                 }});
               }});
@@ -829,18 +913,15 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
               `).join('') : '<div class="notice">没有搜索结果</div>';
             }}
 
-            async function loadSummary() {{
-              const data = await api(adminPath('/api/summary'));
-              els.usersCount.textContent = data.users;
-              els.sessionsCount.textContent = data.conversations;
-              els.requestsCount.textContent = data.requests;
-              els.messagesCount.textContent = data.messages;
-            }}
-
-            async function loadUsers() {{
+            async function loadDashboard() {{
               const q = state.userFilterText.trim();
-              const path = q ? adminPath(`/api/users?query=${{encodeURIComponent(q)}}`) : adminPath('/api/users');
+              const path = q ? adminPath(`/dashboard?user_query=${{encodeURIComponent(q)}}`) : adminPath('/dashboard');
               const data = await api(path);
+              const summary = data.summary || {{}};
+              els.usersCount.textContent = summary.users ?? 0;
+              els.sessionsCount.textContent = summary.conversations ?? 0;
+              els.requestsCount.textContent = summary.requests ?? 0;
+              els.messagesCount.textContent = summary.messages ?? 0;
               renderUsers(data.users || []);
             }}
 
@@ -851,9 +932,46 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
                 // leave it alone; the search box is for global search only
               }}
               if (state.selectedUser) params.set('user_id', state.selectedUser);
-              const path = params.toString() ? adminPath(`/api/conversations?${{params.toString()}}`) : adminPath('/api/conversations');
+              const path = params.toString() ? adminPath(`/conversations?${{params.toString()}}`) : adminPath('/conversations');
               const data = await api(path);
               renderConversations(data.conversations || []);
+            }}
+
+            async function loadUserDetails() {{
+              if (!state.selectedUser) {{
+                renderPrivateSkills(null);
+                return;
+              }}
+              const [userData, capabilitiesData] = await Promise.all([
+                api(adminPath(`/users/${{encodeURIComponent(state.selectedUser)}}`)),
+                api(route('/admin/v1/capabilities?scope=private')),
+              ]);
+              const bindings = userData.private_skills || {{}};
+              const skills = capabilitiesData.skills || [];
+              const availableIds = new Set(skills.map((skill) => skill.id));
+              renderPrivateSkills({{
+                ...bindings,
+                available_private_skills: skills,
+                unavailable_skill_ids: (bindings.bound_skill_ids || []).filter((id) => !availableIds.has(id)),
+              }});
+            }}
+
+            async function savePrivateSkills() {{
+              if (!state.selectedUser) return;
+              const skillIds = Array.from(els.privateSkillsList.querySelectorAll('[data-private-skill]:checked'))
+                .map((input) => input.getAttribute('data-private-skill'))
+                .filter(Boolean);
+              els.savePrivateSkillsBtn.disabled = true;
+              try {{
+                await api(adminPath(`/users/${{encodeURIComponent(state.selectedUser)}}`), {{
+                  method: 'PATCH',
+                  headers: {{ 'x-csrf-token': window.__HERMES_ADMIN__.csrfToken }},
+                  body: JSON.stringify({{ private_skill_ids: skillIds }}),
+                }});
+                await loadUserDetails();
+              }} finally {{
+                els.savePrivateSkillsBtn.disabled = false;
+              }}
             }}
 
             async function loadConversation() {{
@@ -861,10 +979,9 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
                 renderConversation(null);
                 return;
               }}
-              const detail = await api(adminPath(`/api/conversations/${{encodeURIComponent(state.selectedSession)}}`));
-              renderConversation(detail.conversation);
-              const messages = await api(adminPath(`/api/conversations/${{encodeURIComponent(state.selectedSession)}}/messages`));
-              renderMessages(messages.timeline || messages.messages || []);
+              const timeline = await api(adminPath(`/conversations/${{encodeURIComponent(state.selectedSession)}}/timeline`));
+              renderConversation(timeline.conversation);
+              renderMessages(timeline.timeline || timeline.messages || []);
             }}
 
             async function doSearch() {{
@@ -873,7 +990,7 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
                 renderSearch([]);
                 return;
               }}
-              const data = await api(adminPath(`/api/search?q=${{encodeURIComponent(q)}}`));
+              const data = await api(adminPath(`/search?q=${{encodeURIComponent(q)}}`));
               renderSearch(data.results || []);
             }}
 
@@ -882,17 +999,18 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
               state.selectedUser = '';
               state.selectedSession = '';
               els.userFilter.value = '';
-              await loadSummary();
-              await loadUsers();
+              await loadDashboard();
               await loadConversations();
               renderConversation(null);
+              renderPrivateSkills(null);
             }}
 
             els.searchBtn.addEventListener('click', doSearch);
             els.refreshBtn.addEventListener('click', refreshAll);
+            els.savePrivateSkillsBtn.addEventListener('click', savePrivateSkills);
             els.logoutBtn.addEventListener('click', async () => {{
-              await fetch(adminPath('/logout'), {{ credentials: 'same-origin' }});
-              location.href = adminPath('/login');
+              await fetch(route('/admin/logout'), {{ credentials: 'same-origin' }});
+              location.href = route('/admin/login');
             }});
             els.searchInput.addEventListener('keydown', (event) => {{
               if (event.key === 'Enter') doSearch();
@@ -900,7 +1018,7 @@ def render_dashboard_page(*, username: str, public_base_path: str = "") -> str:
             els.userFilter.addEventListener('keydown', (event) => {{
               if (event.key === 'Enter') {{
                 state.userFilterText = els.userFilter.value.trim();
-                loadUsers();
+                loadDashboard();
               }}
             }});
             els.userFilter.addEventListener('input', () => {{

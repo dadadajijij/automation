@@ -1069,11 +1069,14 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
     return linked or None
 
 
-def skill_view(
+def _skill_view(
     name: str,
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    *,
+    include_private: bool = False,
+    allowed_private_skill_dirs: Set[Path] | None = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1209,7 +1212,11 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import (
+            get_external_skills_dirs,
+            get_private_external_skills_dirs,
+            get_project_skills_dirs,
+        )
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1234,6 +1241,10 @@ def skill_view(
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
+        private_dirs: list[Path] = []
+        if include_private:
+            private_dirs = list(get_private_external_skills_dirs())
+            all_dirs.extend(private_dirs)
 
         if not all_dirs:
             return json.dumps(
@@ -1327,6 +1338,31 @@ def skill_view(
                     found_md
                 ):
                     _record(None, found_md)
+
+        if allowed_private_skill_dirs:
+            allowed_private_skill_dirs = {
+                path.resolve() for path in allowed_private_skill_dirs
+            }
+
+            def _under_any(path: Path, roots: List[Path] | Set[Path]) -> bool:
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    resolved = path
+                for root in roots:
+                    try:
+                        resolved.relative_to(root.resolve())
+                        return True
+                    except (OSError, ValueError):
+                        continue
+                return False
+
+            candidates = [
+                (skill_dir, skill_md)
+                for skill_dir, skill_md in candidates
+                if not _under_any(skill_md, private_dirs)
+                or _under_any(skill_md, allowed_private_skill_dirs)
+            ]
 
         if len(candidates) > 1 and project_dirs:
             # Cross-tier collision resolution: a project skill intentionally
@@ -1917,6 +1953,48 @@ def skill_view(
         return tool_error(str(e), success=False)
 
 
+def skill_view(
+    name: str,
+    file_path: str = None,
+    task_id: str = None,
+    preprocess: bool = True,
+) -> str:
+    """View a discoverable skill or an explicitly preloaded private skill."""
+    try:
+        from agent.private_skill_access import get_task_private_skill_dirs
+
+        private_dirs = get_task_private_skill_dirs(task_id)
+    except Exception:
+        private_dirs = frozenset()
+    return _skill_view(
+        name,
+        file_path=file_path,
+        task_id=task_id,
+        preprocess=preprocess,
+        include_private=bool(private_dirs),
+        allowed_private_skill_dirs=set(private_dirs) or None,
+    )
+
+
+def preload_skill_view(
+    name: str,
+    *,
+    task_id: str = None,
+    preprocess: bool = False,
+) -> str:
+    """Resolve a skill for the trusted CLI ``-s`` preload path only.
+
+    This helper deliberately is not registered as an agent-facing tool. It is
+    the sole path permitted to include ``skills.private_external_dirs``.
+    """
+    return _skill_view(
+        name,
+        task_id=task_id,
+        preprocess=preprocess,
+        include_private=True,
+    )
+
+
 
 
 if __name__ == "__main__":
@@ -2158,6 +2236,28 @@ def _skill_view_with_bump(args, **kw):
                     task_id=kw.get("task_id"),
                     session_id=kw.get("session_id"),
                 )
+                try:
+                    from agent.gateway_audit import record_task_skill
+                    record_task_skill(
+                        task_id or kw.get("session_id"),
+                        str(resolved),
+                        "succeeded",
+                        reason="skill_view_completed",
+                    )
+                except Exception:
+                    pass
+        elif isinstance(parsed, dict):
+            try:
+                from agent.gateway_audit import record_task_skill
+                record_task_skill(
+                    task_id or kw.get("session_id"),
+                    str(name),
+                    "failed",
+                    error_type="skill_view_error",
+                    reason=str(parsed.get("error") or "skill_view_failed"),
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     return result

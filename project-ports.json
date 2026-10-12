@@ -37,7 +37,10 @@
     "port": "8008:30001",
     "env": {
       "ADMIN_EMAILS": "hantao@agora.io"
-    }
+    },
+    "volumes": [
+    "/home/devops/ka/data/duty/archives:/app/files/archives"
+    ]
   },
   "ailoganalyze": {
     "port": "8009:8000",

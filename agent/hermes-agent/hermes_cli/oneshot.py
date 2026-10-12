@@ -58,14 +58,24 @@ def _normalize_skills(skills: object = None) -> list[str]:
 
 def _build_preloaded_skills_prompt(skills: object = None) -> str | None:
     """Load requested skills using the same partial-success contract as CLI chat."""
+    prompt, _private_skills = _build_preloaded_skills_context(skills)
+    return prompt
+
+
+def _build_preloaded_skills_context(
+    skills: object = None,
+) -> tuple[str | None, list[dict[str, str]]]:
+    """Return the prompt plus turn-scoped private skill grants for oneshot."""
     parsed_skills = _normalize_skills(skills)
     if not parsed_skills:
-        return None
+        return None, []
 
     from agent.skill_commands import build_preloaded_skills_prompt
 
+    private_skills: list[dict[str, str]] = []
     skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
-        parsed_skills
+        parsed_skills,
+        private_skill_out=private_skills,
     )
     if missing_skills:
         missing_display = ", ".join(missing_skills)
@@ -79,7 +89,7 @@ def _build_preloaded_skills_prompt(skills: object = None) -> str | None:
         else:
             raise ValueError(f"Unknown skill(s): {missing_display}")
 
-    return skills_prompt or None
+    return skills_prompt or None, private_skills
 
 
 def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
@@ -465,7 +475,7 @@ def _run_agent(
         single_query=True,
     )
 
-    skills_prompt = _build_preloaded_skills_prompt(skills)
+    skills_prompt, private_skills = _build_preloaded_skills_context(skills)
 
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
@@ -506,6 +516,7 @@ def _run_agent(
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )
+        agent._preloaded_private_skills = private_skills
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
