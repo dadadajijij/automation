@@ -8,13 +8,16 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import zipfile
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -597,6 +600,21 @@ def clone_git_packages(raw_url: str, ref: str | None) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="skill-git-", dir=ROOT) as temp_dir:
         checkout = Path(temp_dir) / "repository"
         command = ["git", "clone", "--depth", "1", "--no-tags"]
+        git_env = os.environ.copy()
+        username, password = git_env.get("username", ""), git_env.get("password", "")
+        if urlparse(clone_url).scheme in {"http", "https"} and (username or password):
+            if not username or not password:
+                raise HTTPException(400, "Git authentication requires both username and password")
+            askpass = Path(temp_dir) / "askpass"
+            helper = Path(__file__).with_name("git_askpass.py").resolve()
+            askpass.write_text(
+                f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(helper))} "$@"\n',
+                encoding="utf-8",
+            )
+            askpass.chmod(0o700)
+            git_env.update(GIT_ASKPASS=str(askpass), GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+            # Do not save the injected credentials through an existing helper.
+            command = ["git", "-c", "credential.helper=", *command[1:]]
         if ref:
             command.extend(["--branch", ref])
         command.extend(["--", clone_url, str(checkout)])
@@ -607,13 +625,18 @@ def clone_git_packages(raw_url: str, ref: str | None) -> list[dict[str, Any]]:
                 text=True,
                 timeout=GIT_TIMEOUT_SECONDS,
                 check=False,
+                env=git_env,
             )
         except FileNotFoundError as exc:
             raise HTTPException(500, "git is not installed on the Skill Manager host") from exc
         except subprocess.TimeoutExpired as exc:
             raise HTTPException(504, "Git clone timed out") from exc
         if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "Git clone failed").strip().splitlines()[-1][:500]
+            detail = (completed.stderr or completed.stdout or "Git clone failed").strip().splitlines()[-1]
+            for secret in (password, quote(password, safe="")):
+                if secret:
+                    detail = detail.replace(secret, "[redacted]")
+            detail = detail[:500]
             raise HTTPException(502, f"Git clone failed: {detail}")
 
         repository_name = unquote(Path(urlparse(clone_url).path.rstrip("/")).name).removesuffix(".git")
@@ -813,5 +836,18 @@ async def history(name: str, request: Request) -> dict[str, Any]:
 
 
 @app.get("/{path:path}", response_class=HTMLResponse)
-async def frontend(path: str) -> HTMLResponse:
-    return HTMLResponse((Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8"))
+async def frontend(path: str, request: Request) -> HTMLResponse:
+    prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+    if prefix and (
+        not prefix.startswith("/")
+        or prefix.startswith("//")
+        or any(ch in prefix for ch in ("?", "#", "\\"))
+    ):
+        raise HTTPException(400, "Invalid deployment prefix")
+    html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+    html = html.replace(
+        '<meta name="skill-manager-base" content="">',
+        f'<meta name="skill-manager-base" content="{escape(prefix, quote=True)}">',
+        1,
+    )
+    return HTMLResponse(html)

@@ -252,6 +252,40 @@ def replace_user_private_skill_bindings(
     return list_user_private_skill_bindings(settings, user_id)
 
 
+def update_user_private_skill_bindings(
+    settings: Settings,
+    *,
+    user_id: str,
+    add: Iterable[str],
+    remove: Iterable[str],
+) -> list[dict[str, Any]]:
+    add_ids, remove_ids = set(add), set(remove)
+    with _connect(settings.database_url) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = {
+            row["skill_id"] for row in conn.execute(
+                "SELECT skill_id FROM user_private_skill_bindings WHERE user_id = ?", (user_id,)
+            )
+        }
+        next_ids = (current | add_ids) - remove_ids
+        if len(next_ids) > 10:
+            raise ValueError("A user can have at most 10 skills")
+        conn.executemany(
+            "DELETE FROM user_private_skill_bindings WHERE user_id = ? AND skill_id = ?",
+            [(user_id, skill_id) for skill_id in current - next_ids],
+        )
+        now = now_iso()
+        conn.executemany(
+            "INSERT INTO user_private_skill_bindings (user_id, skill_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            [(user_id, skill_id, now, now) for skill_id in next_ids - current],
+        )
+        rows = conn.execute(
+            "SELECT user_id, skill_id, created_at, updated_at FROM user_private_skill_bindings WHERE user_id = ? ORDER BY skill_id",
+            (user_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def create_admin_session(
     settings: Settings,
     *,
@@ -537,6 +571,32 @@ def finish_request_event(
                 event_id,
             ),
         )
+
+
+def list_recent_replaceable_request_events(
+    settings: Settings,
+    *,
+    user_id: str,
+    external_session_id: str,
+    before: str,
+    since: str,
+) -> list[dict[str, Any]]:
+    """Return recent requests whose text may be inherited by a file-only turn."""
+    with _connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, prompt, status, http_status, created_at
+            FROM request_events
+            WHERE user_id = ?
+              AND external_session_id = ?
+              AND created_at >= ?
+              AND created_at < ?
+              AND (status = 'superseded' OR (status = 'running' AND http_status IS NULL))
+            ORDER BY created_at ASC
+            """,
+            (user_id, external_session_id, since, before),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def record_request_stage(

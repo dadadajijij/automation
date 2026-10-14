@@ -64,19 +64,19 @@ def list_private_skills(settings: Settings) -> list[dict[str, Any]]:
     except OSError as exc:
         raise PrivateSkillCatalogError(f"Unable to run Hermes skill catalog: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise PrivateSkillCatalogError("Hermes private skill catalog timed out") from exc
+        raise PrivateSkillCatalogError("Hermes skill catalog timed out") from exc
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "unknown error").strip()
-        raise PrivateSkillCatalogError(f"Hermes private skill catalog failed: {detail[:300]}")
+        raise PrivateSkillCatalogError(f"Hermes skill catalog failed: {detail[:300]}")
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise PrivateSkillCatalogError("Hermes private skill catalog returned invalid JSON") from exc
+        raise PrivateSkillCatalogError("Hermes skill catalog returned invalid JSON") from exc
 
     raw_skills = payload.get("skills") if isinstance(payload, dict) else None
     if not isinstance(raw_skills, list):
-        raise PrivateSkillCatalogError("Hermes private skill catalog has no skills list")
+        raise PrivateSkillCatalogError("Hermes skill catalog has no skills list")
     skills = [item for raw in raw_skills if (item := _normalize_skill(raw)) is not None]
     skills.sort(key=lambda item: (item["category"], item["name"]))
     with _cache_lock:

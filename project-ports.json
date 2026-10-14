@@ -68,5 +68,16 @@
   },
   "abtestcompare": {
   "port": "8015:4173"
+  },
+  "skills-manager": {
+    "port": "8016:8000",
+    "volumes": [
+      "/home/devops/ka/data/skills-manager/data:/data",
+      "/home/devops/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro",
+      "/home/devops/.ssh/known_hosts:/root/.ssh/known_hosts:ro"
+    ],
+    "env": {
+      "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes -i /root/.ssh/id_ed25519"
+    }
   }
 }

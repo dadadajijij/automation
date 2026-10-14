@@ -12,7 +12,7 @@
 - Hermes 只放本机或内网
 - 每个外部 `session_id` 对应一个 Hermes 会话
 - 会话与消息都落盘到本地 SQLite
-- Private Skills 绑定关系落盘到 SQLite，并按 `user_id` 生效
+- Skills 绑定关系落盘到 SQLite，并按 `user_id` 生效
 
 ## 入口规则
 
@@ -22,6 +22,7 @@
 - 新请求没有 `session_id` 时，网关会自动创建一个
 - 同一 `session_id` 会复用同一个 Hermes 会话
 - 同一 `user_id + session_id` 的新请求会替代旧的未完成请求；如果旧请求正在下载附件，会先等附件下载完成并合并到新请求
+- 同一会话的文件-only 请求在 2 秒窗口内会尝试继承最近被替代请求的明确问题文本，避免“问题请求”和“文件请求”分开发送时丢失用户意图
 - 所有业务请求固定使用 Hermes `default` profile，调用端不传 profile
 - 私有 skills 由管理员按 `user_id` 绑定；绑定后网关自动追加 Hermes `-s`
 
@@ -133,7 +134,7 @@ curl -X POST http://127.0.0.1:8003/v1/chat \
 ```
 
 `question.attachments[].type=image` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并通过 `--image` 交给 agent；prompt 只追加图片数量的自然语言提示。
-`question.attachments[].type=file` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，并通过 Hermes 的 `@file:` 引用机制交给 agent。
+`question.attachments[].type=file` 会下载到 `/tmp/hermes/<YYYY-MM-DD>/<session_id>/`，只提供文件路径和元信息，并通过 `--attachment-root` 让 Hermes 工具按需分段读取，不使用 `@file:` 全文注入。
 有附件时，`question.text` 可以不传或传空字符串；无附件时必须传非空文本。
 图片和文件默认只保留最近 3 天数据。
 
@@ -149,12 +150,12 @@ curl 'http://127.0.0.1:8003/v1/sessions?user_id=alice'
 
 ### `GET /v1/messages`
 
-统一查询消息：带 `session_id` 时读取一个会话的消息；同时带 `session_id` 和 `q` 时搜索该会话；只带 `q` 时搜索当前用户全部会话。全局搜索必须提供非空 `q`。所有模式支持 `limit`（默认 `20`）和 `offset`（默认 `0`）。
+统一查询消息：带 `session_id` 时读取一个会话的消息；同时带 `session_id` 和 `keyword` 时搜索该会话；只带 `keyword` 时搜索当前用户全部会话。全局搜索必须提供非空 `keyword`。所有模式支持 `limit`（默认 `20`）和 `offset`（默认 `0`）。
 
 ```bash
 curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&session_id=demo-session'
-curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&session_id=demo-session&q=hello'
-curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&q=hello'
+curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&session_id=demo-session&keyword=hello'
+curl 'http://127.0.0.1:8003/v1/messages?user_id=alice&keyword=hello'
 ```
 
 ### `POST /v1/chat`
@@ -195,9 +196,11 @@ PUBLIC_BASE_PATH=/tools2/hermes-gateway
 
 之后从 `https://athena.agoralab.co/tools2/hermes-gateway/admin/chat` 访问页面。
 
-管理员在管理面板选择用户后，可勾选其 private skills。网关仅会将该用户已绑定且当前启用的 private skill 转为 Hermes `-s <skill>` 参数；`guest` 用户会在服务启动时自动创建，也可在同一页面管理绑定。
+管理员在管理面板选择用户后，可勾选其 skills。网关仅会将该用户已绑定且当前启用的 skill 转为 Hermes `-s <skill>` 参数；`guest` 用户会在服务启动时自动创建，也可在同一页面管理绑定。
 
-管理员页面使用的业务 API 为 `GET /admin/v1/dashboard`、`GET /admin/v1/capabilities?scope=private`、`GET/PATCH /admin/v1/users/{user_id}`、`GET /admin/v1/conversations`、`GET /admin/v1/conversations/{session_id}/timeline`、`GET /admin/v1/search` 与 `POST /admin/v1/chat`。所有接口均由管理员 Cookie 保护，写操作还要求页面下发的 CSRF token。
+网关接口统一称为 Skills，内部目录仍通过 Hermes `skills list --scope private --json` 获取，仅管理 Hermes private skills。capabilities 不接收 `scope`；用户绑定接口为 `GET/PATCH /v1/users/{user_id}/skills`。公共和管理员更新均使用 add/remove 增量语义，空对象或空数组不改变绑定。新增须启用，移除允许失效项；最终最多 10 个绑定。管理员页面按勾选差异提交，不提供 PUT/DELETE 清空接口。现存数据库绑定无需迁移。
+
+管理员页面使用的业务 API 为 `GET /admin/v1/dashboard`、`GET /admin/v1/capabilities`、`GET/PATCH /admin/v1/users/{user_id}`、`GET /admin/v1/conversations`、`GET /admin/v1/conversations/{session_id}/timeline`、`GET /admin/v1/search` 与 `POST /admin/v1/chat`。所有接口均由管理员 Cookie 保护，写操作还要求页面下发的 CSRF token。
 
 ### HTML 报告页面
 

@@ -102,7 +102,7 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("/v1/chat", paths)
         self.assertIn("/v1/messages", paths)
         self.assertIn("/v1/capabilities", paths)
-        self.assertIn("/v1/users/{user_id}/private-skills", paths)
+        self.assertIn("/v1/users/{user_id}/skills", paths)
         self.assertIn("/admin/v1/dashboard", paths)
         self.assertIn("/admin/v1/capabilities", paths)
         self.assertIn("/admin/v1/users/{user_id}", paths)
@@ -115,7 +115,7 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn("/v1/sessions/{session_id}/messages", paths)
         self.assertNotIn("/admin/api/summary", paths)
         self.assertNotIn("/admin/api/users", paths)
-        self.assertNotIn("/admin/api/users/{user_id}/private-skills", paths)
+        self.assertNotIn("/admin/api/users/{user_id}/skills", paths)
         self.assertNotIn("/admin/api/conversations/{session_id}", paths)
         self.assertNotIn("/admin/api/conversations/{session_id}/messages", paths)
 
@@ -188,7 +188,7 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn("image-1.png", prompt)
         self.assertNotIn("image-2.png", prompt)
 
-    def test_prompt_with_file_attachments_keeps_file_refs(self):
+    def test_prompt_with_file_attachments_uses_tool_reading_instructions(self):
         prompt = gateway._prompt_with_attachments(
             "请分析日志",
             [],
@@ -197,7 +197,10 @@ class GatewayTests(unittest.TestCase):
 
         self.assertIn("请分析日志", prompt)
         self.assertIn("附件文件", prompt)
-        self.assertIn("@file:/tmp/hermes/demo/app.log", prompt)
+        self.assertIn("路径：/tmp/hermes/demo/app.log", prompt)
+        self.assertIn("大小：", prompt)
+        self.assertIn("使用 Hermes 文件/终端工具按需读取", prompt)
+        self.assertNotIn("@file:", prompt)
 
     def test_audit_body_redacts_signed_url_query_values(self):
         serialized = gateway._serialize_audit_body(
@@ -772,6 +775,67 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(pending_files, [])
         self.assertEqual([row["content"] for row in messages], ["second question", "second answer"])
 
+    def test_file_only_turn_inherits_recent_superseded_question(self):
+        seen: dict[str, str] = {}
+
+        def fake_first_turn(settings, *, prompt, **kwargs):
+            seen["prompt"] = prompt
+            return HermesRunResult("answer", "hermes-merge", "answer", "", 0, {"session_id": "hermes-merge"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            _init_temp_db(settings)
+            gateway_db.get_or_create_user(settings, "guest")
+            gateway_db.create_conversation(
+                settings,
+                external_session_id="merge-session",
+                user_id="guest",
+                hermes_profile="default",
+                title="日志分析",
+            )
+            old = gateway_db.create_request_event(
+                settings,
+                external_session_id="merge-session",
+                user_id="guest",
+                prompt="分析一下这份日志，列出所有加频道记录",
+            )
+            gateway_db.finish_request_event(
+                settings,
+                event_id=old["id"],
+                status="superseded",
+                http_status=409,
+                error_detail="request superseded by a newer request",
+            )
+            attachment = SimpleNamespace(
+                local_path=Path(tmp) / "sdk.log",
+                size_bytes=12,
+                mime_type="text/plain",
+            )
+            attachment.local_path.write_text("joinChannel", encoding="utf-8")
+            request = _chat_request(
+                "[文件] sdk.log",
+                user_id="guest",
+                session_id="merge-session",
+            )
+            with (
+                mock.patch.object(gateway, "run_first_turn", side_effect=fake_first_turn),
+                mock.patch.object(gateway, "list_private_skills", return_value=[]),
+            ):
+                result = asyncio.run(
+                    gateway._run_chat_turn(
+                        settings,
+                        user_id="guest",
+                        session_id="merge-session",
+                        request=request,
+                        prepared_attachments=gateway.PreparedAttachments([], [attachment]),
+                    )
+                )
+
+        self.assertEqual(result["answer"], "answer")
+        self.assertIn("分析一下这份日志，列出所有加频道记录", seen["prompt"])
+        self.assertIn("路径：", seen["prompt"])
+        self.assertNotIn("[文件] sdk.log\n\n分析一下", seen["prompt"])
+
     def test_file_attachment_adds_file_ref_and_attachment_root(self):
         seen: dict[str, object] = {}
 
@@ -838,7 +902,9 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn("assistant_message", result)
         self.assertNotIn("conversation", result)
         self.assertNotIn("usage", result)
-        self.assertIn("@file:", seen["prompt"])
+        self.assertIn("路径：", seen["prompt"])
+        self.assertIn("使用 Hermes 文件/终端工具按需读取", seen["prompt"])
+        self.assertNotIn("@file:", seen["prompt"])
         self.assertIn("a.txt", seen["prompt"])
         self.assertEqual(Path(seen["attachment_root"]).name, "demo-session")
 
@@ -895,8 +961,10 @@ class GatewayTests(unittest.TestCase):
                 gateway.run_first_turn = original_first
 
         self.assertEqual(result["answer"], "file answer")
-        self.assertTrue(seen["prompt"].startswith("附件文件"))
-        self.assertIn("@file:", seen["prompt"])
+        self.assertIn("附件文件：", seen["prompt"])
+        self.assertIn("使用 Hermes 文件/终端工具按需读取", seen["prompt"])
+        self.assertIn("路径：", seen["prompt"])
+        self.assertNotIn("@file:", seen["prompt"])
         self.assertEqual(Path(seen["attachment_root"]).name, "empty-text-file-session")
 
     def test_image_attachments_are_passed_to_hermes(self):
@@ -1197,8 +1265,8 @@ class GatewayTests(unittest.TestCase):
             )
 
             all_messages = gateway.messages(request, user_id="alice", session_id="sess-a")
-            filtered = gateway.messages(request, user_id="alice", session_id="sess-a", q="hello")
-            global_results = gateway.messages(request, user_id="alice", q="hello")
+            filtered = gateway.messages(request, user_id="alice", session_id="sess-a", keyword="hello")
+            global_results = gateway.messages(request, user_id="alice", keyword="hello")
 
         self.assertEqual(len(all_messages["messages"]), 2)
         self.assertEqual(all_messages["conversation"]["session_id"], "sess-a")
@@ -1389,19 +1457,19 @@ class GatewayTests(unittest.TestCase):
                 saved = gateway.update_admin_user(
                     request,
                     "guest",
-                    gateway.AdminUserUpdate(private_skill_ids=["qa-jira-issue-list-retro"]),
+                    gateway.AdminUserUpdate(add=["qa-jira-issue-list-retro"]),
                 )
                 detail = gateway.admin_user(request, "guest")
                 cleared = gateway.update_admin_user(
                     request,
                     "guest",
-                    gateway.AdminUserUpdate(private_skill_ids=[]),
+                    gateway.AdminUserUpdate(remove=["qa-jira-issue-list-retro"]),
                 )
 
-        self.assertEqual(saved["private_skills"]["bound_skill_ids"], ["qa-jira-issue-list-retro"])
-        self.assertEqual(detail["private_skills"]["user_id"], "guest")
-        self.assertEqual(detail["private_skills"]["bound_skill_ids"], ["qa-jira-issue-list-retro"])
-        self.assertEqual(cleared["private_skills"]["bound_skill_ids"], [])
+        self.assertEqual(saved["skills"]["bound_skill_ids"], ["qa-jira-issue-list-retro"])
+        self.assertEqual(detail["skills"]["user_id"], "guest")
+        self.assertEqual(detail["skills"]["bound_skill_ids"], ["qa-jira-issue-list-retro"])
+        self.assertEqual(cleared["skills"]["bound_skill_ids"], [])
 
     def test_capabilities_returns_private_catalog_separately(self):
         catalog = [{"id": "skill-a", "name": "skill-a", "category": "agora-skills", "enabled": True}]
@@ -1415,12 +1483,13 @@ class GatewayTests(unittest.TestCase):
                 app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
             )
             with mock.patch.object(gateway, "list_private_skills", return_value=catalog):
-                payload = gateway.capabilities(request, scope="private")
+                request.query_params = {}
+                payload = gateway.capabilities(request)
                 user = gateway.admin_user(request, "guest")
 
-        self.assertEqual(payload, {"scope": "private", "profile": "default", "skills": catalog})
-        self.assertNotIn("available_private_skills", user["private_skills"])
-        self.assertEqual(user["private_skills"]["bound_skill_ids"], [])
+        self.assertEqual(payload, {"profile": "default", "skills": catalog})
+        self.assertNotIn("available_private_skills", user["skills"])
+        self.assertEqual(user["skills"]["bound_skill_ids"], [])
 
     def test_public_private_skill_capabilities_and_bindings_use_gateway_key(self):
         catalog = [
@@ -1435,11 +1504,12 @@ class GatewayTests(unittest.TestCase):
                 app=SimpleNamespace(state=SimpleNamespace(settings=settings)),
             )
             with mock.patch.object(gateway, "list_private_skills", return_value=catalog):
-                capabilities = gateway.public_capabilities(request, scope="private")
+                request.query_params = {}
+                capabilities = gateway.public_capabilities(request)
                 saved = gateway.update_public_user_private_skills(
                     request,
                     "customer-a",
-                    gateway.PublicPrivateSkillBindingsUpdate(skill_ids=["skill-active"]),
+                    gateway.SkillBindingsUpdate(add=["skill-active"]),
                 )
                 detail = gateway.public_user_private_skills(request, "customer-a")
 
@@ -1462,11 +1532,11 @@ class GatewayTests(unittest.TestCase):
                     gateway.update_public_user_private_skills(
                         request,
                         "customer-a",
-                        gateway.PublicPrivateSkillBindingsUpdate(skill_ids=["missing"]),
+                        gateway.SkillBindingsUpdate(add=["missing"]),
                     )
 
         self.assertEqual(ctx.exception.status_code, 422)
-        self.assertEqual(ctx.exception.detail, {"invalid_private_skill_ids": ["missing"]})
+        self.assertEqual(ctx.exception.detail, {"invalid_skill_ids": ["missing"]})
 
     def test_bound_private_skills_are_forwarded_on_first_and_resume(self):
         catalog = [
@@ -1567,15 +1637,15 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("formatDuration(stage.duration_ms)", dash)
         self.assertIn("实际主模型", dash)
         self.assertIn("展开模型执行详情", dash)
-        self.assertIn("Private Skills", dash)
+        self.assertIn("Skills", dash)
         self.assertIn("skill-binding-group", dash)
         self.assertIn("const skillGroups = skills.reduce", dash)
-        self.assertIn("savePrivateSkills", dash)
+        self.assertIn("saveSkills", dash)
         self.assertIn("/dashboard", dash)
-        self.assertIn("/capabilities?scope=private", dash)
+        self.assertIn("/capabilities", dash)
         self.assertIn("'/' + 'admin' + '/v1' + suffix", dash)
         self.assertIn("/timeline", dash)
-        self.assertIn("private_skill_ids", dash)
+        self.assertIn("JSON.stringify({ add, remove })", dash)
         self.assertIn("'content-type': 'application/json', ...(options.headers || {})", dash)
         self.assertNotIn("/api/summary", dash)
         self.assertNotIn("/private-skills", dash)

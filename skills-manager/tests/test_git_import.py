@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,49 @@ from skill_manager import app as manager
 
 
 class GitImportTests(unittest.TestCase):
+    def test_ssh_import_uses_ssh_auth_instead_of_https_credentials(self):
+        url = "ssh://git@git.agoralab.co/ai/agora-skills.git"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"username": "fake-user", "password": "fake-password"}), patch.object(manager, "ROOT", Path(tmp)), patch.object(manager, "ensure_dirs"), patch.object(manager, "validate_git_url", side_effect=lambda value: value), patch.object(manager.subprocess, "run", return_value=subprocess.CompletedProcess([], 128, "", "Permission denied (publickey).")) as run:
+            with self.assertRaises(HTTPException):
+                manager.clone_git_packages(url, None)
+            command = run.call_args.args[0]
+            self.assertEqual(command[:5], ["git", "clone", "--depth", "1", "--no-tags"])
+            self.assertIn(url, command)
+            self.assertFalse(list(Path(tmp).glob("skill-git-*")))
+
+    def test_injected_credentials_work_with_git_and_are_redacted(self):
+        run_git = subprocess.run
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def clone(command, **kwargs):
+                self.assertEqual(command[:4], ["git", "-c", "credential.helper=", "clone"])
+                self.assertNotIn("fake-password", " ".join(command))
+                env = kwargs["env"]
+                credentials = run_git(
+                    ["git", "-c", "credential.helper=", "credential", "fill"],
+                    input="protocol=https\nhost=example.com\n\n",
+                    capture_output=True, text=True, env=env, timeout=10,
+                )
+                self.assertEqual(credentials.returncode, 0, credentials.stderr)
+                self.assertIn("username=fake-user", credentials.stdout)
+                self.assertIn("password=fake-password", credentials.stdout)
+                return subprocess.CompletedProcess(command, 128, "", "fatal: fake-password rejected")
+
+            with patch.dict(os.environ, {"username": "fake-user", "password": "fake-password"}), patch.object(manager, "ROOT", root), patch.object(manager, "ensure_dirs"), patch.object(manager, "parse_git_source", return_value=("https://example.com/repo.git", None)), patch.object(manager.subprocess, "run", side_effect=clone):
+                with self.assertRaises(HTTPException) as error:
+                    manager.clone_git_packages("https://example.com/repo.git", None)
+                self.assertEqual(error.exception.status_code, 502)
+                self.assertNotIn("fake-password", error.exception.detail)
+                self.assertIn("[redacted]", error.exception.detail)
+            self.assertFalse(list(root.glob("skill-git-*")))
+
+    def test_incomplete_injected_credentials_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"username": "fake-user", "password": ""}), patch.object(manager, "ROOT", Path(tmp)), patch.object(manager, "ensure_dirs"), patch.object(manager, "parse_git_source", return_value=("https://example.com/repo.git", None)), patch.object(manager.subprocess, "run") as run:
+            with self.assertRaises(HTTPException) as error:
+                manager.clone_git_packages("https://example.com/repo.git", None)
+            self.assertEqual(error.exception.status_code, 400)
+            run.assert_not_called()
+
     def test_browse_paths_do_not_limit_repository(self):
         with patch.object(manager, "validate_git_url", side_effect=lambda url: url):
             self.assertEqual(manager.parse_git_source(

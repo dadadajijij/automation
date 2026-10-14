@@ -613,11 +613,11 @@ def render_dashboard_page(
                   </table>
                   <div class="skill-bindings">
                     <div class="section-head" style="padding:0 0 10px; border:0;">
-                      <h2 style="font-size:13px;">Private Skills</h2>
-                      <span class="meta" id="privateSkillsMeta">未选择用户</span>
+                      <h2 style="font-size:13px;">Skills</h2>
+                      <span class="meta" id="skillsMeta">未选择用户</span>
                     </div>
-                    <div class="skill-binding-list" id="privateSkillsList"><div class="notice">选择用户后管理绑定</div></div>
-                    <div class="skill-binding-actions"><button class="primary" id="savePrivateSkillsBtn" disabled>保存绑定</button></div>
+                    <div class="skill-binding-list" id="skillsList"><div class="notice">选择用户后管理绑定</div></div>
+                    <div class="skill-binding-actions"><button class="primary" id="saveSkillsBtn" disabled>保存绑定</button></div>
                   </div>
                 </div>
               </section>
@@ -676,6 +676,8 @@ def render_dashboard_page(
               userFilterText: '',
               selectedUser: '',
               selectedSession: '',
+              boundSkillIds: new Set(),
+              skillsUser: '',
             }};
             const els = {{
               searchInput: document.getElementById('searchInput'),
@@ -695,9 +697,9 @@ def render_dashboard_page(
               conversationDetail: document.getElementById('conversationDetail'),
               messagesList: document.getElementById('messagesList'),
               searchResults: document.getElementById('searchResults'),
-              privateSkillsMeta: document.getElementById('privateSkillsMeta'),
-              privateSkillsList: document.getElementById('privateSkillsList'),
-              savePrivateSkillsBtn: document.getElementById('savePrivateSkillsBtn'),
+              skillsMeta: document.getElementById('skillsMeta'),
+              skillsList: document.getElementById('skillsList'),
+              saveSkillsBtn: document.getElementById('saveSkillsBtn'),
             }};
 
             function esc(v) {{
@@ -743,12 +745,12 @@ def render_dashboard_page(
               const image = [...events].reverse().find((event) => event.kind === 'image_input');
               const vision = [...events].reverse().find((event) => event.kind === 'auxiliary' && event.task === 'vision');
               const fallback = events.some((event) => event.kind === 'main_fallback');
-              const privateSkills = Array.isArray(audit.private_skills) ? audit.private_skills : [];
+              const skills = Array.isArray(audit.skills) ? audit.skills : [];
               const summary = [
                 finalRoute ? `实际主模型：${{finalRoute}}${{fallback ? '（已回退）' : ''}}` : '',
                 image ? `图片：${{image.input_mode || '-'}}` : '',
                 vision ? `视觉：${{[vision.model, vision.provider].filter(Boolean).join(' • ') || '-'}}` : '',
-                privateSkills.length ? `Private skills：${{privateSkills.map((skill) => skill.id).filter(Boolean).join(', ')}}` : '',
+                skills.length ? `Skills：${{skills.map((skill) => skill.id).filter(Boolean).join(', ')}}` : '',
                 skillResults.length ? `Skill 状态：${{skillResults.map((skill) => `${{skill.id || '-'}}=${{skill.status || 'unknown'}}`).join(', ')}}` : '',
                 audit.context_window ? `上下文：${{audit.context_window}}` : '',
               ].filter(Boolean);
@@ -795,23 +797,27 @@ def render_dashboard_page(
               }});
             }}
 
-            function renderPrivateSkills(data) {{
+            function renderSkills(data) {{
               if (!data) {{
-                els.privateSkillsMeta.textContent = '未选择用户';
-                els.privateSkillsList.innerHTML = '<div class="notice">选择用户后管理绑定</div>';
-                els.savePrivateSkillsBtn.disabled = true;
+                state.boundSkillIds = new Set();
+                state.skillsUser = '';
+                els.skillsMeta.textContent = '未选择用户';
+                els.skillsList.innerHTML = '<div class="notice">选择用户后管理绑定</div>';
+                els.saveSkillsBtn.disabled = true;
                 return;
               }}
               const bound = new Set(data.bound_skill_ids || []);
+              state.boundSkillIds = new Set(bound);
+              state.skillsUser = data.user_id;
               const unavailable = new Set(data.unavailable_skill_ids || []);
-              els.privateSkillsMeta.textContent = data.user_id;
-              const skills = data.available_private_skills || [];
+              els.skillsMeta.textContent = data.user_id;
+              const skills = data.available_skills || [];
               const skillGroups = skills.reduce((groups, skill) => {{
                 const source = skill.category || '未分类';
                 (groups[source] ||= []).push(skill);
                 return groups;
               }}, {{}});
-              els.privateSkillsList.innerHTML = skills.length ? `<div class="skill-binding-groups">${{Object.entries(skillGroups).map(([source, groupSkills]) => {{
+              els.skillsList.innerHTML = skills.length ? `<div class="skill-binding-groups">${{Object.entries(skillGroups).map(([source, groupSkills]) => {{
                 const selectedCount = groupSkills.filter((skill) => bound.has(skill.id)).length;
                 return `
                   <details class="skill-binding-group">
@@ -822,20 +828,20 @@ def render_dashboard_page(
                     <div class="skill-binding-list">
                       ${{groupSkills.map((skill) => `
                         <label class="skill-binding">
-                          <input type="checkbox" data-private-skill="${{esc(skill.id)}}" ${{bound.has(skill.id) ? 'checked' : ''}} ${{skill.enabled ? '' : 'disabled'}} />
+                          <input type="checkbox" data-skill="${{esc(skill.id)}}" ${{bound.has(skill.id) ? 'checked' : ''}} ${{skill.enabled || bound.has(skill.id) ? '' : 'disabled'}} />
                           <span class="skill-binding-name"><strong>${{esc(skill.name)}}</strong></span>
                         </label>
                       `).join('')}}
                     </div>
                   </details>`;
-              }}).join('')}}</div>` : '<div class="notice">当前 default profile 没有可用 private skills</div>';
+              }}).join('')}}</div>` : '<div class="notice">当前 default profile 没有可用 skills</div>';
               if (unavailable.size) {{
                 const note = document.createElement('div');
                 note.className = 'notice';
-                note.textContent = `失效绑定：${{Array.from(unavailable).join(', ')}}`;
-                els.privateSkillsList.appendChild(note);
+                note.innerHTML = `失效绑定：${{Array.from(unavailable).map((id) => `<label class="skill-binding"><input type="checkbox" data-skill="${{esc(id)}}" checked /><span>${{esc(id)}}</span></label>`).join('')}}`;
+                els.skillsList.appendChild(note);
               }}
-              els.savePrivateSkillsBtn.disabled = false;
+              els.saveSkillsBtn.disabled = false;
             }}
 
             function renderConversations(items) {{
@@ -914,8 +920,8 @@ def render_dashboard_page(
             }}
 
             async function loadDashboard() {{
-              const q = state.userFilterText.trim();
-              const path = q ? adminPath(`/dashboard?user_query=${{encodeURIComponent(q)}}`) : adminPath('/dashboard');
+              const keyword = state.userFilterText.trim();
+              const path = keyword ? adminPath(`/dashboard?user_query=${{encodeURIComponent(keyword)}}`) : adminPath('/dashboard');
               const data = await api(path);
               const summary = data.summary || {{}};
               els.usersCount.textContent = summary.users ?? 0;
@@ -927,8 +933,8 @@ def render_dashboard_page(
 
             async function loadConversations() {{
               const params = new URLSearchParams();
-              const q = els.searchInput.value.trim();
-              if (q && q.length < 2) {{
+              const keyword = els.searchInput.value.trim();
+              if (keyword && keyword.length < 2) {{
                 // leave it alone; the search box is for global search only
               }}
               if (state.selectedUser) params.set('user_id', state.selectedUser);
@@ -938,39 +944,48 @@ def render_dashboard_page(
             }}
 
             async function loadUserDetails() {{
+              const userId = state.selectedUser;
+              renderSkills(null);
               if (!state.selectedUser) {{
-                renderPrivateSkills(null);
                 return;
               }}
               const [userData, capabilitiesData] = await Promise.all([
                 api(adminPath(`/users/${{encodeURIComponent(state.selectedUser)}}`)),
-                api(route('/admin/v1/capabilities?scope=private')),
+                api(route('/admin/v1/capabilities')),
               ]);
-              const bindings = userData.private_skills || {{}};
+              if (state.selectedUser !== userId) return;
+              const bindings = userData.skills || {{}};
               const skills = capabilitiesData.skills || [];
               const availableIds = new Set(skills.map((skill) => skill.id));
-              renderPrivateSkills({{
+              renderSkills({{
                 ...bindings,
-                available_private_skills: skills,
+                available_skills: skills,
                 unavailable_skill_ids: (bindings.bound_skill_ids || []).filter((id) => !availableIds.has(id)),
               }});
             }}
 
-            async function savePrivateSkills() {{
-              if (!state.selectedUser) return;
-              const skillIds = Array.from(els.privateSkillsList.querySelectorAll('[data-private-skill]:checked'))
-                .map((input) => input.getAttribute('data-private-skill'))
+            async function saveSkills() {{
+              if (!state.selectedUser || state.skillsUser !== state.selectedUser) return;
+              const userId = state.selectedUser;
+              const skillIds = Array.from(els.skillsList.querySelectorAll('[data-skill]:checked'))
+                .map((input) => input.getAttribute('data-skill'))
                 .filter(Boolean);
-              els.savePrivateSkillsBtn.disabled = true;
+              const previous = state.boundSkillIds || new Set();
+              const selected = new Set(skillIds);
+              const displayed = new Set(Array.from(els.skillsList.querySelectorAll('[data-skill]'))
+                .map((input) => input.getAttribute('data-skill')));
+              const add = skillIds.filter((id) => !previous.has(id));
+              const remove = Array.from(previous).filter((id) => displayed.has(id) && !selected.has(id));
+              els.saveSkillsBtn.disabled = true;
               try {{
-                await api(adminPath(`/users/${{encodeURIComponent(state.selectedUser)}}`), {{
+                await api(adminPath(`/users/${{encodeURIComponent(userId)}}`), {{
                   method: 'PATCH',
                   headers: {{ 'x-csrf-token': window.__HERMES_ADMIN__.csrfToken }},
-                  body: JSON.stringify({{ private_skill_ids: skillIds }}),
+                  body: JSON.stringify({{ add, remove }}),
                 }});
                 await loadUserDetails();
               }} finally {{
-                els.savePrivateSkillsBtn.disabled = false;
+                els.saveSkillsBtn.disabled = state.skillsUser !== state.selectedUser;
               }}
             }}
 
@@ -985,12 +1000,12 @@ def render_dashboard_page(
             }}
 
             async function doSearch() {{
-              const q = els.searchInput.value.trim();
-              if (!q) {{
+              const keyword = els.searchInput.value.trim();
+              if (!keyword) {{
                 renderSearch([]);
                 return;
               }}
-              const data = await api(adminPath(`/search?q=${{encodeURIComponent(q)}}`));
+              const data = await api(adminPath(`/search?keyword=${{encodeURIComponent(keyword)}}`));
               renderSearch(data.results || []);
             }}
 
@@ -1002,12 +1017,12 @@ def render_dashboard_page(
               await loadDashboard();
               await loadConversations();
               renderConversation(null);
-              renderPrivateSkills(null);
+              renderSkills(null);
             }}
 
             els.searchBtn.addEventListener('click', doSearch);
             els.refreshBtn.addEventListener('click', refreshAll);
-            els.savePrivateSkillsBtn.addEventListener('click', savePrivateSkills);
+            els.saveSkillsBtn.addEventListener('click', saveSkills);
             els.logoutBtn.addEventListener('click', async () => {{
               await fetch(route('/admin/logout'), {{ credentials: 'same-origin' }});
               location.href = route('/admin/login');

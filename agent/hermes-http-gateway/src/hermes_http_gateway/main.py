@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 import shutil
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -53,6 +54,7 @@ from .db import (
     list_messages_by_session,
     list_request_events_by_session,
     list_request_stages_by_session,
+    list_recent_replaceable_request_events,
     list_user_private_skill_bindings,
     list_users,
     list_conversations,
@@ -60,7 +62,7 @@ from .db import (
     search_messages,
     search_messages_admin,
     record_request_stage,
-    replace_user_private_skill_bindings,
+    update_user_private_skill_bindings,
     touch_admin_session,
     update_conversation,
 )
@@ -117,13 +119,15 @@ class ChatRequest(BaseModel):
 class AdminUserUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    private_skill_ids: list[str] = Field(default_factory=list, max_length=10)
+    add: list[str] = Field(default_factory=list, max_length=10)
+    remove: list[str] = Field(default_factory=list, max_length=10)
 
 
-class PublicPrivateSkillBindingsUpdate(BaseModel):
+class SkillBindingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    skill_ids: list[str] = Field(default_factory=list, max_length=10)
+    add: list[str] = Field(default_factory=list, max_length=10)
+    remove: list[str] = Field(default_factory=list, max_length=10)
 
 
 class AdminLoginRequest(BaseModel):
@@ -272,6 +276,49 @@ def _conversation_title(question: str) -> str:
     return title[:77].rstrip() + "..."
 
 
+SUPERSEDED_PROMPT_MERGE_WINDOW_SECONDS = 2.0
+
+
+def _is_file_only_prompt(prompt: str) -> bool:
+    value = prompt.strip()
+    return not value or value.startswith("[文件]")
+
+
+def _merge_recent_superseded_prompts(
+    settings: Settings,
+    *,
+    user_id: str,
+    session_id: str,
+    current_prompt: str,
+    request_created_at: str,
+) -> tuple[str, list[str]]:
+    if not _is_file_only_prompt(current_prompt):
+        return current_prompt, []
+    try:
+        current_time = datetime.fromisoformat(request_created_at)
+    except ValueError:
+        return current_prompt, []
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    since = (current_time - timedelta(seconds=SUPERSEDED_PROMPT_MERGE_WINDOW_SECONDS)).isoformat()
+    events = list_recent_replaceable_request_events(
+        settings,
+        user_id=user_id,
+        external_session_id=session_id,
+        before=request_created_at,
+        since=since,
+    )
+    prompts: list[str] = []
+    request_ids: list[str] = []
+    for event in events:
+        prompt = str(event.get("prompt") or "").strip()
+        if not prompt or _is_file_only_prompt(prompt) or prompt in prompts:
+            continue
+        prompts.append(prompt)
+        request_ids.append(str(event["id"]))
+    return ("\n\n".join(prompts) if prompts else current_prompt), request_ids
+
+
 def _conversation_payload(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "session_id": row["external_session_id"],
@@ -311,6 +358,10 @@ def _message_payload(row: dict[str, Any]) -> dict[str, Any]:
 def _request_event_payload(
     row: dict[str, Any], stages: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
+    runtime_audit = row.get("runtime_audit")
+    if isinstance(runtime_audit, dict) and "private_skills" in runtime_audit:
+        runtime_audit = dict(runtime_audit)
+        runtime_audit["skills"] = runtime_audit.pop("private_skills")
     return {
         "event_type": "request",
         "id": row["id"],
@@ -323,7 +374,7 @@ def _request_event_payload(
         "model": row["model"],
         "provider": row["provider"],
         "request_body": row.get("request_body"),
-        "runtime_audit": row.get("runtime_audit"),
+        "runtime_audit": runtime_audit,
         "stages": stages or [],
         "created_at": row["created_at"],
         "completed_at": row["completed_at"],
@@ -360,12 +411,12 @@ def _runtime_audit_with_private_skills(
     skill_audit: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     audit = _runtime_audit_from_usage(usage) or {}
-    if private_skills:
-        audit["private_skills"] = private_skills
     usage_skill_audit = None
     if isinstance(audit.get("skills"), list):
         usage_skill_audit = {"version": audit.get("version", 1), "skills": audit["skills"]}
     normalized = _normalize_skill_audit(skill_audit or usage_skill_audit, private_skills)
+    if private_skills:
+        audit["skills"] = private_skills
     if normalized is not None:
         audit["skill_audit"] = normalized
     return audit or None
@@ -593,16 +644,6 @@ async def _prepare_uploaded_attachments(
     return PreparedAttachments(images=images, files=files)
 
 
-def _format_file_ref(path: Path) -> str:
-    value = str(path)
-    if not any(ch.isspace() or ch in "()[]{}<>\"'`" for ch in value):
-        return f"@file:{value}"
-    for quote in ("`", '"', "'"):
-        if quote not in value:
-            return f"@file:{quote}{value}{quote}"
-    return f"@file:{value}"
-
-
 def _prompt_with_attachments(
     prompt: str,
     images: list[DownloadedImage],
@@ -618,8 +659,25 @@ def _prompt_with_attachments(
         else:
             sections.append(f"本轮请求包含 {len(images)} 张图片附件，请结合随请求传入的图片进行回答。")
     if files:
-        file_refs = "\n".join(f"- {_format_file_ref(item.local_path)}" for item in files)
-        sections.append(f"附件文件：\n{file_refs}")
+        file_refs = "\n".join(
+            "- 文件名：{name}\n  路径：{path}\n  大小：{size} bytes\n  类型：{mime}".format(
+                name=item.local_path.name,
+                path=item.local_path,
+                size=(
+                    getattr(item, "size_bytes", None)
+                    if getattr(item, "size_bytes", None) is not None
+                    else (item.local_path.stat().st_size if item.local_path.exists() else 0)
+                ),
+                mime=getattr(item, "mime_type", "application/octet-stream"),
+            )
+            for item in files
+        )
+        sections.append(
+            "大型或普通文件请使用 Hermes 文件/终端工具按需读取，不要一次性加载全文。\n"
+            "先搜索与用户问题相关的关键词和时间范围，再分段读取相关上下文；"
+            "只能读取本轮附件目录中的文件。\n\n"
+            f"附件文件：\n{file_refs}"
+        )
     prefix = prompt.rstrip()
     if not prefix:
         return "\n\n".join(sections)
@@ -737,6 +795,13 @@ async def _run_chat_turn(
         provider=effective_provider,
         request_body=request_body,
     )
+    merged_question_text, merged_request_ids = _merge_recent_superseded_prompts(
+        settings,
+        user_id=user_id,
+        session_id=external_session_id,
+        current_prompt=question_text,
+        request_created_at=request_event["created_at"],
+    )
 
     private_skills: list[dict[str, Any]] = []
     private_catalog_error: str | None = None
@@ -784,10 +849,10 @@ async def _run_chat_turn(
         )
 
     if private_catalog_error:
-        record_stage("解析私有 Skills", private_catalog_started_at, private_catalog_error)
+        record_stage("解析 Skills", private_catalog_started_at, private_catalog_error)
     else:
         record_stage(
-            "解析私有 Skills",
+            "解析 Skills",
             private_catalog_started_at,
             ", ".join(item["id"] for item in private_skills) or "无绑定",
         )
@@ -869,7 +934,7 @@ async def _run_chat_turn(
         else:
             turn_images = _dedupe_downloaded(prepared_attachments.images)
             turn_files = _dedupe_downloaded(prepared_attachments.files)
-        hermes_prompt = _prompt_with_attachments(question_text, turn_images, turn_files)
+        hermes_prompt = _prompt_with_attachments(merged_question_text, turn_images, turn_files)
         image_paths = [item.local_path for item in turn_images]
         attachment_root = _attachment_root_for_prompt(
             settings,
@@ -885,7 +950,7 @@ async def _run_chat_turn(
             user_id=user_id,
             role="user",
             kind="chat",
-            content=question_text,
+            content=merged_question_text,
             title=conversation["title"],
         )
         user_message_id = user_message["id"]
@@ -1280,13 +1345,12 @@ def _private_skill_catalog_or_503(settings: Settings) -> list[dict[str, Any]]:
 
 
 @app.get("/admin/v1/capabilities")
-def capabilities(request: Request, scope: str = "private"):
+def capabilities(request: Request):
     settings = _settings(request)
     _require_admin_session(request, settings)
-    if scope != "private":
-        raise HTTPException(status_code=400, detail="Only scope=private is supported")
+    if "scope" in request.query_params:
+        raise HTTPException(status_code=422, detail="scope is no longer supported")
     return {
-        "scope": "private",
         "profile": DEFAULT_HERMES_PROFILE,
         "skills": _private_skill_catalog_or_503(settings),
     }
@@ -1300,23 +1364,29 @@ def _admin_private_skills_binding_payload(settings: Settings, user_id: str) -> d
     }
 
 
-def _replace_private_skill_bindings(
+def _update_private_skill_bindings(
     settings: Settings,
     *,
     user_id: str,
-    skill_ids: list[str],
+    add: list[str],
+    remove: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    add_ids = {str(skill_id).strip() for skill_id in add if str(skill_id).strip()}
+    remove_ids = {str(skill_id).strip() for skill_id in remove if str(skill_id).strip()}
+    overlap = sorted(add_ids & remove_ids)
+    if overlap:
+        raise HTTPException(status_code=422, detail={"conflicting_skill_ids": overlap})
     catalog = _private_skill_catalog_or_503(settings)
     enabled_ids = {str(item["id"]) for item in catalog if item.get("enabled")}
-    requested_ids = [skill_id.strip() for skill_id in skill_ids if skill_id.strip()]
-    invalid_ids = sorted(set(requested_ids) - enabled_ids)
+    invalid_ids = sorted(add_ids - enabled_ids)
     if invalid_ids:
-        raise HTTPException(status_code=422, detail={"invalid_private_skill_ids": invalid_ids})
-    bindings = replace_user_private_skill_bindings(
-        settings,
-        user_id=user_id,
-        skill_ids=requested_ids,
-    )
+        raise HTTPException(status_code=422, detail={"invalid_skill_ids": invalid_ids})
+    try:
+        bindings = update_user_private_skill_bindings(
+            settings, user_id=user_id, add=add_ids, remove=remove_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return bindings, catalog
 
 
@@ -1328,7 +1398,7 @@ def admin_user(request: Request, user_id: str):
     user = get_or_create_user(settings, resolved_user_id)
     return {
         "user": user,
-        "private_skills": _admin_private_skills_binding_payload(settings, resolved_user_id),
+        "skills": _admin_private_skills_binding_payload(settings, resolved_user_id),
     }
 
 
@@ -1343,14 +1413,15 @@ def update_admin_user(
     _require_admin_csrf(request, session)
     resolved_user_id = _resolve_user_id(user_id)
     user = get_or_create_user(settings, resolved_user_id)
-    bindings, _ = _replace_private_skill_bindings(
+    bindings, _ = _update_private_skill_bindings(
         settings,
         user_id=resolved_user_id,
-        skill_ids=body.private_skill_ids,
+        add=body.add,
+        remove=body.remove,
     )
     return {
         "user": user,
-        "private_skills": {
+        "skills": {
             "bound_skill_ids": [item["skill_id"] for item in bindings],
         },
     }
@@ -1408,17 +1479,19 @@ def admin_conversation_timeline(request: Request, session_id: str):
 @app.get("/admin/v1/search")
 def admin_search(
     request: Request,
-    q: str,
+    keyword: str,
     user_id: str | None = None,
     session_id: str | None = None,
     limit: int = 50,
 ):
     settings = _settings(request)
     _require_admin_session(request, settings)
+    if "q" in getattr(request, "query_params", {}):
+        raise HTTPException(status_code=422, detail="q is no longer supported; use keyword")
     return {
         "results": search_messages_admin(
             settings,
-            query=q,
+            query=keyword,
             user_id=user_id,
             external_session_id=_validate_session_id(session_id) if session_id else None,
             limit=limit,
@@ -1451,14 +1524,12 @@ def report_page(request: Request, filename: str, download_token: str):
 
 
 @app.get("/v1/capabilities")
-def public_capabilities(request: Request, scope: str = "private"):
+def public_capabilities(request: Request):
     settings = _settings(request)
     _require_gateway_key(request, settings)
-    if scope != "private":
-        raise HTTPException(status_code=400, detail="Only scope=private is supported")
+    if "scope" in request.query_params:
+        raise HTTPException(status_code=422, detail="scope is no longer supported")
     return {
-        "scope": "private",
-        "profile": DEFAULT_HERMES_PROFILE,
         "skills": _private_skill_catalog_or_503(settings),
     }
 
@@ -1473,14 +1544,13 @@ def _public_private_skill_binding_payload(
     available_ids = {str(item["id"]) for item in catalog if item.get("enabled")}
     return {
         "user_id": user_id,
-        "profile": DEFAULT_HERMES_PROFILE,
         "bound_skill_ids": bound_skill_ids,
         "active_skill_ids": [skill_id for skill_id in bound_skill_ids if skill_id in available_ids],
         "unavailable_skill_ids": [skill_id for skill_id in bound_skill_ids if skill_id not in available_ids],
     }
 
 
-@app.get("/v1/users/{user_id}/private-skills")
+@app.get("/v1/users/{user_id}/skills")
 def public_user_private_skills(request: Request, user_id: str):
     settings = _settings(request)
     _require_gateway_key(request, settings)
@@ -1489,20 +1559,21 @@ def public_user_private_skills(request: Request, user_id: str):
     return _public_private_skill_binding_payload(settings, resolved_user_id)
 
 
-@app.put("/v1/users/{user_id}/private-skills")
+@app.patch("/v1/users/{user_id}/skills")
 def update_public_user_private_skills(
     request: Request,
     user_id: str,
-    body: PublicPrivateSkillBindingsUpdate,
+    body: SkillBindingsUpdate,
 ):
     settings = _settings(request)
     _require_gateway_key(request, settings)
     resolved_user_id = _resolve_user_id(user_id)
     get_or_create_user(settings, resolved_user_id)
-    _replace_private_skill_bindings(
+    _update_private_skill_bindings(
         settings,
         user_id=resolved_user_id,
-        skill_ids=body.skill_ids,
+        add=body.add,
+        remove=body.remove,
     )
     return _public_private_skill_binding_payload(settings, resolved_user_id)
 
@@ -1524,17 +1595,19 @@ def sessions(request: Request, user_id: str | None = None, limit: int = 50, offs
 def messages(
     request: Request,
     user_id: str | None = None,
-    q: str | None = None,
+    keyword: str | None = None,
     session_id: str | None = None,
     limit: int = 20,
     offset: int = 0,
 ):
     settings = _settings(request)
     _require_gateway_key(request, settings)
+    if "q" in getattr(request, "query_params", {}):
+        raise HTTPException(status_code=422, detail="q is no longer supported; use keyword")
     resolved_user_id = _resolve_user_id(user_id)
-    query = (q or "").strip()
+    query = (keyword or "").strip()
     if not session_id and not query:
-        raise HTTPException(status_code=422, detail="q is required when session_id is not provided")
+        raise HTTPException(status_code=422, detail="keyword is required when session_id is not provided")
 
     conversation = None
     conversation_id = None

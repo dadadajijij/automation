@@ -11,7 +11,7 @@ pip install -r requirements.txt
 uvicorn skill_manager.app:app --reload
 ```
 
-生产环境将 `/tools2/skill-manager/` 反向代理到容器的 8000 端口，并将 `/data` 挂载为持久化卷。`ATHENA_ME_URL` 可通过环境变量覆盖。
+生产环境将 `/tools2/skills/` 反向代理到容器的 8000 端口，并将 `/data` 挂载为持久化卷。代理需要剥掉该路径前缀，并设置 `X-Forwarded-Prefix: /tools2/skills`；服务会将前缀注入页面，供 API、文件预览和下载使用。其他部署路径可设置对应的请求头。本地直接运行时不设置该请求头，页面使用 `/api/skills` 等根路径，无需额外配置。`ATHENA_ME_URL` 可通过环境变量覆盖。
 
 ## 页面能力
 
@@ -74,12 +74,18 @@ POST /api/skills/import-git
 Content-Type: application/json
 
 {
-  "url": "https://bitbucket.agoralab.co/scm/AI/agora-skills.git",
+  "url": "ssh://git@git.agoralab.co/ai/agora-skills.git",
   "ref": "main"
 }
 ```
 
+页面导入私有 Git / Bitbucket 仓库时，建议填写 SSH 克隆地址，例如 `ssh://git@git.agoralab.co/ai/agora-skills.git`。HTTPS 地址如果经过 OAuth 登录网关，可能跳转到网页登录，Git 客户端无法完成该跳转。
+
 Git 导入不再接收目录参数，始终扫描整个仓库并批量导入所有 Skill。服务支持标准 Git clone 地址，也会解析常见的 Bitbucket `projects/.../repos/.../browse` 和 GitHub `tree` 链接；链接中的子目录不限制扫描范围。`ref` 可选，优先使用显式分支，其次使用浏览链接中的分支，两者均未指定时使用仓库默认分支。Git 导入使用服务端已有的 Git 凭据，客户不需要在请求中传 Token。
+
+私有 HTTP/HTTPS 仓库支持通过容器的 `env_file` 注入小写环境变量 `username` 和 `password`，两者必须同时设置。服务使用临时 `GIT_ASKPASS` 脚本提供认证信息，密码不拼入仓库地址，也不写入 Git 凭据文件；导入结束后临时脚本自动删除。仓库平台要求访问 Token 时，可将 Token 作为 `password`。未设置这两个变量时，继续使用本机已有的 Git 认证配置；SSH 仓库仍使用 SSH 认证。不要将真实账号密码提交到项目仓库。
+
+当前部署使用 `ssh://git@git.agoralab.co/ai/agora-skills.git`，避免 HTTPS 入口的浏览器 OAuth 跳转。镜像安装 `openssh-client`；自动部署配置只读挂载服务器上已获仓库访问权限的 SSH 私钥及 `known_hosts`，并通过 `GIT_SSH_COMMAND` 设置 `BatchMode=yes`、`StrictHostKeyChecking=yes` 和指定密钥路径。SSH 导入不使用 `username`、`password`。本地运行继续使用本机 SSH 配置，仓库地址中不指定分支时使用默认分支。
 
 扫描时先定位 `SKILL.md`，再读取对应 Skill 目录内的资源；非 Skill 文件不计入资源大小和数量限制。根目录含 `SKILL.md` 时，优先使用 YAML frontmatter 的 `name`，未声明时使用仓库名。其他 Skill 继续使用目录名。同名 Skill 更新，重复名称、嵌套 Skill 和 Skill 内的符号链接会被拒绝；远端删除的 Skill 不会自动删除本地记录。
 
