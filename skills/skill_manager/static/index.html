@@ -1,1 +1,242 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Athena Skills 管理</title><style>body{font:14px system-ui;margin:0;background:#f6f7f9;color:#202124}main{max-width:1100px;margin:32px auto;padding:0 20px}.bar,.card{background:#fff;border:1px solid #e2e5e9;border-radius:10px;padding:18px;margin:12px 0}.bar{display:flex;justify-content:space-between;align-items:center}button{padding:8px 14px;border:0;border-radius:6px;background:#2563eb;color:white;cursor:pointer}button.danger{background:#dc2626}input,textarea{width:100%;box-sizing:border-box;padding:9px;border:1px solid #ccd1d8;border-radius:6px}textarea{min-height:320px;font-family:monospace}.grid{display:grid;grid-template-columns:280px 1fr;gap:16px}.skill{padding:12px;border-bottom:1px solid #eee;cursor:pointer}.skill.active{background:#eef4ff}.muted{color:#667085}.row{display:flex;gap:8px;align-items:center}.hidden{display:none}</style></head><body><main><div class="bar"><div><h1>Athena Skills</h1><div id="user" class="muted">正在获取登录信息…</div></div><div class="row"><input id="upload" type="file" accept=".zip"><button onclick="upload()">上传 ZIP</button></div></div><div id="msg" class="card hidden"></div><div class="grid"><div class="card"><h3>共享 Skills</h3><div id="list">加载中…</div></div><div class="card"><div id="empty">选择一个 Skill 查看或编辑</div><div id="editor" class="hidden"><div class="row"><h2 id="title"></h2><span id="meta" class="muted"></span></div><textarea id="content"></textarea><p><button onclick="save()">保存</button> <button class="danger" onclick="removeSkill()">删除</button> <a id="download">下载 ZIP</a></p></div></div></div></main><script>let selected=null,version=null;const $=id=>document.getElementById(id);async function api(url,opt={}){let r=await fetch(url,{credentials:'include',...opt});let d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.detail||r.statusText);return d}function show(s){$('msg').textContent=s;$('msg').classList.remove('hidden');setTimeout(()=>$('msg').classList.add('hidden'),4000)}async function load(){try{let me=await api('/api/me');$('user').textContent=`${me.user.display_name} (${me.user.email})`;await list()}catch(e){$('user').textContent=e.message}}async function list(){let d=await api('/api/skills');$('list').innerHTML=d.skills.map(s=>`<div class="skill ${s.name===selected?'active':''}" onclick="openSkill('${s.name}')"><b>${s.name}</b><br><span class="muted">v${s.version} · ${s.description||'无描述'}</span></div>`).join('')||'<span class="muted">暂无 Skills</span>'}async function openSkill(n){let d=await api('/api/skills/'+encodeURIComponent(n));selected=n;version=d.skill.version;$('empty').classList.add('hidden');$('editor').classList.remove('hidden');$('title').textContent=n;$('meta').textContent=`v${version} · 最后修改：${d.skill.updated_by}`;$('content').value=d.files['SKILL.md']||'';$('download').href='/api/skills/'+encodeURIComponent(n)+'/download';await list()}async function save(){try{await api('/api/skills/'+encodeURIComponent(selected),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:{'SKILL.md':$('content').value},base_version:version,message:'Online edit'})});show('保存成功');await openSkill(selected)}catch(e){show(e.message)}}async function removeSkill(){if(!selected||!confirm(`确定删除 ${selected}？`))return;try{await api('/api/skills/'+encodeURIComponent(selected),{method:'DELETE'});selected=null;$('editor').classList.add('hidden');$('empty').classList.remove('hidden');show('已删除');await list()}catch(e){show(e.message)}}async function upload(){let f=$('upload').files[0];if(!f)return show('请选择 ZIP 文件');let fd=new FormData();fd.append('file',f);try{let d=await api('/api/skills',{method:'POST',body:fd});show(`上传成功：${d.skill.name}`);$('upload').value='';await list();await openSkill(d.skill.name)}catch(e){show(e.message)}}load()</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Athena Skills</title>
+  <style>
+    :root { color-scheme: light; --border:#dfe3e8; --muted:#667085; --blue:#1769e0; --blue-bg:#edf4ff; --surface:#fff; --canvas:#f6f7f9; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--canvas); color:#202124; font:14px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,input,textarea { font:inherit; }
+    button { border:1px solid var(--border); border-radius:6px; background:#fff; color:#202124; cursor:pointer; padding:7px 11px; }
+    button:hover { border-color:#9aa4b2; background:#f8fafc; }
+    button.primary { border-color:var(--blue); background:var(--blue); color:#fff; }
+    button.primary:hover { background:#125ac3; }
+    button.danger { color:#b42318; }
+    button:disabled { opacity:.45; cursor:default; }
+    input[type="checkbox"] { width:16px; height:16px; margin:0; flex-shrink:0; accent-color:var(--blue); cursor:pointer; }
+    input { border:1px solid var(--border); border-radius:6px; padding:8px 10px; background:#fff; }
+    input:focus, textarea:focus { border-color:var(--blue); outline:2px solid #cfe0ff; }
+    .topbar { min-height:64px; display:flex; align-items:center; justify-content:flex-start; gap:16px; padding:12px 24px; border-bottom:1px solid var(--border); background:var(--surface); }
+    .brand { display:flex; align-items:center; gap:12px; min-width:220px; }
+    .brand-mark { width:30px; height:30px; display:grid; place-items:center; border-radius:6px; background:#1f2937; color:#fff; font-weight:700; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:18px; }
+    h2 { font-size:17px; }
+    h3 { font-size:14px; }
+    .muted { color:var(--muted); }
+    .top-actions,.row { display:flex; align-items:center; gap:8px; }
+    .top-actions { display:flex; flex:0 1 600px; justify-content:flex-end; width:100%; min-width:0; margin-left:auto; }
+    .import-box { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; width:100%; padding:10px; border:1px solid var(--border); border-radius:8px; background:#f8fafc; }
+    .import-box > .source-tabs { width:max-content; }
+    .import-box > .import-method { grid-column:1; grid-row:2; }
+    /* Both modes reserve the same row height, including when controls wrap. */
+    .import-box > .import-method.hidden { display:flex !important; visibility:hidden; pointer-events:none; }
+    .source-tabs { display:flex; align-self:flex-start; gap:3px; padding:3px; border:1px solid var(--border); border-radius:7px; background:#fff; }
+    .source-tab { border:1px solid transparent; border-radius:5px; padding:7px 13px; color:var(--muted); background:transparent; white-space:nowrap; }
+    .source-tab:hover { background:#f2f4f7; }
+    .source-tab.active { border-color:#c8d9f5; background:#e7efff; color:#1557b0; font-weight:600; }
+    .import-method { display:flex; align-items:center; gap:8px; width:100%; min-width:0; }
+    .import-method input { width:230px; min-width:0; }
+    .import-method .git-option { width:125px; }
+    .zip-file { display:flex; align-items:center; gap:8px; min-width:0; }
+    #zip-url-method { flex:1 1 0; min-width:0; }
+    #zip-url-method input,#git-url { flex:1 1 0; width:auto; }
+    .import-method > .source-tabs { flex-shrink:0; }
+    .import-method button.primary { flex-shrink:0; white-space:nowrap; }
+    #zip-upload-method { width:100%; }
+    #zip-upload-method .file-picker { flex:1 1 auto; }
+    #zip-upload-method .upload-file-name { flex:1 1 auto; max-width:none; }
+    .file-picker { display:flex; align-items:center; gap:8px; min-width:0; }
+    .file-picker label { border:1px solid #98a2b3; border-radius:6px; padding:7px 10px; background:#fff; color:#344054; cursor:pointer; white-space:nowrap; }
+    .file-picker label:hover { border-color:#9aa4b2; background:#f8fafc; }
+    .upload-file-name { max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); }
+    .layout { display:grid; grid-template-columns:300px minmax(0,1fr); min-height:calc(100vh - 65px); }
+    .sidebar { border-right:1px solid var(--border); background:var(--surface); }
+    .sidebar-head { padding:18px 16px 12px; border-bottom:1px solid var(--border); }
+    .sidebar-head .row { margin-top:12px; }
+    .sidebar-head input[type="search"] { width:100%; }
+    .selection-bar { padding:12px 16px; border-bottom:1px solid var(--border); }
+    .selection-bar label { display:flex; align-items:center; gap:8px; cursor:pointer; white-space:nowrap; }
+    .selection-status { margin:8px 0 0; font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+    .selection-actions { display:flex; align-items:center; gap:6px; margin-left:auto; }
+    .selection-actions button { height:26px; padding:3px 7px; font-size:12px; line-height:18px; white-space:nowrap; }
+    .skill-list { max-height:calc(100vh - 330px); overflow:auto; }
+    .skill-item { display:flex; align-items:flex-start; gap:10px; width:100%; padding:13px 16px; border-bottom:1px solid #eef0f2; text-align:left; cursor:pointer; }
+    .skill-item:hover { background:#f4f6f8; }
+    .skill-item input { margin-top:2px; }
+    .skill-open { display:block; min-width:0; flex:1; padding:0; border:0; background:transparent; text-align:left; }
+    .skill-open:hover { background:transparent; }
+    .skill-body { flex:1; min-width:0; }
+    .skill-footer { display:flex; align-items:center; gap:8px; margin-top:5px; min-height:28px; }
+    .skill-footer small { flex:1; min-width:0; margin-top:0 !important; }
+    .skill-actions { display:flex; flex-shrink:0; gap:4px; opacity:0; pointer-events:none; }
+    .skill-item:hover .skill-actions,.skill-item:focus-within .skill-actions { opacity:1; pointer-events:auto; }
+    .skill-actions button { padding:4px 7px; font-size:12px; line-height:18px; }
+    .skill-item.active { border-left:3px solid var(--blue); padding-left:13px; background:var(--blue-bg); }
+    .skill-item strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .skill-item small { display:block; margin-top:5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); }
+    .workspace { min-width:0; padding:22px 24px; }
+    .empty { display:grid; min-height:420px; place-items:center; color:var(--muted); border:1px dashed #c8ced6; background:#fff; }
+    .repo-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; padding-bottom:18px; border-bottom:1px solid var(--border); }
+    .repo-title { display:flex; align-items:center; gap:10px; }
+    .repo-meta { margin-top:12px; color:var(--muted); font-size:12px; }
+    .repo-body { display:grid; grid-template-columns:260px minmax(0,1fr); min-height:560px; border:1px solid var(--border); border-radius:8px; overflow:hidden; background:#fff; }
+    .tree { border-right:1px solid var(--border); overflow:auto; }
+    .tree-head { padding:12px 14px; border-bottom:1px solid var(--border); font-weight:600; }
+    .tree-node { display:block; width:100%; padding:6px 12px; border:0; border-radius:0; text-align:left; font-size:13px; }
+    .tree-node:hover { background:#f4f6f8; }
+    .tree-node.active { background:var(--blue-bg); color:#114da6; }
+    .tree-node.dir { color:#475467; font-weight:600; }
+    .tree-children { margin-left:13px; }
+    .file-glyph { display:inline-block; width:22px; color:#98a2b3; }
+    .viewer { min-width:0; display:flex; flex-direction:column; }
+    .viewer-head { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:52px; padding:9px 14px; border-bottom:1px solid var(--border); }
+    .file-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .badge { padding:3px 7px; border-radius:4px; background:#f2f4f7; color:#667085; font-size:12px; white-space:nowrap; }
+    .viewer-content { min-height:0; flex:1; overflow:auto; }
+    textarea.editor { display:block; width:100%; min-height:505px; height:100%; resize:vertical; border:0; border-radius:0; padding:18px; outline:0; font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .preview { padding:22px 26px; min-height:505px; line-height:1.7; overflow:auto; }
+    .preview h1,.preview h2,.preview h3 { margin:0 0 12px; }
+    .preview h1 { font-size:26px; }.preview h2 { font-size:21px; }.preview h3 { font-size:17px; }
+    .preview p,.preview ul,.preview ol,.preview pre,.preview blockquote { margin:0 0 14px; }
+    .preview code { padding:2px 4px; border-radius:3px; background:#f2f4f7; font-family:ui-monospace,monospace; }
+    .preview pre { padding:14px; overflow:auto; border-radius:6px; background:#111827; color:#e5e7eb; }
+    .preview pre code { padding:0; background:transparent; }
+    .preview blockquote { margin-left:0; padding-left:12px; border-left:3px solid #d0d5dd; color:#667085; }
+    .preview a { color:var(--blue); }
+    .media-preview { display:block; max-width:100%; max-height:620px; margin:24px auto; object-fit:contain; }
+    .document-preview { width:100%; height:620px; border:0; }
+    .binary { display:grid; place-items:center; min-height:505px; gap:12px; color:var(--muted); text-align:center; }
+    .viewer-foot { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 14px; border-top:1px solid var(--border); }
+    .hidden { display:none !important; }
+    .notice { position:fixed; right:24px; bottom:24px; max-width:420px; padding:12px 16px; border:1px solid #b7c5d8; border-radius:7px; background:#fff; box-shadow:0 8px 24px #1018281a; }
+    .notice.error { border-color:#f0b4ad; color:#b42318; }
+    .history { margin-top:20px; border-top:1px solid var(--border); padding-top:16px; }
+    .history table { width:100%; border-collapse:collapse; margin-top:10px; background:#fff; }
+    .history th,.history td { padding:9px 10px; border-bottom:1px solid #eef0f2; text-align:left; font-size:12px; }
+    @media (max-width:800px) {
+      .topbar { align-items:flex-start; flex-direction:column; }
+      .top-actions { flex:1 1 auto; width:100%; max-width:none; justify-content:flex-start; margin-left:0; }
+      .import-box { width:100%; }
+      .source-tabs { width:max-content; }
+      .import-method { width:100%; flex-wrap:wrap; }
+      .import-method input { flex:1 1 220px; width:auto; }
+      .import-method .git-option { flex:1 1 140px; width:auto; }
+      .layout { display:block; }
+      .sidebar { border-right:0; border-bottom:1px solid var(--border); }
+      .skill-list { max-height:220px; }
+      .workspace { padding:16px; }
+      .repo-body { grid-template-columns:1fr; }
+      .tree { max-height:260px; border-right:0; border-bottom:1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><div class="brand-mark">S</div><div><h1>Skills</h1><div class="muted">共享 Skill 仓库</div></div></div>
+    <div class="top-actions"><div class="import-box"><div class="source-tabs" role="tablist" aria-label="导入方式"><button id="zip-tab" class="source-tab active" role="tab" aria-selected="true" onclick="setSourceType('zip')">Zip 导入</button><button id="git-tab" class="source-tab" role="tab" aria-selected="false" onclick="setSourceType('git')">Git 导入</button></div><div id="zip-method" class="import-method"><div class="source-tabs" role="tablist" aria-label="Zip 导入方式"><button id="zip-upload-tab" class="source-tab active" role="tab" aria-selected="true" onclick="setZipType('upload')">Zip 压缩包</button><button id="zip-url-tab" class="source-tab" role="tab" aria-selected="false" onclick="setZipType('url')">Zip 链接</button></div><div id="zip-upload-method" class="zip-file"><div class="file-picker"><label for="upload">选择压缩包</label><input id="upload" class="hidden" type="file" accept=".zip" onchange="updateUploadName()"><span id="upload-name" class="upload-file-name">未选择文件</span></div><button class="primary" onclick="uploadSkill()">导入</button></div><div id="zip-url-method" class="zip-file hidden"><input id="zip-url" type="url" placeholder="在线 Zip 链接"><button class="primary" onclick="importZipUrl()">导入</button></div></div><div id="git-method" class="import-method hidden"><input id="git-url" type="url" placeholder="Git / Bitbucket 链接"><input id="git-ref" class="git-option" type="text" placeholder="分支，如 main"><button class="primary" onclick="importGitUrl()">导入</button></div></div></div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head"><div class="row" style="justify-content:space-between"><h3>Skills</h3><span id="skill-count" class="muted"></span></div><div class="row"><input id="skill-search" type="search" placeholder="搜索 Skill" oninput="renderSkillList()"></div></div>
+      <div class="selection-bar">
+        <div class="row"><label><input id="select-all" type="checkbox" onchange="selectVisibleSkills(this.checked)">全选</label><div class="selection-actions"><button id="download-skills" onclick="downloadSelectedSkills()" disabled>批量下载</button><button id="delete-skills" class="danger" onclick="deleteSelectedSkills()" disabled>批量删除</button></div></div>
+        <div id="selection-status" class="selection-status" aria-live="polite">已勾选 0 个 Skill</div>
+      </div>
+      <div id="skill-list" class="skill-list">加载中…</div>
+    </aside>
+    <main class="workspace">
+      <div id="empty" class="empty">从左侧选择一个 Skill</div>
+      <section id="repo" class="hidden">
+        <div class="repo-head">
+          <div><div class="repo-title"><h2 id="repo-name"></h2><span id="repo-version" class="badge"></span></div><div id="repo-meta" class="repo-meta"></div></div>
+        </div>
+        <div class="repo-body">
+          <div class="tree"><div class="tree-head">文件</div><div id="file-tree"></div></div>
+          <div class="viewer">
+            <div class="viewer-head"><div class="row" style="min-width:0"><span id="file-name" class="file-name">请选择文件</span><span id="file-badge" class="badge hidden"></span></div><div id="mode-buttons" class="row hidden"><button id="source-button" onclick="setMode('source')">源码</button><button id="preview-button" onclick="setMode('preview')">预览</button></div></div>
+            <div id="viewer-content" class="viewer-content"><div class="binary">请选择左侧文件</div></div>
+            <div class="viewer-foot"><span id="file-info" class="muted"></span><div class="row"><a id="file-download" class="hidden" href="#" download><button>下载文件</button></a><button id="save-button" class="primary hidden" onclick="saveFile()">保存</button></div></div>
+          </div>
+        </div>
+        <div class="history"><div class="row" style="justify-content:space-between"><h3>版本历史</h3><button onclick="loadHistory()">刷新</button></div><div id="history-list" class="muted">加载中…</div></div>
+      </section>
+    </main>
+  </div>
+  <div id="notice" class="notice hidden"></div>
+  <script>
+    let skills = [], selectedSkill = null, selectedFile = null, skillVersion = null, fileContent = '', fileMode = 'source', selectionBusy = false;
+    const checkedSkills = new Set();
+    const $ = id => document.getElementById(id);
+    $('skill-list').addEventListener('click', event => {
+      const row = event.target.closest('.skill-item');
+      if (row && !event.target.closest('button, input')) {
+        row.querySelector('.skill-open').click();
+      }
+    });
+    const api = async (url, options = {}) => { const response = await fetch(url, {credentials:'include', ...options}); const data = await response.json().catch(() => ({})); if (!response.ok) throw Error(data.detail || response.statusText); return data; };
+    const fileUrl = (name, path) => '/api/skills/' + encodeURIComponent(name) + '/files/' + path.split('/').map(encodeURIComponent).join('/');
+    const escapeHtml = value => String(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    function notify(message, error = false) { const node = $('notice'); node.textContent = message; node.className = 'notice' + (error ? ' error' : ''); setTimeout(() => node.classList.add('hidden'), 4500); }
+    function formatBytes(size) { if (size < 1024) return size + ' B'; if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB'; return (size / 1024 / 1024).toFixed(1) + ' MB'; }
+    function visibleSkills() { const query = $('skill-search').value.trim().toLowerCase(); return skills.filter(s => !query || (s.name + ' ' + s.description).toLowerCase().includes(query)); }
+    function selectionTargets() { return [...checkedSkills]; }
+    function updateSelectionBar() {
+      const visible = visibleSkills(), checkedVisible = visible.filter(s => checkedSkills.has(s.name)).length;
+      $('select-all').checked = visible.length > 0 && checkedVisible === visible.length;
+      $('select-all').indeterminate = checkedVisible > 0 && checkedVisible < visible.length;
+      $('select-all').disabled = selectionBusy || !visible.length;
+      $('selection-status').textContent = `已勾选 ${checkedSkills.size} 个 Skill`;
+      $('download-skills').disabled = $('delete-skills').disabled = selectionBusy || !selectionTargets().length;
+    }
+    function renderSkillList() {
+      const visible = visibleSkills(); $('skill-count').textContent = visible.length + ' 个';
+      $('skill-list').innerHTML = visible.map(s => `<div class="skill-item ${s.name === selectedSkill ? 'active' : ''}"><input type="checkbox" aria-label="勾选 ${escapeHtml(s.name)}" ${checkedSkills.has(s.name) ? 'checked' : ''} ${selectionBusy ? 'disabled' : ''} onchange="toggleCheckedSkill('${s.name}', this.checked)"><div class="skill-body"><button class="skill-open" onclick="openSkill('${s.name}')"><strong>${escapeHtml(s.name)}</strong></button><div class="skill-footer"><small>v${s.version}</small><div class="skill-actions"><button aria-label="下载 ${s.name}" title="下载 ${s.name}" ${selectionBusy ? 'disabled' : ''} onclick="downloadSelectedSkills('${s.name}')">下载</button><button class="danger" aria-label="删除 ${s.name}" title="删除 ${s.name}" ${selectionBusy ? 'disabled' : ''} onclick="deleteSelectedSkills('${s.name}')">删除</button></div></div></div></div>`).join('') || '<div class="muted" style="padding:16px">没有匹配的 Skill</div>';
+      updateSelectionBar();
+    }
+    function toggleCheckedSkill(name, checked) { if (checked) checkedSkills.add(name); else checkedSkills.delete(name); updateSelectionBar(); }
+    function selectVisibleSkills(checked) { visibleSkills().forEach(s => checked ? checkedSkills.add(s.name) : checkedSkills.delete(s.name)); renderSkillList(); }
+    function closeSkill() { selectedSkill = null; selectedFile = null; skillVersion = null; $('repo').classList.add('hidden'); $('empty').classList.remove('hidden'); }
+    async function loadSkills() { const data = await api('/api/skills'); skills = data.skills; const names = new Set(skills.map(s => s.name)); for (const name of checkedSkills) if (!names.has(name)) checkedSkills.delete(name); if (selectedSkill && !names.has(selectedSkill)) closeSkill(); renderSkillList(); }
+    function buildTree(files) { const root = {dirs:{}, files:[]}; files.forEach(file => { let node = root; const parts = file.path.split('/'); parts.forEach((part, index) => { if (index === parts.length - 1) node.files.push(file); else node = node.dirs[part] ||= {dirs:{}, files:[]}; }); }); return root; }
+    function renderTree() { const root = buildTree($('repo')._files); const container = $('file-tree'); container.replaceChildren(); const render = (node, parent, depth) => { Object.keys(node.dirs).sort().forEach(name => { const button = document.createElement('button'); button.className = 'tree-node dir'; button.style.paddingLeft = (12 + depth * 14) + 'px'; button.textContent = '▾  ' + name; parent.append(button); const children = document.createElement('div'); children.className = 'tree-children'; parent.append(children); render(node.dirs[name], children, depth + 1); }); node.files.sort((a,b) => a.name.localeCompare(b.name)).forEach(file => { const button = document.createElement('button'); button.className = 'tree-node' + (file.path === selectedFile ? ' active' : ''); button.style.paddingLeft = (12 + depth * 14) + 'px'; button.innerHTML = `<span class="file-glyph">${file.is_text ? '▤' : '◻'}</span>${escapeHtml(file.name)}`; button.onclick = () => openFile(file); parent.append(button); }); }; render(root, container, 0); }
+    async function openSkill(name) { try { const data = await api('/api/skills/' + encodeURIComponent(name)); selectedSkill = name; skillVersion = data.skill.version; $('repo')._files = data.files; selectedFile = null; $('empty').classList.add('hidden'); $('repo').classList.remove('hidden'); $('repo-name').textContent = name; $('repo-version').textContent = 'v' + skillVersion; $('repo-meta').textContent = `创建者 ${data.skill.created_by} · 最后修改 ${data.skill.updated_by} · ${data.files.length} 个文件`; renderSkillList(); renderTree(); const first = data.files.find(file => file.path === 'SKILL.md') || data.files[0]; if (first) await openFile(first); await loadHistory(); } catch (error) { notify(error.message, true); } }
+    async function openFile(file) { try { selectedFile = file.path; renderTree(); $('file-name').textContent = file.path; $('file-badge').textContent = file.is_text ? '文本' : file.mime_type; $('file-badge').classList.remove('hidden'); $('file-info').textContent = `${formatBytes(file.size_bytes)} · ${file.mime_type}`; const url = fileUrl(selectedSkill, file.path); $('file-download').href = url; $('file-download').classList.remove('hidden'); $('save-button').classList.add('hidden'); $('mode-buttons').classList.add('hidden'); $('viewer-content').replaceChildren(); if (file.is_text) { const response = await fetch(url, {credentials:'include'}); if (!response.ok) throw Error('文件读取失败'); fileContent = await response.text(); fileMode = 'source'; $('mode-buttons').classList.remove('hidden'); $('source-button').classList.add('primary'); $('preview-button').classList.remove('primary'); renderTextFile(file); } else if (file.mime_type.startsWith('image/')) { const image = document.createElement('img'); image.className = 'media-preview'; image.src = url; image.alt = file.name; $('viewer-content').append(image); } else if (file.mime_type === 'application/pdf') { const frame = document.createElement('iframe'); frame.className = 'document-preview'; frame.src = url; frame.title = file.name; $('viewer-content').append(frame); } else { $('viewer-content').innerHTML = `<div class="binary"><div>该文件不能直接预览</div><a href="${url}" download>下载 ${escapeHtml(file.name)}</a></div>`; } } catch (error) { notify(error.message, true); } }
+    function renderTextFile(file) { const content = $('viewer-content'); content.replaceChildren(); if (fileMode === 'preview' && file.path.toLowerCase().endsWith('.md')) { const preview = document.createElement('article'); preview.className = 'preview'; preview.innerHTML = markdownToHtml(fileContent); content.append(preview); $('save-button').classList.add('hidden'); return; } const editor = document.createElement('textarea'); editor.className = 'editor'; editor.value = fileContent; editor.oninput = () => { fileContent = editor.value; $('save-button').classList.remove('hidden'); }; content.append(editor); $('save-button').classList.remove('hidden'); }
+    function setMode(mode) { fileMode = mode; $('source-button').classList.toggle('primary', mode === 'source'); $('preview-button').classList.toggle('primary', mode === 'preview'); const file = $('repo')._files.find(item => item.path === selectedFile); if (file) renderTextFile(file); }
+    function markdownInline(text) { return escapeHtml(text).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/\*([^*]+)\*/g, '<em>$1</em>'); }
+    function markdownToHtml(source) { const lines = source.split(/\r?\n/), output = []; let inCode = false, code = [], list = false; const closeList = () => { if (list) { output.push('</ul>'); list = false; } }; lines.forEach(line => { if (line.startsWith('```')) { closeList(); if (inCode) { output.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>'); code = []; } inCode = !inCode; return; } if (inCode) { code.push(line); return; } if (!line.trim()) { closeList(); return; } const heading = line.match(/^(#{1,3})\s+(.+)$/); if (heading) { closeList(); output.push(`<h${heading[1].length}>${markdownInline(heading[2])}</h${heading[1].length}>`); return; } const item = line.match(/^[-*]\s+(.+)$/); if (item) { if (!list) { output.push('<ul>'); list = true; } output.push('<li>' + markdownInline(item[1]) + '</li>'); return; } closeList(); if (line.startsWith('> ')) output.push('<blockquote>' + markdownInline(line.slice(2)) + '</blockquote>'); else output.push('<p>' + markdownInline(line) + '</p>'); }); closeList(); if (inCode) output.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>'); return output.join(''); }
+    async function saveFile() { if (!selectedSkill || !selectedFile) return; try { await api('/api/skills/' + encodeURIComponent(selectedSkill), {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({files:{[selectedFile]:fileContent}, base_version:skillVersion, message:'Online edit'})}); notify('文件保存成功'); await openSkill(selectedSkill); } catch (error) { notify(error.message, true); } }
+    async function loadHistory() { if (!selectedSkill) return; try { const data = await api('/api/skills/' + encodeURIComponent(selectedSkill) + '/history'); $('history-list').innerHTML = data.history.length ? `<table><thead><tr><th>版本</th><th>操作人</th><th>说明</th><th>时间</th></tr></thead><tbody>${data.history.map(item => `<tr><td>v${item.version}</td><td>${escapeHtml(item.actor_id)}</td><td>${escapeHtml(item.message)}</td><td>${new Date(item.created_at).toLocaleString()}</td></tr>`).join('')}</tbody></table>` : '暂无版本历史'; } catch (error) { $('history-list').textContent = error.message; } }
+    function setSourceType(type) { const git = type === 'git'; $('zip-method').classList.toggle('hidden', git); $('git-method').classList.toggle('hidden', !git); $('zip-tab').classList.toggle('active', !git); $('git-tab').classList.toggle('active', git); $('zip-tab').setAttribute('aria-selected', String(!git)); $('git-tab').setAttribute('aria-selected', String(git)); }
+    function setZipType(type) { const url = type === 'url'; $('zip-upload-method').classList.toggle('hidden', url); $('zip-url-method').classList.toggle('hidden', !url); $('zip-upload-tab').classList.toggle('active', !url); $('zip-url-tab').classList.toggle('active', url); $('zip-upload-tab').setAttribute('aria-selected', String(!url)); $('zip-url-tab').setAttribute('aria-selected', String(url)); }
+    function updateUploadName() { const file = $('upload').files[0]; $('upload-name').textContent = file ? file.name : '未选择文件'; }
+    function importSummary(data) { const summary = data.summary; return `导入完成：创建 ${summary.created}，更新 ${summary.updated}，跳过 ${summary.skipped}，失败 ${summary.failed}`; }
+    async function openFirstImported(data) { const first = (data.skills || []).find(item => item.status === 'created' || item.status === 'updated'); await loadSkills(); if (first) await openSkill(first.name); notify(importSummary(data), data.summary.failed > 0); }
+    async function uploadSkill() { const file = $('upload').files[0]; if (!file) return notify('请选择 Zip 文件', true); const form = new FormData(); form.append('file', file); try { const data = await api('/api/skills', {method:'POST', body:form}); $('upload').value = ''; updateUploadName(); await openFirstImported(data); } catch (error) { notify(error.message, true); } }
+    async function importZipUrl() { const url = $('zip-url').value.trim(); if (!url) return notify('请输入在线 Zip 链接', true); try { const data = await api('/api/skills/import-url', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})}); $('zip-url').value = ''; await openFirstImported(data); } catch (error) { notify(error.message, true); } }
+    async function importGitUrl() { const url = $('git-url').value.trim(); if (!url) return notify('请输入 Git 仓库链接', true); try { const payload = {url, ref:$('git-ref').value.trim() || null}; const data = await api('/api/skills/import-git', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); $('git-url').value = ''; $('git-ref').value = ''; await openFirstImported(data); } catch (error) { notify(error.message, true); } }
+    async function downloadSelectedSkills(name = null) {
+      const names = name ? [name] : selectionTargets(); if (!names.length || selectionBusy) return;
+      selectionBusy = true; renderSkillList();
+      try {
+        const response = await fetch(names.length === 1 ? '/api/skills/' + encodeURIComponent(names[0]) + '/download' : '/api/skills/batch-download', names.length === 1 ? {credentials:'include'} : {credentials:'include', method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({names})});
+        if (!response.ok) { const data = await response.json().catch(() => ({})); throw Error(data.detail || response.statusText); }
+        const url = URL.createObjectURL(await response.blob()), link = document.createElement('a'); link.href = url; link.download = names.length === 1 ? names[0] + '.zip' : 'skills.zip'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+      } catch (error) { notify(error.message, true); } finally { selectionBusy = false; renderSkillList(); }
+    }
+    async function deleteSelectedSkills(name = null) {
+      const names = name ? [name] : selectionTargets(); if (!names.length || selectionBusy || !confirm(`确定删除以下 ${names.length} 个 Skill？\n\n${names.join('\n')}`)) return;
+      selectionBusy = true; renderSkillList();
+      try {
+        const data = await api('/api/skills/batch-delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({names})});
+        data.deleted.forEach(name => checkedSkills.delete(name)); if (data.deleted.includes(selectedSkill)) closeSkill(); await loadSkills(); notify(`已删除 ${data.count} 个 Skill`);
+      } catch (error) { notify(error.message, true); } finally { selectionBusy = false; renderSkillList(); }
+    }
+    async function load() { try { await loadSkills(); } catch (error) { notify(error.message, true); } }
+    load();
+  </script>
+</body>
+</html>
