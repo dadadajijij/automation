@@ -2,6 +2,22 @@
 
 共享 Skills 管理工具。接口通过 Athena 尝试识别操作人，页面不展示用户信息；Athena 暂时不可用时，服务继续提供本地 Skills 管理能力，修改记录会使用 `anonymous` 作为操作人。
 
+## 权限控制
+
+服务固定将 `panweikui@agora.io` 视为管理用户。管理用户专属操作包括新建、改名和删除分类，以及批量移动和批量删除 Skill。普通用户可以查看和下载 Skill，也可以单个移动或删除 Skill；批量下载对普通用户开放。
+
+后端会独立校验管理权限，不能通过直接调用接口绕过页面限制。以下接口需要管理用户身份：
+
+```text
+POST   /api/categories
+PATCH  /api/categories/{category}
+DELETE /api/categories/{category}
+POST   /api/skills/batch-category
+POST   /api/skills/batch-delete
+```
+
+页面通过 `GET /api/me` 返回的 `can_manage` 字段控制管理按钮显示。Athena 无法识别用户时，`can_manage` 为 `false`；单个 Skill 移动和删除接口仍可用。
+
 ## 本地运行
 
 ```bash
@@ -13,7 +29,67 @@ uvicorn skill_manager.app:app --reload
 
 生产环境将 `/tools2/skills/` 反向代理到容器的 8000 端口，并将 `/data` 挂载为持久化卷。代理需要剥掉该路径前缀，并设置 `X-Forwarded-Prefix: /tools2/skills`；服务会将前缀注入页面，供 API、文件预览和下载使用。其他部署路径可设置对应的请求头。本地直接运行时不设置该请求头，页面使用 `/api/skills` 等根路径，无需额外配置。`ATHENA_ME_URL` 可通过环境变量覆盖。
 
+## Skill 分类
+
+Skill 文件统一保存为：
+
+```text
+data/skills/<category>/<skill-name>/
+```
+
+系统会预置不可删除的 `general` 分类。所有新上传和 Git 导入的 Skill 默认进入：
+
+```text
+data/skills/general/<skill-name>/
+```
+
+页面左侧支持查看分类、按分类筛选、新建分类、单个移动和批量移动。新建分类使用页面内联表单；批量移动点击“批量移动”后才展开分类选择；单个 Skill 的移动选择器直接展开在对应 Skill 行内。分类标识只允许小写字母、数字和连字符，例如 `customer-private`。分类由管理页面控制，导入包中 `SKILL.md` 的 `category` 字段不会改变系统分类。
+
+分类接口：
+
+```http
+GET /api/categories
+POST /api/categories
+PATCH /api/categories/{category}
+DELETE /api/categories/{category}
+PATCH /api/skills/{skill_name}/category
+POST /api/skills/batch-category
+```
+
+创建分类时提供路径标识和中文名称。分类标识用于磁盘目录名：
+
+```json
+{
+  "slug": "customer-private",
+  "name_zh": "客户私有"
+}
+```
+
+分类名称对照会自动写入 `data/category_names.json`，供其他项目读取：
+
+```json
+{
+  "customer-private": "客户私有"
+}
+```
+
+修改分类时可以同时修改 `slug` 和 `name_zh`。如果 `slug` 变化，服务会同步修改 `data/skills/<category>/`、`data/archives/<category>/` 和数据库中的分类引用；修改后的中文名会立即反映到页面。删除分类时，分类下的 Skill 会先移动到 `general`，随后删除该分类及其 JSON 对照信息。
+
+移动 Skill：
+
+```json
+{
+  "category": "customer-private"
+}
+```
+
+`general` 不允许删除。分类移动只改变归属和目录路径，不增加 Skill 内容版本；版本快照保存于 `data/archives/<category>/`。
+
+已有旧目录 `data/skills/<skill-name>` 会在服务启动时自动迁移到 `data/skills/general/<skill-name>`。迁移前应备份 `data/skill-manager.db`；如果目标目录已经存在，服务会停止迁移并报告冲突。
+
 ## 页面能力
+
+Skill 描述优先使用 `SKILL.md` YAML frontmatter 中的非空字符串 `description`（支持 `>`、`|` 多行语法，保留解析后的完整内容）。没有声明、值为空或空白时，跳过标题等非正文内容，提取第一段正文，多行段落以空格连接；只有标题而没有正文时描述为空。导入和在线编辑使用同一规则，frontmatter 格式错误或非字符串描述会返回包含 Skill 名称的校验错误，批量导入不会部分写入。已有记录需重新导入或保存 `SKILL.md` 后才会更新描述。
 
 左侧 Skills 列表支持独立勾选、多选和全选当前搜索结果。顶部的批量下载 Zip 和批量删除只操作勾选项，未勾选时禁用。取消勾选可点击对应复选框，或取消全选当前搜索结果。每个 Skill 行都有独立下载、删除按钮，默认隐藏，鼠标悬停或键盘聚焦时显示；行内操作只作用于对应 Skill，与勾选和当前打开的 Skill 无关。搜索不会清除已有勾选，操作区显示整个选择的数量；删除前会列出待删除的 Skill 进行确认。
 
@@ -37,35 +113,9 @@ Content-Type: application/json
 
 成功返回 `{"ok": true, "deleted": ["skill-a", "skill-b"], "count": 2}`。两种批量接口都要求非空列表，最多 500 项，重复名称自动去重；名称无效或 Skill 不存在时返回错误。批量删除在写入前校验全部目标，失败会回滚已暂存的目录和数据库修改。删除保留历史版本 Zip 快照，当前没有页面恢复入口。
 
-删除后重新导入会从历史最高版本继续编号，避免覆盖原有快照。导入和在线编辑将 Skill 文件、版本记录及快照一起提交，失败则回滚；数据库暂时被占用时返回 HTTP 503 和 `Retry-After`，稍后可重试。
+删除后重新导入会从历史最高版本继续编号，避免覆盖原有快照。每个 Skill 只保留最近两个版本的 Zip 快照和历史记录，生成新版本后自动清理更早版本；服务启动时也会清理已有超量快照。导入和在线编辑将 Skill 文件、版本记录及快照一起提交，失败则回滚；数据库暂时被占用时返回 HTTP 503 和 `Retry-After`，稍后可重试。
 
-页面按仓库浏览方式管理 Skill：左侧可以搜索和选择 Skill，详情区域显示文件目录树，文本文件支持源码查看和编辑，Markdown 支持预览，图片和 PDF 支持直接预览，其他二进制文件提供下载。Skill 可以通过本地 ZIP、在线 ZIP 链接或 Git 仓库导入；一个来源中包含多个 `SKILL.md` 时会自动批量识别并导入。导入同名 Skill 会生成新版本并覆盖当前文件内容。
-
-在线 ZIP 导入接口：
-
-```http
-POST /api/skills/import-url
-Content-Type: application/json
-
-{
-  "url": "https://example.com/my-skill.zip"
-}
-```
-
-也可以提供可选的文件名，用于压缩包没有顶层目录、只能从文件名推导 Skill 名称的情况：
-
-```json
-{
-  "url": "https://example.com/download?id=123",
-  "filename": "my-skill.zip"
-}
-```
-
-在线地址必须最终返回 ZIP 文件，压缩包仍然必须包含 `SKILL.md`。服务会限制下载大小、校验重定向，并默认拒绝解析到本机、内网或其他非公网地址的域名。公司内部域名可以通过环境变量显式放行：
-
-```bash
-SKILL_URL_ALLOWED_HOSTS=bitbucket.agoralab.co,git.agoralab.co
-```
+页面按仓库浏览方式管理 Skill：左侧可以搜索和选择 Skill，详情区域显示文件目录树，文本文件支持源码查看和编辑，Markdown 支持预览，图片和 PDF 支持直接预览，其他二进制文件提供下载。Skill 可以通过本地 Zip 压缩包或 Git 仓库导入；一个来源中包含多个 `SKILL.md` 时会自动批量识别并导入。导入同名 Skill 会生成新版本并覆盖当前文件内容。
 
 Git 仓库导入接口：
 
@@ -89,7 +139,7 @@ Git 导入不再接收目录参数，始终扫描整个仓库并批量导入所�
 
 扫描时先定位 `SKILL.md`，再读取对应 Skill 目录内的资源；非 Skill 文件不计入资源大小和数量限制。根目录含 `SKILL.md` 时，优先使用 YAML frontmatter 的 `name`，未声明时使用仓库名。其他 Skill 继续使用目录名。同名 Skill 更新，重复名称、嵌套 Skill 和 Skill 内的符号链接会被拒绝；远端删除的 Skill 不会自动删除本地记录。
 
-本地 ZIP 上传、在线 ZIP 导入和 Git 导入都返回批量结果：
+本地 Zip 上传和 Git 导入都返回批量结果：
 
 ```json
 {

@@ -130,8 +130,8 @@ class GitImportTests(unittest.TestCase):
                         response = await client.post("/api/skills/import-git", json={"url": "https://example.com/source.git"})
                         self.assertEqual(response.status_code, 201, response.text)
                         self.assertEqual(response.json()["summary"][expected], 2)
-                    self.assertTrue((data / "skills/alpha/SKILL.md").is_file())
-                    self.assertEqual(len(list((data / "archives").glob("*.zip"))), 4)
+                    self.assertTrue((data / "skills/general/alpha/SKILL.md").is_file())
+                    self.assertEqual(len(list((data / "archives").rglob("*.zip"))), 4)
                     self.assertFalse(list(data.glob("skill-git-*")))
 
             with patch.multiple(manager, ROOT=data, SKILLS_ROOT=data / "skills", ARCHIVES_ROOT=data / "archives", DB_PATH=data / "db.sqlite"), patch.object(manager, "current_user", no_user), patch.object(manager, "parse_git_source", return_value=(source.as_uri(), None)):

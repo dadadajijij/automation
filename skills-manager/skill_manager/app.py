@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 import yaml
@@ -33,13 +33,14 @@ SKILLS_ROOT = ROOT / "skills"
 ARCHIVES_ROOT = ROOT / "archives"
 DB_PATH = ROOT / "skill-manager.db"
 ATHENA_ME_URL = os.getenv("ATHENA_ME_URL", "https://athena.agoralab.co/api/me")
+SKILL_MANAGER_ADMIN_ID = "panweikui@agora.io"
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 MAX_FILES = int(os.getenv("MAX_FILES", "2000"))
-MAX_REDIRECTS = 5
-DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("SKILL_URL_TIMEOUT_SECONDS", "30"))
 GIT_TIMEOUT_SECONDS = float(os.getenv("SKILL_GIT_TIMEOUT_SECONDS", "120"))
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,255}$")
+DEFAULT_CATEGORY = "general"
+MAX_ARCHIVED_VERSIONS = 2
 
 app = FastAPI(title="Athena Skill Manager", docs_url="/api/docs")
 logger = logging.getLogger(__name__)
@@ -59,11 +60,6 @@ class FileUpdate(BaseModel):
     message: str = Field(default="Updated skill", max_length=500)
 
 
-class UrlImport(BaseModel):
-    url: str = Field(min_length=1, max_length=2048)
-    filename: str | None = Field(default=None, max_length=255)
-
-
 class GitImport(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     ref: str | None = Field(default=None, max_length=255)
@@ -72,6 +68,28 @@ class GitImport(BaseModel):
 
 class SkillSelection(BaseModel):
     names: list[str] = Field(min_length=1, max_length=500)
+
+
+class CategoryCreate(BaseModel):
+    slug: str = Field(min_length=1, max_length=64)
+    name_zh: str | None = Field(default=None, min_length=1, max_length=120)
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+
+
+class CategoryUpdate(BaseModel):
+    slug: str | None = Field(default=None, min_length=1, max_length=64)
+    name_zh: str | None = Field(default=None, min_length=1, max_length=120)
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
+
+
+class CategoryAssignment(BaseModel):
+    category: str = Field(min_length=1, max_length=64)
+
+
+class BatchCategoryAssignment(SkillSelection, CategoryAssignment):
+    pass
 
 
 @app.get("/health")
@@ -91,8 +109,14 @@ def db() -> sqlite3.Connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS categories (
+              slug TEXT PRIMARY KEY, display_name TEXT NOT NULL, name_zh TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+              is_system INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS skills (
-              name TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL,
+              name TEXT PRIMARY KEY, category_slug TEXT NOT NULL DEFAULT 'general',
+              description TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL,
               created_by TEXT NOT NULL, updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS skill_versions (
@@ -102,6 +126,22 @@ def db() -> sqlite3.Connection:
             );
             """
         )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)").fetchall()}
+        if "category_slug" not in columns:
+            connection.execute("ALTER TABLE skills ADD COLUMN category_slug TEXT NOT NULL DEFAULT 'general'")
+        category_columns = {row[1] for row in connection.execute("PRAGMA table_info(categories)").fetchall()}
+        if "name_zh" not in category_columns:
+            connection.execute("ALTER TABLE categories ADD COLUMN name_zh TEXT NOT NULL DEFAULT ''")
+        stamp = now()
+        connection.execute(
+            "INSERT OR IGNORE INTO categories(slug,display_name,name_zh,description,is_system,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (DEFAULT_CATEGORY, "默认", "默认", "", 1, "system", stamp, stamp),
+        )
+        for category in connection.execute("SELECT slug,display_name,name_zh FROM categories").fetchall():
+            zh = "默认" if category["slug"] == DEFAULT_CATEGORY else category["name_zh"] or category["display_name"]
+            if zh != category["name_zh"] or category["display_name"] != zh:
+                connection.execute("UPDATE categories SET display_name=?,name_zh=? WHERE slug=?", (zh, zh, category["slug"]))
+        connection.commit()
     except Exception:
         connection.close()
         raise
@@ -111,6 +151,62 @@ def db() -> sqlite3.Connection:
 def ensure_dirs() -> None:
     SKILLS_ROOT.mkdir(parents=True, exist_ok=True)
     ARCHIVES_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def validate_category(slug: str) -> str:
+    if not NAME_RE.fullmatch(slug):
+        raise HTTPException(400, "Category must use lowercase letters, numbers and hyphens")
+    return slug
+
+
+def category_root(category: str) -> Path:
+    return SKILLS_ROOT / validate_category(category)
+
+
+def skill_root(category: str, name: str) -> Path:
+    return category_root(category) / validate_name(name)
+
+
+def archive_path(category: str, name: str, version: int) -> Path:
+    return ARCHIVES_ROOT / validate_category(category) / f"{validate_name(name)}-v{version}.zip"
+
+
+def migrate_legacy_skill_paths() -> None:
+    """Move legacy data/skills/<name> directories under data/skills/general."""
+    legacy_entries = [path for path in SKILLS_ROOT.iterdir() if path.is_dir() and path.name != DEFAULT_CATEGORY]
+    if not legacy_entries:
+        return
+    target_root = category_root(DEFAULT_CATEGORY)
+    target_root.mkdir(parents=True, exist_ok=True)
+    for path in legacy_entries:
+        if not (path / "SKILL.md").is_file():
+            continue
+        target = target_root / path.name
+        if target.exists():
+            raise RuntimeError(f"Cannot migrate legacy Skill; target already exists: {target}")
+        path.rename(target)
+
+
+def category_names_path() -> Path:
+    return ROOT / "category_names.json"
+
+
+def write_category_names_file(connection: sqlite3.Connection | None = None) -> None:
+    owns_connection = connection is None
+    connection = connection or db()
+    try:
+        payload = {
+            row["slug"]: row["name_zh"]
+            for row in connection.execute("SELECT slug,name_zh FROM categories ORDER BY slug").fetchall()
+        }
+    finally:
+        if owns_connection:
+            connection.close()
+    target = category_names_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
 
 
 async def current_user(request: Request) -> dict[str, str] | None:
@@ -135,6 +231,23 @@ async def current_user(request: Request) -> dict[str, str] | None:
         return {"id": user_id, "email": str(raw.get("email") or user_id), "display_name": str(raw.get("displayName") or user_id)}
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def is_manager(user: dict[str, str] | None) -> bool:
+    if not user:
+        return False
+    return any(
+        value.strip().casefold() == SKILL_MANAGER_ADMIN_ID
+        for value in (user.get("id", ""), user.get("email", ""))
+        if value
+    )
+
+
+async def require_manager(request: Request) -> dict[str, str]:
+    user = await current_user(request)
+    if not is_manager(user):
+        raise HTTPException(403, "Administrator permission required")
+    return user
 
 
 def safe_member(name: str) -> str:
@@ -269,12 +382,19 @@ def is_text_file(path: Path) -> bool:
         return False
 
 
-def skill_file_path(name: str, relative: str) -> Path:
+def skill_file_path(name: str, relative: str, category: str | None = None) -> Path:
     relative = safe_member(relative)
-    skill_root = (SKILLS_ROOT / name).resolve()
-    candidate = (skill_root / relative).resolve()
+    if category is None:
+        connection = db()
+        row = connection.execute("SELECT category_slug FROM skills WHERE name=?", (validate_name(name),)).fetchone()
+        connection.close()
+        if row is None:
+            raise HTTPException(404, "Skill not found")
+        category = row["category_slug"]
+    root_path = skill_root(category, name).resolve()
+    candidate = (root_path / relative).resolve()
     try:
-        candidate.relative_to(skill_root)
+        candidate.relative_to(root_path)
     except ValueError as exc:
         raise HTTPException(400, "Invalid file path") from exc
     if not candidate.is_file():
@@ -294,8 +414,8 @@ def file_metadata(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
-def list_skill_files(name: str) -> list[dict[str, Any]]:
-    root = (SKILLS_ROOT / name).resolve()
+def list_skill_files(name: str, category: str) -> list[dict[str, Any]]:
+    root = skill_root(category, name).resolve()
     return [
         file_metadata(path, root)
         for path in sorted(root.rglob("*"))
@@ -310,11 +430,59 @@ def validate_name(name: str) -> str:
 
 
 def description_from(content: str) -> str:
-    for line in content.splitlines():
-        line = line.strip().lstrip("#").strip()
-        if line:
-            return line[:500]
-    return ""
+    lines = content.lstrip("\ufeff").splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((index for index in range(1, len(lines)) if lines[index].strip() in {"---", "..."}), None)
+        if end is None:
+            raise HTTPException(400, "SKILL.md frontmatter is missing its closing delimiter")
+        try:
+            metadata = yaml.safe_load("\n".join(lines[1:end]))
+        except yaml.YAMLError as exc:
+            raise HTTPException(400, "Invalid SKILL.md frontmatter") from exc
+        if metadata is not None and not isinstance(metadata, dict):
+            raise HTTPException(400, "SKILL.md frontmatter must be a mapping")
+        if metadata and "description" in metadata:
+            description = metadata["description"]
+            if description is not None and not isinstance(description, str):
+                raise HTTPException(400, "SKILL.md description must be a string")
+            if description and description.strip():
+                return description.strip()
+        lines = lines[end + 1:]
+
+    paragraph: list[str] = []
+    fence = None
+    in_comment = False
+    for raw in lines:
+        line = raw.strip()
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if line.startswith("<!--"):
+            if paragraph:
+                break
+            in_comment = "-->" not in line
+            continue
+        marker = re.match(r"^(`{3,}|~{3,})", line)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+                fence = None
+            continue
+        if marker:
+            if paragraph:
+                break
+            fence = marker[1]
+            continue
+        if re.fullmatch(r"(?:=+|-+)", line) and paragraph:
+            # A setext underline makes the preceding lines a heading.
+            paragraph.clear()
+            continue
+        if not line or re.match(r"^(?:#{1,6}(?:\s|$)|[-*+]\s|\d+[.)]\s|>|(?:\*\s*){3,}$|(?:_\s*){3,}$|(?:-\s*){3,}$)", line) or raw.startswith(("    ", "\t")):
+            if paragraph:
+                break
+            continue
+        paragraph.append(line)
+    return " ".join(paragraph)
 
 
 def write_skill_archive(source: Path, archive: Path) -> None:
@@ -327,6 +495,38 @@ def write_skill_archive(source: Path, archive: Path) -> None:
 def next_skill_version(connection: sqlite3.Connection, name: str, current_version: int = 0) -> int:
     history_version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM skill_versions WHERE skill_name=?", (name,)).fetchone()[0]
     return max(current_version, history_version) + 1
+
+
+def prune_skill_history(skill_name: str, keep: int = MAX_ARCHIVED_VERSIONS) -> None:
+    """Keep only the newest version records and archive files for one Skill."""
+    connection = db()
+    try:
+        rows = connection.execute(
+            "SELECT id,archive_path FROM skill_versions WHERE skill_name=? ORDER BY version DESC, id DESC",
+            (skill_name,),
+        ).fetchall()
+        stale = rows[keep:]
+        if not stale:
+            return
+        for row in stale:
+            archive = Path(row["archive_path"])
+            if archive.exists():
+                archive.unlink()
+        connection.execute(
+            f"DELETE FROM skill_versions WHERE id IN ({','.join('?' for _ in stale)})",
+            [row["id"] for row in stale],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def prune_all_skill_history() -> None:
+    connection = db()
+    names = [row[0] for row in connection.execute("SELECT DISTINCT skill_name FROM skill_versions").fetchall()]
+    connection.close()
+    for name in names:
+        prune_skill_history(name)
 
 
 def source_file_ignored(path: str) -> bool:
@@ -492,8 +692,13 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
         backup_root = Path(temp_dir) / "backup"
         staging_root.mkdir()
         backup_root.mkdir()
+        descriptions: dict[str, str] = {}
         for package in packages:
             name = validate_name(package["name"])
+            try:
+                descriptions[name] = description_from(package["files"]["SKILL.md"].decode("utf-8", errors="replace"))
+            except HTTPException as exc:
+                raise HTTPException(exc.status_code, f"{name}: {exc.detail}") from exc
             staged = staging_root / name
             staged.mkdir()
             for relative, content in package["files"].items():
@@ -510,6 +715,10 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
             for package in packages:
                 name = package["name"]
                 existing = connection.execute("SELECT * FROM skills WHERE name=?", (name,)).fetchone()
+                category = validate_category(existing["category_slug"] if existing else DEFAULT_CATEGORY)
+                category_row = connection.execute("SELECT slug FROM categories WHERE slug=?", (category,)).fetchone()
+                if category_row is None:
+                    raise HTTPException(409, f"Category not found for Skill {name}: {category}")
                 if base_versions and name in base_versions:
                     if existing is None:
                         raise HTTPException(404, "Skill not found")
@@ -520,14 +729,16 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
                     continue
 
                 version = next_skill_version(connection, name, int(existing["version"]) if existing else 0)
-                archive = ARCHIVES_ROOT / f"{name}-v{version}.zip"
+                archive = archive_path(category, name, version)
+                archive.parent.mkdir(parents=True, exist_ok=True)
                 if archive.exists():
                     raise HTTPException(409, f"Version archive already exists for {name}; check storage consistency")
                 staged = staging_root / name
                 staged_archive = Path(temp_dir) / f"{name}.zip"
                 write_skill_archive(staged, staged_archive)
 
-                destination = SKILLS_ROOT / name
+                destination = skill_root(category, name)
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 backup = backup_root / name if destination.exists() else None
                 if backup:
                     destination.rename(backup)
@@ -536,13 +747,13 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
                 staged_archive.rename(archive)
                 archives.append(archive)
                 stamp = now()
-                description = description_from(package["files"]["SKILL.md"].decode("utf-8", errors="replace"))
+                description = descriptions[name]
                 if existing:
                     connection.execute("UPDATE skills SET description=?,version=?,updated_by=?,updated_at=? WHERE name=?", (description, version, user["id"], stamp, name))
                 else:
-                    connection.execute("INSERT INTO skills VALUES(?,?,?,?,?,?,?)", (name, description, version, user["id"], user["id"], stamp, stamp))
+                    connection.execute("INSERT INTO skills(name,category_slug,description,version,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (name, category, description, version, user["id"], user["id"], stamp, stamp))
                 connection.execute("INSERT INTO skill_versions(skill_name,version,archive_path,actor_id,message,created_at) VALUES(?,?,?,?,?,?)", (name, version, str(archive), user["id"], message, stamp))
-                results.append({"name": name, "status": "updated" if existing else "created", "version": version})
+                results.append({"name": name, "category": category, "status": "updated" if existing else "created", "version": version})
             connection.commit()
         except Exception:
             connection.rollback()
@@ -556,42 +767,10 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
             raise
         finally:
             connection.close()
+    for result in results:
+        if result.get("status") in {"created", "updated"}:
+            prune_skill_history(result["name"])
     return batch_result(results)
-
-
-async def download_skill_archive(raw_url: str, filename: str | None = None) -> tuple[bytes, str]:
-    current_url = validate_download_url(raw_url)
-    timeout = httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS, connect=min(DOWNLOAD_TIMEOUT_SECONDS, 10))
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            for _ in range(MAX_REDIRECTS + 1):
-                response = await client.get(current_url)
-                if response.is_redirect:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise HTTPException(502, "Skill URL returned an invalid redirect")
-                    current_url = validate_download_url(urljoin(current_url, location))
-                    continue
-                if response.status_code < 200 or response.status_code >= 300:
-                    raise HTTPException(502, f"Skill URL returned HTTP {response.status_code}")
-                content_length = response.headers.get("content-length")
-                if content_length and int(content_length) > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "Remote Skill package is too large")
-                content = bytearray()
-                async for chunk in response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > MAX_UPLOAD_BYTES:
-                        raise HTTPException(413, "Remote Skill package is too large")
-                if not bytes(content).startswith(b"PK"):
-                    raise HTTPException(400, "Remote URL must point to a ZIP Skill package")
-                parsed = urlparse(current_url)
-                remote_name = unquote(Path(parsed.path).name) or "skill.zip"
-                return bytes(content), filename or remote_name
-            raise HTTPException(502, "Too many redirects while downloading Skill package")
-    except HTTPException:
-        raise
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(502, f"Unable to download Skill package: {exc}") from exc
 
 
 def clone_git_packages(raw_url: str, ref: str | None) -> list[dict[str, Any]]:
@@ -649,12 +828,18 @@ def skill_row(row: sqlite3.Row) -> dict[str, Any]:
 
 @app.on_event("startup")
 def startup() -> None:
-    ensure_dirs(); connection = db(); connection.close()
+    ensure_dirs()
+    connection = db()
+    connection.close()
+    migrate_legacy_skill_paths()
+    prune_all_skill_history()
+    write_category_names_file()
 
 
 @app.get("/api/me")
 async def me(request: Request) -> dict[str, Any]:
-    return {"user": await current_user(request)}
+    user = await current_user(request)
+    return {"user": user, "can_manage": is_manager(user)}
 
 
 @app.get("/api/skills")
@@ -664,12 +849,170 @@ async def list_skills(request: Request) -> dict[str, Any]:
     return {"skills": [skill_row(row) for row in rows]}
 
 
+@app.get("/api/categories")
+async def list_categories(request: Request) -> dict[str, Any]:
+    await current_user(request)
+    connection = db()
+    rows = connection.execute(
+        """SELECT c.slug,c.display_name,c.name_zh,c.description,c.is_system,c.created_by,c.created_at,c.updated_at,
+                  COUNT(s.name) AS skill_count
+           FROM categories c LEFT JOIN skills s ON s.category_slug=c.slug
+           GROUP BY c.slug ORDER BY c.is_system DESC, c.display_name, c.slug"""
+    ).fetchall()
+    connection.close()
+    return {"categories": [skill_row(row) for row in rows]}
+
+
+@app.post("/api/categories", status_code=201)
+async def create_category(payload: CategoryCreate, request: Request) -> dict[str, Any]:
+    user = await require_manager(request)
+    slug = validate_category(payload.slug)
+    name_zh = (payload.name_zh or payload.display_name or slug).strip()
+    connection = db()
+    try:
+        stamp = now()
+        connection.execute(
+            "INSERT INTO categories(slug,display_name,name_zh,description,is_system,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (slug, name_zh, name_zh, payload.description.strip(), 0, user["id"], stamp, stamp),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError as exc:
+        connection.rollback()
+        raise HTTPException(409, "Category already exists") from exc
+    finally:
+        connection.close()
+    write_category_names_file()
+    return {"category": {"slug": slug, "display_name": name_zh, "name_zh": name_zh, "description": payload.description.strip(), "is_system": False, "skill_count": 0}}
+
+
+@app.patch("/api/categories/{slug}")
+async def update_category(slug: str, payload: CategoryUpdate, request: Request) -> dict[str, Any]:
+    await require_manager(request)
+    slug = validate_category(slug)
+    if all(value is None for value in (payload.slug, payload.name_zh, payload.display_name, payload.description)):
+        raise HTTPException(422, "No category fields to update")
+    connection = db()
+    row = connection.execute("SELECT * FROM categories WHERE slug=?", (slug,)).fetchone()
+    if row is None:
+        connection.close()
+        raise HTTPException(404, "Category not found")
+    # `display_name` is retained for older API clients. New clients should
+    # send the path slug and the two localized names independently.
+    legacy_display_name_only = (
+        payload.display_name is not None
+        and payload.slug is None
+        and payload.name_zh is None
+    )
+    name_zh = (
+        payload.name_zh.strip()
+        if payload.name_zh is not None
+        else payload.display_name.strip()
+        if payload.display_name is not None
+        else row["name_zh"] or row["display_name"] or slug
+    )
+    description = payload.description.strip() if payload.description is not None else row["description"]
+    new_slug = (
+        validate_category(payload.slug.strip())
+        if payload.slug is not None
+        else validate_category(payload.display_name.strip())
+        if legacy_display_name_only
+        else slug
+    )
+    if row["is_system"] and new_slug != slug:
+        connection.close()
+        raise HTTPException(409, "The general category cannot be renamed")
+    if new_slug != slug and connection.execute("SELECT 1 FROM categories WHERE slug=?", (new_slug,)).fetchone():
+        connection.close()
+        raise HTTPException(409, "Category already exists")
+    old_category_dir = category_root(slug)
+    new_category_dir = category_root(new_slug)
+    old_archive_dir = ARCHIVES_ROOT / slug
+    new_archive_dir = ARCHIVES_ROOT / new_slug
+    moved_dirs: list[tuple[Path, Path]] = []
+    try:
+        if new_slug != slug:
+            if new_category_dir.exists() or new_archive_dir.exists():
+                raise HTTPException(409, "Target category path already exists")
+            if old_category_dir.exists():
+                old_category_dir.rename(new_category_dir)
+                moved_dirs.append((old_category_dir, new_category_dir))
+            if old_archive_dir.exists():
+                new_archive_dir.parent.mkdir(parents=True, exist_ok=True)
+                old_archive_dir.rename(new_archive_dir)
+                moved_dirs.append((old_archive_dir, new_archive_dir))
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE categories SET slug=?,display_name=?,name_zh=?,description=?,updated_at=? WHERE slug=?",
+                (new_slug, name_zh, name_zh, description, now(), slug),
+            )
+            connection.execute("UPDATE skills SET category_slug=?,updated_at=? WHERE category_slug=?", (new_slug, now(), slug))
+            old_prefix = str(old_archive_dir) + "/"
+            new_prefix = str(new_archive_dir) + "/"
+            connection.execute("UPDATE skill_versions SET archive_path=REPLACE(archive_path, ?, ?) WHERE archive_path LIKE ?", (old_prefix, new_prefix, old_prefix + "%"))
+        else:
+            connection.execute(
+                "UPDATE categories SET display_name=?,name_zh=?,description=?,updated_at=? WHERE slug=?",
+                (name_zh, name_zh, description, now(), slug),
+            )
+        connection.commit()
+    except HTTPException:
+        connection.rollback()
+        for old_path, new_path in reversed(moved_dirs):
+            if new_path.exists():
+                new_path.rename(old_path)
+        raise
+    except Exception:
+        connection.rollback()
+        for old_path, new_path in reversed(moved_dirs):
+            if new_path.exists():
+                new_path.rename(old_path)
+        raise
+    finally:
+        connection.close()
+    write_category_names_file()
+    return {
+        "category": {
+            "slug": new_slug,
+            "display_name": name_zh,
+            "name_zh": name_zh,
+            "description": description,
+            "is_system": bool(row["is_system"]),
+        }
+    }
+
+
+@app.delete("/api/categories/{slug}")
+async def delete_category(slug: str, request: Request) -> dict[str, Any]:
+    await require_manager(request)
+    slug = validate_category(slug)
+    if slug == DEFAULT_CATEGORY:
+        raise HTTPException(409, "The general category cannot be deleted")
+    connection = db()
+    row = connection.execute("SELECT * FROM categories WHERE slug=?", (slug,)).fetchone()
+    if row is None:
+        connection.close()
+        raise HTTPException(404, "Category not found")
+    skill_names = [row[0] for row in connection.execute("SELECT name FROM skills WHERE category_slug=?", (slug,)).fetchall()]
+    connection.close()
+    if skill_names:
+        move_selected_skills(skill_names, DEFAULT_CATEGORY)
+    connection = db()
+    connection.execute("DELETE FROM categories WHERE slug=?", (slug,))
+    connection.commit()
+    connection.close()
+    write_category_names_file()
+    category_dir = category_root(slug)
+    if category_dir.is_dir() and not any(category_dir.iterdir()):
+        category_dir.rmdir()
+    return {"ok": True, "slug": slug}
+
+
 @app.get("/api/skills/{name}")
 async def get_skill(name: str, request: Request) -> dict[str, Any]:
     await current_user(request); name = validate_name(name)
     connection = db(); row = connection.execute("SELECT * FROM skills WHERE name=?", (name,)).fetchone(); connection.close()
     if row is None: raise HTTPException(404, "Skill not found")
-    return {"skill": skill_row(row), "files": list_skill_files(name)}
+    return {"skill": skill_row(row), "files": list_skill_files(name, row["category_slug"])}
 
 
 @app.get("/api/skills/{name}/files/{path:path}")
@@ -699,14 +1042,6 @@ async def upload_skill(request: Request, file: UploadFile = File(...)) -> dict[s
     return install_skill_packages(packages, user, "Uploaded skill")
 
 
-@app.post("/api/skills/import-url", status_code=201)
-async def import_skill_url(payload: UrlImport, request: Request) -> dict[str, Any]:
-    user = actor_for(await current_user(request))
-    content, filename = await download_skill_archive(payload.url, payload.filename)
-    packages = discover_zip_packages(content, filename)
-    return install_skill_packages(packages, user, "Imported Skill from URL")
-
-
 @app.post("/api/skills/import-git", status_code=201)
 async def import_skills_from_git(payload: GitImport, request: Request) -> dict[str, Any]:
     user = actor_for(await current_user(request))
@@ -726,16 +1061,18 @@ async def update_skill(name: str, payload: FileUpdate, request: Request) -> dict
         connection.close()
     if payload.base_version is not None and payload.base_version != row["version"]:
         raise HTTPException(409, "Skill changed by another user", headers={"X-Current-Version": str(row["version"])})
+    category = row["category_slug"]
+    current_root = skill_root(category, name)
     files: dict[str, bytes] = {}
-    for path in (SKILLS_ROOT / name).rglob("*"):
+    for path in current_root.rglob("*"):
         if path.is_symlink():
             raise HTTPException(400, "Skill contains unsupported symbolic links")
         if path.is_file():
-            files[path.relative_to(SKILLS_ROOT / name).as_posix()] = path.read_bytes()
+            files[path.relative_to(current_root).as_posix()] = path.read_bytes()
     for relative, content in payload.files.items():
         files[safe_member(relative)] = content.encode("utf-8")
     result = install_skill_packages([{"name": name, "files": files}], user, payload.message, base_versions={name: row["version"]})
-    return {"skill": {"name": name, "version": result["skills"][0]["version"], "description": description_from(files["SKILL.md"].decode("utf-8", errors="replace"))}}
+    return {"skill": {"name": name, "category_slug": category, "version": result["skills"][0]["version"], "description": description_from(files["SKILL.md"].decode("utf-8", errors="replace"))}}
 
 
 @app.delete("/api/skills/{name}")
@@ -745,21 +1082,22 @@ async def delete_skill(name: str, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
-def selected_skill_paths(connection: sqlite3.Connection, names: list[str]) -> list[tuple[str, Path]]:
+def selected_skill_paths(connection: sqlite3.Connection, names: list[str]) -> list[tuple[str, str, Path]]:
     names = list(dict.fromkeys(validate_name(name) for name in names))
     placeholders = ",".join("?" for _ in names)
-    found = {row["name"] for row in connection.execute(
-        f"SELECT name FROM skills WHERE name IN ({placeholders})", names
+    found = {row["name"]: row["category_slug"] for row in connection.execute(
+        f"SELECT name,category_slug FROM skills WHERE name IN ({placeholders})", names
     ).fetchall()}
     missing = [name for name in names if name not in found]
     if missing:
         raise HTTPException(404, "Skills not found: " + ", ".join(missing))
     paths = []
     for name in names:
-        path = SKILLS_ROOT / name
+        category = validate_category(found[name])
+        path = skill_root(category, name)
         if path.is_symlink() or not path.is_dir():
             raise HTTPException(409, f"Skill directory is unavailable: {name}")
-        paths.append((name, path))
+        paths.append((name, category, path))
     return paths
 
 
@@ -772,7 +1110,7 @@ def delete_selected_skills(names: list[str]) -> list[str]:
         # Retain version archives; stage directories so a failed batch can roll back.
         with tempfile.TemporaryDirectory(prefix="skill-delete-", dir=ROOT) as temp_dir:
             try:
-                for name, path in paths:
+                for name, category, path in paths:
                     backup = Path(temp_dir) / name
                     path.rename(backup)
                     moved.append((path, backup))
@@ -783,16 +1121,71 @@ def delete_selected_skills(names: list[str]) -> list[str]:
                 for path, backup in reversed(moved):
                     backup.rename(path)
                 raise
-        return [name for name, _ in paths]
+        return [name for name, _, _ in paths]
     finally:
         connection.close()
 
 
 @app.post("/api/skills/batch-delete")
 async def batch_delete_skills(payload: SkillSelection, request: Request) -> dict[str, Any]:
-    await current_user(request)
+    await require_manager(request)
     deleted = delete_selected_skills(payload.names)
     return {"ok": True, "deleted": deleted, "count": len(deleted)}
+
+
+def move_selected_skills(names: list[str], target_category: str) -> list[str]:
+    target_category = validate_category(target_category)
+    connection = db()
+    moved: list[tuple[Path, Path]] = []
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT 1 FROM categories WHERE slug=?", (target_category,)).fetchone() is None:
+            raise HTTPException(404, "Category not found")
+        paths = selected_skill_paths(connection, names)
+        with tempfile.TemporaryDirectory(prefix="skill-move-", dir=ROOT) as temp_dir:
+            staging = Path(temp_dir) / "staging"
+            staging.mkdir()
+            try:
+                for name, category, source in paths:
+                    if category == target_category:
+                        continue
+                    destination = skill_root(target_category, name)
+                    if destination.exists():
+                        raise HTTPException(409, f"Target category already contains Skill: {name}")
+                    staged = staging / name
+                    source.rename(staged)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    staged.rename(destination)
+                    moved.append((source, destination))
+                    connection.execute("UPDATE skills SET category_slug=?,updated_at=? WHERE name=?", (target_category, now(), name))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                for source, destination in reversed(moved):
+                    if destination.exists():
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        destination.rename(source)
+                raise
+        return [name for name, _, _ in paths]
+    finally:
+        connection.close()
+
+
+@app.patch("/api/skills/{name}/category")
+async def move_skill_category(name: str, payload: CategoryAssignment, request: Request) -> dict[str, Any]:
+    await current_user(request)
+    moved = move_selected_skills([name], payload.category)
+    connection = db()
+    row = connection.execute("SELECT name,category_slug FROM skills WHERE name=?", (moved[0],)).fetchone()
+    connection.close()
+    return {"skill": dict(row)}
+
+
+@app.post("/api/skills/batch-category")
+async def move_batch_skill_category(payload: BatchCategoryAssignment, request: Request) -> dict[str, Any]:
+    await require_manager(request)
+    moved = move_selected_skills(payload.names, payload.category)
+    return {"ok": True, "moved": moved, "category": validate_category(payload.category), "count": len(moved)}
 
 
 @app.post("/api/skills/batch-download")
@@ -805,7 +1198,7 @@ async def batch_download_skills(payload: SkillSelection, request: Request) -> St
         connection.close()
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name, root in paths:
+        for name, category, root in paths:
             for path in sorted(root.rglob("*")):
                 if path.is_symlink():
                     raise HTTPException(409, f"Skill contains unsupported symbolic links: {name}")
@@ -820,12 +1213,13 @@ async def batch_download_skills(payload: SkillSelection, request: Request) -> St
 @app.get("/api/skills/{name}/download")
 async def download_skill(name: str, request: Request) -> StreamingResponse:
     await current_user(request); name = validate_name(name)
-    connection = db(); row = connection.execute("SELECT version FROM skills WHERE name=?", (name,)).fetchone(); connection.close()
+    connection = db(); row = connection.execute("SELECT version,category_slug FROM skills WHERE name=?", (name,)).fetchone(); connection.close()
     if row is None: raise HTTPException(404, "Skill not found")
+    root = skill_root(row["category_slug"], name)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in (SKILLS_ROOT / name).rglob("*"):
-            if path.is_file(): archive.write(path, path.relative_to(SKILLS_ROOT / name).as_posix())
+        for path in root.rglob("*"):
+            if path.is_file(): archive.write(path, path.relative_to(root).as_posix())
     output.seek(0); return StreamingResponse(output, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{name}-v{row["version"]}.zip"'})
 
 
