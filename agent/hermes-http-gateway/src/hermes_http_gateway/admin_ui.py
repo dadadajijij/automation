@@ -229,7 +229,10 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
           <header>
             <div class="topbar">
               <div><h1>Hermes 在线对话</h1><div class="muted">管理员：{_html_escape(username)}</div></div>
-              <a class="nav" id="dashboardLink">返回管理面板</a>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <a class="nav" id="dashboardLink">返回管理面板</a>
+                <a class="nav" id="latencyLink">耗时统计</a>
+              </div>
             </div>
           </header>
           <main>
@@ -253,7 +256,11 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
           <script>
             window.__HERMES_ADMIN_CHAT__ = {payload};
             const config = window.__HERMES_ADMIN_CHAT__;
-            const route = (path) => `${{config.publicBasePath || ''}}${{path}}`;
+            const route = (path) => {{
+              const base = String(config.publicBasePath || '').replace(/\\/+$/, '');
+              const suffix = String(path || '').startsWith('/') ? String(path) : `/${{path}}`;
+              return (base.startsWith('/') ? base : `/${{base}}`) + suffix;
+            }};
               const adminPath = (suffix) => route('/' + 'admin' + '/v1' + suffix);
             const els = {{
               userId: document.getElementById('userId'), sessionId: document.getElementById('sessionId'),
@@ -262,7 +269,10 @@ def render_chat_page(*, username: str, csrf_token: str, public_base_path: str = 
               sendBtn: document.getElementById('sendBtn'), newSessionBtn: document.getElementById('newSessionBtn'),
               status: document.getElementById('status'), answer: document.getElementById('answer'),
             }};
-            document.getElementById('dashboardLink').href = route('/admin');
+            // Keep the admin path split so the reverse proxy's legacy URL rewrite
+            // cannot rewrite an already prefixed path a second time.
+            document.getElementById('dashboardLink').href = route('/' + 'admin');
+            document.getElementById('latencyLink').href = route('/' + 'admin' + '/latency');
 
             function formatBytes(value) {{
               if (value < 1024) return `${{value}} B`;
@@ -332,6 +342,8 @@ def render_dashboard_page(
         {"username": username, "csrfToken": csrf_token, "publicBasePath": public_base_path},
         ensure_ascii=False,
     )
+
+
     return textwrap.dedent(
         f"""\
         <!doctype html>
@@ -381,8 +393,9 @@ def render_dashboard_page(
             h1 {{ margin: 0; font-size: 18px; }}
             .toolbar {{
               margin-top: 12px;
-              display: grid;
-              grid-template-columns: 1.1fr .9fr auto auto auto;
+              display: flex;
+              align-items: center;
+              flex-wrap: wrap;
               gap: 8px;
             }}
             input, button {{
@@ -393,6 +406,10 @@ def render_dashboard_page(
               padding: 10px 12px;
               font: inherit;
             }}
+            .toolbar input {{ padding: 8px 10px; min-width: 0; }}
+            #userFilter {{ width: 220px; }}
+            #searchInput {{ width: 300px; }}
+            .toolbar-nav {{ display: flex; gap: 8px; margin-left: auto; }}
             button {{
               cursor: pointer;
               background: #1c2330;
@@ -569,7 +586,6 @@ def render_dashboard_page(
             @media (max-width: 1200px) {{
               .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
               .layout {{ grid-template-columns: 1fr; }}
-              .toolbar {{ grid-template-columns: 1fr; }}
             }}
           </style>
         </head>
@@ -582,11 +598,13 @@ def render_dashboard_page(
               </div>
             </div>
             <div class="toolbar">
-              <input id="searchInput" type="text" placeholder="搜索用户 / 会话 / 内容" autocomplete="off" />
-              <input id="userFilter" type="text" placeholder="筛选用户" autocomplete="off" />
-              <button class="primary" id="searchBtn">搜索</button>
+              <input id="userFilter" type="text" placeholder="搜索用户" autocomplete="off" />
+              <input id="searchInput" type="text" placeholder="搜索会话信息" autocomplete="off" />
               <button id="refreshBtn">刷新</button>
+              <div class="toolbar-nav">
               <a class="nav-link" id="chatLink">在线对话</a>
+              <a class="nav-link" id="latencyLink">耗时统计</a>
+              </div>
             </div>
           </header>
 
@@ -656,7 +674,7 @@ def render_dashboard_page(
                   <div class="detail-box">
                     <h3>搜索结果</h3>
                     <div class="messages" id="searchResults">
-                      <div class="notice">输入关键词后点击搜索</div>
+                      <div class="notice">输入会话信息后按回车搜索</div>
                     </div>
                   </div>
                 </div>
@@ -672,6 +690,7 @@ def render_dashboard_page(
             const route = (path) => `${{basePath}}${{path}}`;
             const adminPath = (suffix) => route('/' + 'admin' + '/v1' + suffix);
             document.getElementById('chatLink').href = route('/admin/chat');
+            document.getElementById('latencyLink').href = route('/admin/latency');
             const state = {{
               userFilterText: '',
               selectedUser: '',
@@ -682,7 +701,6 @@ def render_dashboard_page(
             const els = {{
               searchInput: document.getElementById('searchInput'),
               userFilter: document.getElementById('userFilter'),
-              searchBtn: document.getElementById('searchBtn'),
               refreshBtn: document.getElementById('refreshBtn'),
               logoutBtn: document.getElementById('logoutBtn'),
               usersCount: document.getElementById('usersCount'),
@@ -917,6 +935,7 @@ def render_dashboard_page(
                   <div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{esc(row.content)}}</div>
                 </div>
               `).join('') : '<div class="notice">没有搜索结果</div>';
+              els.searchResults.closest('.detail-box')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
             }}
 
             async function loadDashboard() {{
@@ -1002,11 +1021,17 @@ def render_dashboard_page(
             async function doSearch() {{
               const keyword = els.searchInput.value.trim();
               if (!keyword) {{
-                renderSearch([]);
+                els.searchResults.innerHTML = '<div class="notice">请输入搜索会话信息</div>';
+                els.searchInput.focus();
                 return;
               }}
-              const data = await api(adminPath(`/search?keyword=${{encodeURIComponent(keyword)}}`));
-              renderSearch(data.results || []);
+              els.searchResults.innerHTML = '<div class="notice">正在搜索…</div>';
+              try {{
+                const data = await api(adminPath(`/search?keyword=${{encodeURIComponent(keyword)}}`));
+                renderSearch(data.results || []);
+              }} catch (error) {{
+                els.searchResults.innerHTML = `<div class="notice" style="color:var(--danger);">搜索失败：${{esc(error.message || '未知错误')}}</div>`;
+              }}
             }}
 
             async function refreshAll() {{
@@ -1020,7 +1045,6 @@ def render_dashboard_page(
               renderSkills(null);
             }}
 
-            els.searchBtn.addEventListener('click', doSearch);
             els.refreshBtn.addEventListener('click', refreshAll);
             els.saveSkillsBtn.addEventListener('click', saveSkills);
             els.logoutBtn.addEventListener('click', async () => {{
@@ -1046,3 +1070,35 @@ def render_dashboard_page(
         </html>
         """
     )
+
+
+def render_latency_page(*, username: str, public_base_path: str = "") -> str:
+    payload = json.dumps({"username": username, "publicBasePath": public_base_path}, ensure_ascii=False)
+    return textwrap.dedent(f"""\
+    <!doctype html><html lang="zh-CN"><head><meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" /><title>网关对话数据统计</title>
+    <style>
+    :root{{--bg:#0f1115;--panel:#171b22;--line:#273041;--text:#e8edf4;--muted:#93a4bb;--accent:#78a6ff}}
+    *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+    header{{padding:16px 20px;border-bottom:1px solid var(--line);background:#12161c}} .top{{max-width:1180px;margin:auto;display:flex;justify-content:space-between;align-items:center;gap:12px}}
+    main{{max-width:1180px;margin:auto;padding:20px}} h1{{margin:0;font-size:19px}} h2{{font-size:15px;margin:0 0 12px}} .muted,.note{{color:var(--muted);font-size:12px}}
+    a{{color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px;text-decoration:none}} .grid{{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:16px}}
+    section,.card{{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px}} .card .label{{color:var(--muted);font-size:12px}} .card .value{{font-size:22px;font-weight:700;margin-top:5px}}
+    section{{margin-bottom:16px;overflow:auto}} table{{width:100%;border-collapse:collapse;white-space:nowrap}} th,td{{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}} th{{color:var(--muted);font-size:12px;font-weight:500}}
+    .bar{{height:8px;background:#263044;border-radius:4px;min-width:80px}} .bar i{{display:block;height:100%;background:var(--accent);border-radius:4px}}
+    @media(max-width:800px){{main{{padding:12px}}.grid{{grid-template-columns:repeat(2,1fr)}}}}
+    </style></head><body><header><div class="top"><div><h1>网关对话数据统计</h1><div class="muted">管理员：{_html_escape(username)}</div></div><div><a href="{_html_escape(public_base_path)}/admin">管理面板</a> <a href="{_html_escape(public_base_path)}/admin/chat">在线对话</a></div></div></header>
+    <main><div class="note" id="window">加载中…</div><div class="grid" id="cards"></div>
+    <section><h2>最近四周趋势</h2><table><thead><tr><th>周期</th><th>完成数</th><th>平均</th><th>中位数</th><th>P90</th></tr></thead><tbody id="trends"></tbody></table></section>
+    <section><h2>最近 7 天耗时分布</h2><table><thead><tr><th>区间</th><th>数量</th><th>占比</th><th>分布</th></tr></thead><tbody id="distribution"></tbody></table></section>
+    <section><h2>匿名会话维度</h2><table><thead><tr><th>对象</th><th>完成数</th><th>平均</th><th>中位数</th><th>最长</th></tr></thead><tbody id="users"></tbody></table></section>
+    <section><h2>按日汇总</h2><table><thead><tr><th>日期</th><th>完成数</th><th>平均</th><th>最长</th></tr></thead><tbody id="daily"></tbody></table></section>
+    <section><h2>数据质量</h2><div class="note" id="quality"></div></section></main>
+    <script>window.__LATENCY__={payload};const c=window.__LATENCY__,route=p=>`${{c.publicBasePath||''}}${{p}}`;const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    const fmt=v=>v==null?'—':(v<1000?`${{Math.round(v)}}毫秒`:v<60000?`${{Math.round(v/1000)}}秒`:`${{Math.floor(v/60000)}}分${{Math.round(v%60000/1000)}}秒`);const pct=v=>`${{Number(v||0).toFixed(1)}}%`;
+    function row(x){{return `<tr>${{x.map(v=>`<td>${{v}}</td>`).join('')}}</tr>`}} async function load(){{const r=await fetch(route('/admin/v1/latency-report'));if(!r.ok)throw Error('加载失败');const d=await r.json();const s=d.core||{{}};document.getElementById('window').textContent=`窗口：${{d.window.start}} 至 ${{d.window.end}}（${{d.window.timezone}}） · 口径：${{d.metric}}`;
+    document.getElementById('cards').innerHTML=[['完成回复',s.count],['平均耗时',fmt(s.average_ms)],['中位数',fmt(s.median_ms)],['P90',fmt(s.p90_ms)],['P95',fmt(s.p95_ms)],['最长',fmt(s.max_ms)]].map(x=>`<div class="card"><div class="label">${{x[0]}}</div><div class="value">${{x[1]}}</div></div>`).join('');
+    document.getElementById('trends').innerHTML=(d.trends||[]).map(x=>row([esc(x.period.start.slice(0,16))+' – '+esc(x.period.end.slice(0,16)),x.count,fmt(x.average_ms),fmt(x.median_ms),fmt(x.p90_ms)])).join('');
+    document.getElementById('distribution').innerHTML=(d.distribution||[]).map(x=>row([esc(x.label),x.count,pct(x.percentage),`<div class="bar"><i style="width:${{Math.min(100,x.percentage)}}%"></i></div>`])).join('');
+    const names='ABCDEFGHIJKLMN';document.getElementById('users').innerHTML=(d.users||[]).map((x,i)=>row([`用户${{names[i]||i+1}}`,x.count,fmt(x.average_ms),fmt(x.median_ms),fmt(x.max_ms)])).join('');
+    document.getElementById('daily').innerHTML=(d.daily||[]).map(x=>row([esc(x.date),x.count,fmt(x.average_ms),fmt(x.max_ms)])).join('');const p=d.pairing||{{}};document.getElementById('quality').textContent=`完成记录：${{p.total||0}}；有 Hermes 阶段记录：${{p.matched||0}}；缺失：${{p.unmatched||0}}。API 调用总数：${{d.api_calls==null?'暂不可用':d.api_calls}}。${{d.api_calls==null?'当前数据源尚未持久化 response_ready / API 调用日志。':''}}`}}load().catch(e=>document.getElementById('quality').textContent=e.message);</script></body></html>""")

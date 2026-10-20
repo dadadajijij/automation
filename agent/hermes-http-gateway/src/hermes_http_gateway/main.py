@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .admin_ui import render_chat_page, render_dashboard_page, render_login_page
+from .admin_ui import render_chat_page, render_dashboard_page, render_latency_page, render_login_page
 from .attachments import (
     AttachmentError,
     DownloadedFile,
@@ -57,6 +57,7 @@ from .db import (
     list_recent_replaceable_request_events,
     list_user_private_skill_bindings,
     list_users,
+    latency_report,
     list_conversations,
     list_messages,
     search_messages,
@@ -1290,6 +1291,18 @@ def admin_page(request: Request):
     )
 
 
+@app.get("/admin/latency", response_class=HTMLResponse)
+def admin_latency_page(request: Request):
+    settings = _settings(request)
+    session = _admin_session_from_request(request, settings)
+    if session is None:
+        return RedirectResponse(_public_path(settings, "/admin/login"), status_code=302)
+    return HTMLResponse(render_latency_page(
+        username=str(session["username"]),
+        public_base_path=settings.public_base_path,
+    ))
+
+
 @app.get("/admin/chat", response_class=HTMLResponse)
 def admin_chat_page(request: Request):
     settings = _settings(request)
@@ -1335,6 +1348,13 @@ def admin_dashboard(
         ),
         "user_pagination": {"limit": user_limit, "offset": user_offset},
     }
+
+
+@app.get("/admin/v1/latency-report")
+def admin_latency_report(request: Request):
+    settings = _settings(request)
+    _require_admin_session(request, settings)
+    return latency_report(settings)
 
 
 def _private_skill_catalog_or_503(settings: Settings) -> list[dict[str, Any]]:

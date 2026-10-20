@@ -1077,10 +1077,10 @@ class GatewayTests(unittest.TestCase):
         self.assertIn(str(img1), cmd)
         self.assertIn(str(img2), cmd)
 
-    def test_gateway_report_delivery_reaches_first_attachment_and_resume_commands(self):
+    def test_gateway_preserves_prompt_in_first_attachment_and_resume_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = replace(_make_settings(Path(tmp)), report_source_root=Path(tmp) / "reports")
-            original = "请分析这个问题"
+            original = "rtc 错误码110什么含义\n请简要说明。"
             completed = SimpleNamespace(returncode=0, stdout="final answer", stderr="")
             for mode in ("first", "attachment", "resume"):
                 with (
@@ -1100,11 +1100,7 @@ class GatewayTests(unittest.TestCase):
                     cmd = run.call_args.args[1]
                     flag = "-z" if mode == "first" else "-q"
                     prompt = cmd[cmd.index(flag) + 1]
-                    self.assertTrue(prompt.startswith("[HTTP Gateway report delivery]"))
-                    self.assertTrue(prompt.endswith("[User request]\n" + original))
-                    self.assertIn(str(settings.report_source_root), prompt)
-                    self.assertIn("Do not load the static-spaces Skill", prompt)
-                    self.assertIn("or claim publication succeeded or failed", prompt)
+                    self.assertEqual(prompt, original)
 
     def test_hermes_client_repeats_private_skill_flags(self):
         class FakeProcess:

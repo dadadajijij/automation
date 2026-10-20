@@ -7,3 +7,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+.hermes-gateway.log
+.hermes-gateway.pid
+.hermes-gateway.pid.lock

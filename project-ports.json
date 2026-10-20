@@ -64,7 +64,8 @@
   },
   "csfanzha": {
     "port": "8014:3000",
-    "env_file":"/home/devops/ka/data/csfanzha/env"
+    "env_file":"/home/devops/ka/data/csfanzha/env",
+    "volumes": ["/home/devops/ka/data/csfanzha/storage:/app/storage"]
   },
   "abtestcompare": {
   "port": "8015:4173"

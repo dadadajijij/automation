@@ -176,6 +176,24 @@ class RunnerProjectSlugTests(unittest.TestCase):
             self.assertEqual(signature_a, signature_b)
             self.assertNotIn("source", signature_a)
 
+    def test_local_source_sync_ignores_dotvenv_and_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            (source / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (source / ".venv" / "bin").mkdir(parents=True)
+            (source / ".venv" / "bin" / "python").symlink_to("/path/from/another/machine/bin/python")
+
+            runner.sync_local_source(source, destination)
+
+            self.assertTrue((destination / "app.py").exists())
+            self.assertFalse((destination / ".venv").exists())
+            signature = runner.local_source_signature(source, root / "other-destination")
+            (source / ".venv" / "marker.txt").write_text("ignored", encoding="utf-8")
+            self.assertEqual(signature, runner.local_source_signature(source, root / "second-destination"))
+
     def test_resolve_git_source_revision_uses_peeled_tag_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "fetch.log"

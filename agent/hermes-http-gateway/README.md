@@ -52,6 +52,10 @@ bash scripts/hermes-gateway.sh stop
 
 脚本默认监听 `127.0.0.1:8003`，日志写入项目根目录 `.hermes-gateway.log`，PID 写入 `.hermes-gateway.pid`。脚本使用 Bash，请使用 `bash scripts/hermes-gateway.sh ...` 或直接执行脚本。
 
+启停检查使用 Linux `/proc` 和 Python 标准库。脚本使用 `.hermes-gateway.pid.lock` 防止并发操作，校验 PID 的用户、项目工作目录和启动命令；PID 文件丢失时，仅对身份匹配且唯一占用目标端口的进程恢复 PID。无关进程占用端口、PID 指向无关进程或进程由服务管理器托管时会明确失败，不自动终止。端口检查保守地将任意监听地址上的同端口视为冲突。
+
+只有新进程存活、独占监听目标端口且 `/health` 返回 HTTP 200 后才报告启动成功。启动失败返回非零状态并显示本次启动日志。停止使用 SIGTERM，超时保留 PID 并报错，不自动 SIGKILL；`restart` 在停止失败时不会继续启动。可用 `START_TIMEOUT`（默认 15 秒）和 `STOP_TIMEOUT`（默认 10 秒）调整等待时间。`status` 在未运行或未就绪时返回非零状态。
+
 当前服务器使用：
 
 ```text
@@ -206,7 +210,7 @@ PUBLIC_BASE_PATH=/tools2/hermes-gateway
 
 两个聊天入口都会将回复中 `REPORT_SOURCE_ROOT` 下明确给出的单个 `.html` 文件路径替换为 HTTPS 报告页面链接。网关保存独立文件副本，历史消息与当前回答包含相同链接。源文件清理或网关重启不影响未过期的副本。
 
-网关在每次 Hermes CLI 请求中加入报告交付说明，包括已有会话续聊。报告 Skill 在该场景下只生成本地 HTML，跳过 StaticSpaces 发布和凭据检查；Hermes 静默模式不输出文件 diff 预览，避免将 HTML 源码混入回答。
+网关不向 Hermes 提问中注入 HTML 生成、验证或交付提示，首轮、带附件请求和已有会话续聊均保持用户问题原文。是否生成 HTML 由用户需求和 Skills 决定；网关仅在回复包含允许目录内的 HTML 文件路径时执行后处理，没有报告路径的回复原样返回。Hermes 静默模式不输出文件 diff 预览，避免将 HTML 源码混入回答。
 
 `GET /v1/reports/{filename}/{download_token}` 使用原始报告文件名和 256 位随机访问凭证，无需 Gateway Key 或管理员 Cookie；持有链接即可打开页面。默认有效期 7 天，过期、无效凭证或文件名不匹配时返回 `404`。HTML 以页面形式直接打开。文件丢失、超过大小限制或真实路径越界时，回答中的路径替换为“报告暂不可用”，其余聊天结论正常返回。
 

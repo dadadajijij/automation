@@ -872,7 +872,7 @@ def iter_local_source_files(src: Path, dst: Path) -> List[Path]:
     for root, dirs, filenames in os.walk(src):
         current = Path(root)
         names = list(dirs) + list(filenames)
-        ignored = {".git", "node_modules", "__pycache__", ".DS_Store", ".codex", ".agents"}
+        ignored = {".git", ".venv", "node_modules", "__pycache__", ".DS_Store", ".codex", ".agents"}
         for name in names:
             candidate = (current / name).resolve()
             if candidate == dst or _is_relative_to(dst, candidate):
@@ -935,7 +935,7 @@ def sync_local_source(src: Path, dst: Path) -> None:
         raise ValueError("Local source path must be a directory")
 
     def ignore(path: str, names: List[str]) -> List[str]:
-        ignored = {".git", "node_modules", "__pycache__"}
+        ignored = {".git", ".venv", "node_modules", "__pycache__"}
         current = Path(path)
         for name in names:
             candidate = current / name

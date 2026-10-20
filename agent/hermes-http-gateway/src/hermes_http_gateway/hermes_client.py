@@ -58,26 +58,6 @@ def _base_env(settings: Settings, *, skill_audit_path: Path | None = None) -> di
     return env
 
 
-def _prompt_with_report_delivery(settings: Settings, prompt: str) -> str:
-    # A per-turn host directive also reaches resumed sessions with cached prompts.
-    delivery = (
-        "[HTTP Gateway report delivery]\n"
-        "This request is served by the HTTP Gateway. When a Skill creates an HTML "
-        "investigation report, use local-file delivery for this request, overriding "
-        "any Skill instructions to publish through StaticSpaces. "
-        f"Write one self-contained .html report under {settings.report_source_root}. "
-        "Verify that it exists, is nonempty, has valid HTML structure, and contains "
-        "no credentials. Keep the local file. Do not load the static-spaces Skill, "
-        "run publish_verified_html.py, call a publishing API, or request publishing "
-        "credentials. In the final reply give the short investigation conclusion "
-        "and the absolute local HTML path. Do not include HTML source or file diffs, "
-        "invent a download URL, or claim publication succeeded or failed. "
-        "The Gateway will copy the report and replace its path with an "
-        "HTTPS link that opens the static HTML report after this reply.\n\n[User request]\n"
-    )
-    return delivery + prompt
-
-
 def _build_hermes_command(
     settings: Settings,
     *,
@@ -190,7 +170,6 @@ def run_first_turn(
     run_key: str | None = None,
     run_generation: int | None = None,
 ) -> HermesRunResult:
-    prompt = _prompt_with_report_delivery(settings, prompt)
     usage_path = _make_usage_path()
     skill_audit_path = _make_usage_path()
     cmd = _build_hermes_command(
@@ -282,7 +261,6 @@ def run_resume_turn(
     run_key: str | None = None,
     run_generation: int | None = None,
 ) -> HermesRunResult:
-    prompt = _prompt_with_report_delivery(settings, prompt)
     usage_path = _make_usage_path()
     skill_audit_path = _make_usage_path()
     cmd = _build_hermes_command(

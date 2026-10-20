@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -370,6 +370,106 @@ def count_request_events(settings: Settings) -> int:
     with _connect(settings.database_url) as conn:
         row = conn.execute("SELECT COUNT(*) AS count FROM request_events").fetchone()
         return int((row["count"] if row else 0) or 0)
+
+
+def latency_report(settings: Settings, *, now: datetime | None = None) -> dict[str, Any]:
+    """Build rolling latency aggregates from completed gateway requests.
+
+    The report intentionally uses UTC database timestamps and the recorded
+    ``Hermes CLI 运行`` stage when available.  This is the closest structured
+    approximation to Agent processing time until response-ready log events are
+    persisted separately.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    end = now.astimezone(timezone.utc)
+    start = end - timedelta(hours=168)
+    trend_start = end - timedelta(days=28)
+    with _connect(settings.database_url) as conn:
+        rows = conn.execute(
+            """
+            SELECT r.id, r.user_id, r.created_at, r.completed_at, r.status,
+                   COALESCE((SELECT SUM(s.duration_ms) FROM request_stage_events s
+                             WHERE s.request_event_id = r.id AND s.stage = 'Hermes CLI 运行'),
+                            (julianday(r.completed_at) - julianday(r.created_at)) * 86400000.0) AS agent_ms,
+                   (SELECT COUNT(*) FROM request_stage_events s WHERE s.request_event_id = r.id
+                      AND s.stage = 'Hermes CLI 运行') AS stage_matches
+            FROM request_events r
+            WHERE r.status = 'completed' AND r.completed_at IS NOT NULL
+              AND r.created_at >= ? AND r.created_at < ?
+            ORDER BY r.created_at ASC
+            """,
+            (trend_start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+    def parse(value: str) -> datetime:
+        return datetime.fromisoformat(value).astimezone(timezone.utc)
+
+    def values_for(left: datetime, right: datetime) -> list[dict[str, Any]]:
+        return [dict(row) | {"created": parse(row["created_at"])} for row in rows
+                if left <= parse(row["created_at"]) < right]
+
+    def percentile(values: list[float], fraction: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * fraction
+        lower, upper = int(position), min(int(position) + 1, len(ordered) - 1)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+    def duration_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+        values = [max(0.0, float(item["agent_ms"] or 0)) for item in items]
+        return {
+            "count": len(values),
+            "average_ms": round(sum(values) / len(values), 1) if values else None,
+            "median_ms": round(percentile(values, 0.5), 1) if values else None,
+            "p90_ms": round(percentile(values, 0.9), 1) if values else None,
+            "p95_ms": round(percentile(values, 0.95), 1) if values else None,
+            "max_ms": round(max(values), 1) if values else None,
+        }
+
+    recent = values_for(start, end)
+    distribution = []
+    for label, low, high in [("≤30秒", 0, 30000), ("31–60秒", 30000, 60000),
+                             ("1–2分钟", 60000, 120000), ("2–5分钟", 120000, 300000),
+                             ("5–10分钟", 300000, 600000), (">10分钟", 600000, None)]:
+        def in_bucket(item: dict[str, Any]) -> bool:
+            value = float(item["agent_ms"] or 0)
+            return (value <= high if high is not None else value > low) and (not low or value > low)
+        count = sum(1 for item in recent if in_bucket(item))
+        distribution.append({"label": label, "count": count,
+                             "percentage": round(count / len(recent) * 100, 1) if recent else 0})
+
+    users: dict[str, list[dict[str, Any]]] = {}
+    for item in recent:
+        users.setdefault(str(item["user_id"]), []).append(item)
+    user_rows = []
+    for user_id, items in sorted(users.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        summary = duration_summary(items)
+        user_rows.append({"user_id": user_id, **summary})
+
+    daily: dict[str, list[dict[str, Any]]] = {}
+    for item in recent:
+        daily.setdefault(item["created"].date().isoformat(), []).append(item)
+    daily_rows = [{"date": day, **duration_summary(items)} for day, items in sorted(daily.items())]
+    trends = []
+    for index in range(4):
+        left = end - timedelta(days=28 - index * 7)
+        items = values_for(left, left + timedelta(days=7))
+        trends.append({"period": {"start": left.isoformat(), "end": (left + timedelta(days=7)).isoformat()}, **duration_summary(items)})
+    matched = sum(1 for item in recent if int(item["stage_matches"] or 0) > 0)
+    return {
+        "window": {"start": start.isoformat(), "end": end.isoformat(), "timezone": "UTC"},
+        "metric": "Hermes CLI 运行 stage; fallback to completed_at-created_at",
+        "core": duration_summary(recent),
+        "distribution": distribution,
+        "users": user_rows,
+        "daily": daily_rows,
+        "trends": trends,
+        "api_calls": None,
+        "pairing": {"matched": matched, "total": len(recent), "unmatched": len(recent) - matched},
+    }
 
 
 def list_users(
