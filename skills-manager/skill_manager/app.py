@@ -70,6 +70,10 @@ class SkillSelection(BaseModel):
     names: list[str] = Field(min_length=1, max_length=500)
 
 
+class SkillNameUpdate(BaseModel):
+    name_zh: str = Field(min_length=1, max_length=120)
+
+
 class CategoryCreate(BaseModel):
     slug: str = Field(min_length=1, max_length=64)
     name_zh: str | None = Field(default=None, min_length=1, max_length=120)
@@ -115,7 +119,7 @@ def db() -> sqlite3.Connection:
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS skills (
-              name TEXT PRIMARY KEY, category_slug TEXT NOT NULL DEFAULT 'general',
+              name TEXT PRIMARY KEY, name_zh TEXT NOT NULL DEFAULT '', category_slug TEXT NOT NULL DEFAULT 'general',
               description TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL,
               created_by TEXT NOT NULL, updated_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
@@ -129,6 +133,25 @@ def db() -> sqlite3.Connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)").fetchall()}
         if "category_slug" not in columns:
             connection.execute("ALTER TABLE skills ADD COLUMN category_slug TEXT NOT NULL DEFAULT 'general'")
+        if "name_zh" not in columns:
+            connection.execute("ALTER TABLE skills ADD COLUMN name_zh TEXT NOT NULL DEFAULT ''")
+        skill_name_mapping: dict[str, str] = {}
+        try:
+            mapping_path = ROOT / "skill_names.json"
+            if mapping_path.is_file():
+                raw_mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+                if isinstance(raw_mapping, dict):
+                    skill_name_mapping = {
+                        str(name): str(display_name).strip()
+                        for name, display_name in raw_mapping.items()
+                        if str(display_name).strip()
+                    }
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("Unable to read skill_names.json; keeping database names", exc_info=True)
+        for skill in connection.execute("SELECT name,name_zh FROM skills").fetchall():
+            name_zh = skill["name_zh"] or skill_name_mapping.get(skill["name"]) or skill["name"]
+            if name_zh != skill["name_zh"]:
+                connection.execute("UPDATE skills SET name_zh=? WHERE name=?", (name_zh, skill["name"]))
         category_columns = {row[1] for row in connection.execute("PRAGMA table_info(categories)").fetchall()}
         if "name_zh" not in category_columns:
             connection.execute("ALTER TABLE categories ADD COLUMN name_zh TEXT NOT NULL DEFAULT ''")
@@ -191,6 +214,10 @@ def category_names_path() -> Path:
     return ROOT / "category_names.json"
 
 
+def skill_names_path() -> Path:
+    return ROOT / "skill_names.json"
+
+
 def write_category_names_file(connection: sqlite3.Connection | None = None) -> None:
     owns_connection = connection is None
     connection = connection or db()
@@ -203,6 +230,24 @@ def write_category_names_file(connection: sqlite3.Connection | None = None) -> N
         if owns_connection:
             connection.close()
     target = category_names_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+
+
+def write_skill_names_file(connection: sqlite3.Connection | None = None) -> None:
+    owns_connection = connection is None
+    connection = connection or db()
+    try:
+        payload = {
+            row["name"]: row["name_zh"] or row["name"]
+            for row in connection.execute("SELECT name,name_zh FROM skills ORDER BY name").fetchall()
+        }
+    finally:
+        if owns_connection:
+            connection.close()
+    target = skill_names_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -751,9 +796,9 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
                 if existing:
                     connection.execute("UPDATE skills SET description=?,version=?,updated_by=?,updated_at=? WHERE name=?", (description, version, user["id"], stamp, name))
                 else:
-                    connection.execute("INSERT INTO skills(name,category_slug,description,version,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (name, category, description, version, user["id"], user["id"], stamp, stamp))
+                    connection.execute("INSERT INTO skills(name,name_zh,category_slug,description,version,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (name, name, category, description, version, user["id"], user["id"], stamp, stamp))
                 connection.execute("INSERT INTO skill_versions(skill_name,version,archive_path,actor_id,message,created_at) VALUES(?,?,?,?,?,?)", (name, version, str(archive), user["id"], message, stamp))
-                results.append({"name": name, "category": category, "status": "updated" if existing else "created", "version": version})
+                results.append({"name": name, "name_zh": existing["name_zh"] or name if existing else name, "category": category, "status": "updated" if existing else "created", "version": version})
             connection.commit()
         except Exception:
             connection.rollback()
@@ -770,6 +815,7 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
     for result in results:
         if result.get("status") in {"created", "updated"}:
             prune_skill_history(result["name"])
+    write_skill_names_file()
     return batch_result(results)
 
 
@@ -834,6 +880,7 @@ def startup() -> None:
     migrate_legacy_skill_paths()
     prune_all_skill_history()
     write_category_names_file()
+    write_skill_names_file()
 
 
 @app.get("/api/me")
@@ -1082,6 +1129,24 @@ async def delete_skill(name: str, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.patch("/api/skills/{name}/name")
+async def update_skill_name(name: str, payload: SkillNameUpdate, request: Request) -> dict[str, Any]:
+    user = actor_for(await current_user(request))
+    name = validate_name(name)
+    name_zh = payload.name_zh.strip()
+    connection = db()
+    try:
+        row = connection.execute("SELECT name FROM skills WHERE name=?", (name,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Skill not found")
+        connection.execute("UPDATE skills SET name_zh=?,updated_by=?,updated_at=? WHERE name=?", (name_zh, user["id"], now(), name))
+        connection.commit()
+    finally:
+        connection.close()
+    write_skill_names_file()
+    return {"skill": {"name": name, "name_zh": name_zh}}
+
+
 def selected_skill_paths(connection: sqlite3.Connection, names: list[str]) -> list[tuple[str, str, Path]]:
     names = list(dict.fromkeys(validate_name(name) for name in names))
     placeholders = ",".join("?" for _ in names)
@@ -1121,7 +1186,9 @@ def delete_selected_skills(names: list[str]) -> list[str]:
                 for path, backup in reversed(moved):
                     backup.rename(path)
                 raise
-        return [name for name, _, _ in paths]
+        deleted = [name for name, _, _ in paths]
+        write_skill_names_file(connection)
+        return deleted
     finally:
         connection.close()
 

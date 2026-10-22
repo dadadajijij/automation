@@ -3,3 +3,4 @@ __pycache__/
 data/*
 !data/.gitkeep
 !data/category_names.json
+!data/skill_names.json

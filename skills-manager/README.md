@@ -117,6 +117,24 @@ Content-Type: application/json
 
 页面按仓库浏览方式管理 Skill：左侧可以搜索和选择 Skill，详情区域显示文件目录树，文本文件支持源码查看和编辑，Markdown 支持预览，图片和 PDF 支持直接预览，其他二进制文件提供下载。Skill 可以通过本地 Zip 压缩包或 Git 仓库导入；一个来源中包含多个 `SKILL.md` 时会自动批量识别并导入。导入同名 Skill 会生成新版本并覆盖当前文件内容。
 
+每个 Skill 保留不可变的 Skill ID，同时支持独立的中文显示名。中文名保存在数据库 `skills.name_zh`，并同步导出到 `data/skill_names.json`，格式如下：
+
+```json
+{
+  "lre-issue-triage": "火花问题排查",
+  "zhangmen-troubleshooting": "掌门问题排查"
+}
+```
+
+新导入的 Skill 默认中文名等于 Skill ID；重新导入同名 Skill 会保留已有中文名。所有用户都可以在 Skill 行的“改名”操作中修改中文名，Skill ID、磁盘路径和历史版本不会改变。也可以调用：
+
+```http
+PATCH /api/skills/{skill_name}/name
+Content-Type: application/json
+
+{"name_zh": "火花问题排查"}
+```
+
 Git 仓库导入接口：
 
 ```http

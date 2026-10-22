@@ -47,6 +47,29 @@ class CategoryTests(unittest.TestCase):
         row = manager.db().execute("SELECT category_slug FROM skills WHERE name='alpha'").fetchone()
         self.assertEqual(row[0], "general")
 
+    def test_skill_name_defaults_and_can_be_changed_by_regular_user(self):
+        manager.install_skill_packages(
+            [{"name": "lre-issue-triage", "files": {"SKILL.md": b"# Skill"}}],
+            {"id": "test"},
+            "Import",
+        )
+        created = self.request("/api/skills/lre-issue-triage", method="GET")
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.json()["skill"]["name_zh"], "lre-issue-triage")
+
+        async def regular_user(request):
+            return {"id": "customer@example.com", "email": "customer@example.com", "display_name": "Customer"}
+
+        with patch.object(manager, "current_user", regular_user):
+            renamed = self.request("/api/skills/lre-issue-triage/name", {"name_zh": "火花问题排查"}, "PATCH")
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(renamed.json()["skill"]["name_zh"], "火花问题排查")
+        mapping = json.loads(manager.skill_names_path().read_text(encoding="utf-8"))
+        self.assertEqual(mapping["lre-issue-triage"], "火花问题排查")
+
+        listing = self.request("/api/skills", method="GET")
+        self.assertEqual(next(item for item in listing.json()["skills"] if item["name"] == "lre-issue-triage")["name_zh"], "火花问题排查")
+
     def test_create_and_move_skill_category(self):
         manager.install_skill_packages(
             [{"name": "alpha", "files": {"SKILL.md": b"# Alpha"}}],
