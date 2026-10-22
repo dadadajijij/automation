@@ -10,6 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENT_ROOT = PROJECT_ROOT.parent
 DEFAULT_HERMES_REPO = AGENT_ROOT / "hermes-agent"
 DEFAULT_DOTENV_PATH = PROJECT_ROOT / ".env"
+DEFAULT_CATEGORY_NAMES_FILE = PROJECT_ROOT.parents[2] / "data" / "skills-manager" / "data" / "category_names.json"
+DEFAULT_SKILL_NAMES_FILE = PROJECT_ROOT.parents[2] / "data" / "skills-manager" / "data" / "skill_names.json"
 
 
 def load_env_file(path: Path | None = None) -> int:
@@ -119,6 +121,8 @@ class Settings:
     report_public_base_url: str = "https://athena.agoralab.co/tools2/hermes-gateway"
     report_retention_days: int = 7
     report_max_bytes: int = 10 * 1024 * 1024
+    category_names_file: Path = field(default_factory=lambda: DEFAULT_CATEGORY_NAMES_FILE)
+    skill_names_file: Path = field(default_factory=lambda: DEFAULT_SKILL_NAMES_FILE)
 
 
 def load_settings() -> Settings:
@@ -130,6 +134,8 @@ def load_settings() -> Settings:
         hermes_workdir=_default_workdir(),
         # Business traffic is intentionally pinned to Hermes' default profile.
         hermes_profile_default="default",
+        category_names_file=_env_path("CATEGORY_NAMES_FILE", DEFAULT_CATEGORY_NAMES_FILE),
+        skill_names_file=_env_path("SKILL_NAMES_FILE", DEFAULT_SKILL_NAMES_FILE),
         gateway_api_key=os.environ.get("GATEWAY_API_KEY", "").strip() or None,
         admin_username=os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin",
         admin_password=os.environ.get("ADMIN_PASSWORD", "").strip() or None,

@@ -1048,8 +1048,16 @@ def render_dashboard_page(
             els.refreshBtn.addEventListener('click', refreshAll);
             els.saveSkillsBtn.addEventListener('click', saveSkills);
             els.logoutBtn.addEventListener('click', async () => {{
-              await fetch(route('/admin/logout'), {{ credentials: 'same-origin' }});
-              location.href = route('/admin/login');
+              // Do not follow the backend redirect here. Behind a subpath reverse
+              // proxy, following a prefixed Location can add publicBasePath twice.
+              // Derive the mount point from the URL currently serving this page.
+              // This remains correct when a proxy has already rewritten the
+              // configured publicBasePath in the rendered page.
+              const currentPath = window.location.pathname || '';
+              const adminIndex = currentPath.lastIndexOf('/admin');
+              const mountPath = adminIndex >= 0 ? currentPath.slice(0, adminIndex) : '';
+              await fetch(`${{mountPath}}/admin/logout`, {{ credentials: 'same-origin', redirect: 'manual' }});
+              location.replace(`${{mountPath}}/admin/login`);
             }});
             els.searchInput.addEventListener('keydown', (event) => {{
               if (event.key === 'Enter') doSearch();

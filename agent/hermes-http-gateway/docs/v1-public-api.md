@@ -91,7 +91,8 @@
 
 ### `GET /v1/capabilities`
 
-返回当前默认 Hermes profile 下可用的私有 Skills。`scope` 查询参数已废弃，传入会返回 `422`。
+获取hermes的私有 Skills。私有Skills hermes默认无法使用，
+只有通过后续`PATCH /v1/users/{user_id}/skills` 接口进行了私有skills绑定的user_id才能使用对应的私有skills
 
 #### 请求示例
 
@@ -108,7 +109,7 @@ curl https://example.com/hermes-gateway/v1/capabilities \
     {
       "id": "summarize",
       "name": "summarize",
-      "category": "writing",
+      "category": "客户私有",
       "description": "总结长文本",
       "version": "1.0.0",
       "enabled": true
@@ -119,13 +120,55 @@ curl https://example.com/hermes-gateway/v1/capabilities \
 
 Skills 由 Hermes 动态提供，列表内容可能变化。只有 `enabled: true` 的 Skill 可以新增到用户绑定中。
 
+### 返回字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `skills` | array | 私有 Skills 列表 |
+| `skills[].id` | string | Skill ID，取 Hermes 返回的 `name` |
+| `skills[].name` | string | Skill 展示名称；优先使用 `SKILL_NAMES_FILE` 中的中文映射，未匹配时使用 Hermes 原始 `name` |
+| `skills[].category` | string | Skill 分类；网关会用分类映射文件转换为中文 |
+| `skills[].description` | string | Skill 描述 |
+| `skills[].version` | string | Skill 版本 |
+| `skills[].enabled` | boolean | 是否启用 |
+
+`category` 当前映射示例：
+
+```json
+{
+  "customer-common": "客户通用",
+  "customer-private": "客户私有",
+  "general": "默认",
+  "internal": "内部使用"
+}
+```
+
+命中映射时返回中文；空分类保持空字符串；未命中的分类保留 Hermes 原始值。映射文件不存在、格式错误或无法读取时，接口仍然返回，分类保留原始值并记录日志。映射文件按修改时间缓存，更新后会自动重新加载。
+
+`skills[].id` 始终保留 Hermes 返回的原始 `name`，用于 Skills 绑定和后续请求；`skills[].name` 仅用于展示。Skill 名称映射文件由 `SKILL_NAMES_FILE` 指定，默认路径为：
+
+```text
+/home/devops/ka/data/skills-manager/data/skill_names.json
+```
+
+例如：
+
+```json
+{
+  "lre-issue-triage": "火花问题排查",
+  "zhangmen-troubleshooting": "掌门问题排查"
+}
+```
+
+名称映射未命中、文件不存在、格式错误或无法读取时，`name` 保留 Hermes 原始名称。映射文件按修改时间缓存，更新后会自动重新加载。
+
 #### 常见错误
 
 | 状态码 | 说明 |
 |---:|---|
 | `401` | Gateway API Key 缺失或错误 |
 | `422` | 传入了已废弃的 `scope` 参数 |
-| `503` | Hermes Skills 目录不可用 |
+| `503` | Hermes Skills 目录不可用；分类映射文件异常不会单独导致 `503` |
 
 ## 3. 查询用户 Skills 绑定
 

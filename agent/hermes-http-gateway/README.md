@@ -82,6 +82,8 @@ Hermes 二进制会优先自动寻找：
 | `DATABASE_URL` | `./data/hermes_gateway.sqlite` | SQLite 数据库路径 |
 | `HERMES_BIN` | 自动探测 | Hermes 可执行文件路径 |
 | `HERMES_WORKDIR` | 相邻 `hermes-agent` 目录 | Hermes 工作目录 |
+| `CATEGORY_NAMES_FILE` | `../../data/skills-manager/data/category_names.json` | `/v1/capabilities` 返回的 Skill 分类中英文映射文件；文件不可用时保留 Hermes 原始分类 |
+| `SKILL_NAMES_FILE` | `../../data/skills-manager/data/skill_names.json` | `/v1/capabilities` 返回的 Skill 名称中英文映射文件；文件不可用或未匹配时保留 Hermes 原始名称 |
 | `GATEWAY_API_KEY` | 空 | 配置后保护 `/v1/*` |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / 空 | 管理员登录凭据 |
 | `PUBLIC_BASE_PATH` | 空 | 反向代理子路径，例如 `/tools2/hermes-gateway` |
