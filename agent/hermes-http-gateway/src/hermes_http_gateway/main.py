@@ -62,6 +62,7 @@ from .db import (
     list_messages,
     search_messages,
     search_messages_admin,
+    search_admin_context,
     record_request_stage,
     update_user_private_skill_bindings,
     touch_admin_session,
@@ -1445,6 +1446,23 @@ def update_admin_user(
             "bound_skill_ids": [item["skill_id"] for item in bindings],
         },
     }
+
+
+@app.get("/admin/v1/browse")
+def admin_browse(
+    request: Request,
+    keyword: str = "",
+    user_query: str = "",
+    user_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    settings = _settings(request)
+    _require_admin_session(request, settings)
+    if not 1 <= limit <= 500 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid pagination")
+    return search_admin_context(settings, query=keyword, user_query=user_query,
+                                user_id=user_id, limit=limit, offset=offset)
 
 
 @app.get("/admin/v1/conversations")

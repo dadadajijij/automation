@@ -827,6 +827,77 @@ def search_messages_admin(
         return [dict(row) for row in rows]
 
 
+def search_admin_context(
+    settings: Settings,
+    *,
+    query: str = "",
+    user_query: str = "",
+    user_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Build linked admin lists from the complete match set before pagination."""
+    def like_pattern(value: str) -> str:
+        return "%" + value.strip().replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if user_query.strip():
+        clauses.append("(u.user_id LIKE ? ESCAPE '!' COLLATE NOCASE OR u.default_hermes_profile LIKE ? ESCAPE '!' COLLATE NOCASE)")
+        params.extend([like_pattern(user_query)] * 2)
+    if query.strip():
+        clauses.append("""(c.title LIKE ? ESCAPE '!' COLLATE NOCASE OR c.external_session_id LIKE ? ESCAPE '!' COLLATE NOCASE
+            OR EXISTS (SELECT 1 FROM session_search s
+                WHERE s.external_session_id = c.external_session_id AND s.user_id = c.user_id
+                AND (s.content LIKE ? ESCAPE '!' COLLATE NOCASE OR s.title LIKE ? ESCAPE '!' COLLATE NOCASE
+                     OR s.role LIKE ? ESCAPE '!' COLLATE NOCASE OR s.kind LIKE ? ESCAPE '!' COLLATE NOCASE)))""")
+        params.extend([like_pattern(query)] * 6)
+    # LEFT JOIN retains users with no conversations for user-only searches.
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    with _connect(settings.database_url) as conn:
+        users = conn.execute(
+            f"""SELECT u.user_id, u.default_hermes_profile, u.updated_at,
+                COUNT(c.external_session_id) AS conversation_count,
+                COALESCE(SUM((SELECT COUNT(*) FROM messages m
+                    WHERE m.external_session_id = c.external_session_id)), 0) AS message_count
+                FROM users u LEFT JOIN conversations c ON c.user_id = u.user_id
+                {where} GROUP BY u.user_id ORDER BY u.updated_at DESC, u.user_id ASC""",
+            params,
+        ).fetchall()
+        users = [dict(row) for row in users]
+        ids = {row["user_id"] for row in users}
+        scoped_user = user_id if user_id in ids else None
+        if user_query.strip() and not scoped_user and users:
+            scoped_user = users[0]["user_id"]
+        if scoped_user:
+            clauses.append("c.user_id = ?")
+            params.append(scoped_user)
+        clauses.append("c.external_session_id IS NOT NULL")
+        where = "WHERE " + " AND ".join(clauses)
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM conversations c JOIN users u ON u.user_id = c.user_id {where}", params
+        ).fetchone()[0]
+        pattern = like_pattern(query)
+        conversations = conn.execute(
+            f"""SELECT c.*,
+                (SELECT COUNT(*) FROM messages m WHERE m.external_session_id = c.external_session_id) AS message_count,
+                (SELECT COUNT(*) FROM session_search s WHERE s.external_session_id = c.external_session_id
+                    AND s.message_id IS NOT NULL
+                    AND (s.content LIKE ? ESCAPE '!' COLLATE NOCASE
+                         OR s.role LIKE ? ESCAPE '!' COLLATE NOCASE OR s.kind LIKE ? ESCAPE '!' COLLATE NOCASE)) AS match_count,
+                (SELECT substr(s.content, max(1, instr(lower(s.content), lower(?)) - 50), 180)
+                    FROM session_search s WHERE s.external_session_id = c.external_session_id
+                    AND s.message_id IS NOT NULL AND s.content LIKE ? ESCAPE '!' COLLATE NOCASE
+                    ORDER BY s.created_at DESC LIMIT 1) AS match_preview
+                FROM conversations c JOIN users u ON u.user_id = c.user_id
+                {where} ORDER BY c.updated_at DESC, c.external_session_id ASC LIMIT ? OFFSET ?""",
+            [pattern] * 3 + [query.strip(), pattern] + params + [limit, offset],
+        ).fetchall()
+    return {"users": users, "conversations": [dict(row) for row in conversations],
+            "scoped_user": scoped_user, "total_conversations": total,
+            "pagination": {"limit": limit, "offset": offset, "has_more": offset + limit < total}}
+
+
 def create_conversation(
     settings: Settings,
     *,

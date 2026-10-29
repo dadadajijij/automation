@@ -186,6 +186,10 @@ curl -X POST http://127.0.0.1:8003/v1/chat \
 
 管理员网页，可以查看所有用户、会话、消息，并做全局搜索。会话详情按时间顺序展示每次请求：成功请求保留正常问答消息；被同一会话后续请求替代的调用显示 HTTP 409 和中断原因；Hermes 调用失败会显示失败状态与错误详情。
 
+管理面板按回车应用两个搜索框的交集条件：会话信息搜索仅展示匹配会话及其所属用户；用户搜索默认选择首个匹配用户，自动加载其首个会话与消息。点击用户进一步收窄会话，清除会话条件可查看该用户全部会话。消息支持关键词高亮、命中导航和仅看命中；刷新保留筛选，重置全部清除筛选。
+
+`GET /admin/v1/browse` 使用管理员 Cookie，接收 `keyword`、`user_query`、`user_id`、`limit`（默认 100，最多 500）、`offset`。返回完整匹配用户集合、当前用户范围下的会话分页及总数；用户计数按匹配会话统计。匹配范围包含会话标题、会话 ID 以及已索引消息的正文、标题、角色和类型。原有搜索接口保持兼容。
+
 ### `GET /admin/login`
 
 管理员登录页，用户名默认预填。
@@ -206,7 +210,7 @@ PUBLIC_BASE_PATH=/tools2/hermes-gateway
 
 网关接口统一称为 Skills，内部目录仍通过 Hermes `skills list --scope private --json` 获取，仅管理 Hermes private skills。capabilities 不接收 `scope`；用户绑定接口为 `GET/PATCH /v1/users/{user_id}/skills`。公共和管理员更新均使用 add/remove 增量语义，空对象或空数组不改变绑定。新增须启用，移除允许失效项；最终最多 10 个绑定。管理员页面按勾选差异提交，不提供 PUT/DELETE 清空接口。现存数据库绑定无需迁移。
 
-管理员页面使用的业务 API 为 `GET /admin/v1/dashboard`、`GET /admin/v1/capabilities`、`GET/PATCH /admin/v1/users/{user_id}`、`GET /admin/v1/conversations`、`GET /admin/v1/conversations/{session_id}/timeline`、`GET /admin/v1/search` 与 `POST /admin/v1/chat`。所有接口均由管理员 Cookie 保护，写操作还要求页面下发的 CSRF token。
+管理员页面使用的业务 API 为 `GET /admin/v1/dashboard`、`GET /admin/v1/capabilities`、`GET/PATCH /admin/v1/users/{user_id}`、`GET /admin/v1/conversations`、`GET /admin/v1/conversations/{session_id}/timeline`、`GET /admin/v1/search`、`GET /admin/v1/browse` 与 `POST /admin/v1/chat`。所有接口均由管理员 Cookie 保护，写操作还要求页面下发的 CSRF token。
 
 ### HTML 报告页面
 

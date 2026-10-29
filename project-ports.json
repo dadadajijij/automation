@@ -35,12 +35,12 @@
   },
   "duty": {
     "port": "8008:30001",
+    "volumes": [
+      "/home/devops/ka/data/duty/archives:/app/files/archives"
+    ],
     "env": {
       "ADMIN_EMAILS": "hantao@agora.io"
-    },
-    "volumes": [
-    "/home/devops/ka/data/duty/archives:/app/files/archives"
-    ]
+    }
   },
   "ailoganalyze": {
     "port": "8009:8000",
@@ -64,11 +64,13 @@
   },
   "csfanzha": {
     "port": "8014:3000",
-    "env_file":"/home/devops/ka/data/csfanzha/env",
-    "volumes": ["/home/devops/ka/data/csfanzha/storage:/app/storage"]
+    "volumes": [
+      "/home/devops/ka/data/csfanzha/storage:/app/storage"
+    ],
+    "env_file": "/home/devops/ka/data/csfanzha/env"
   },
   "abtestcompare": {
-  "port": "8015:4173"
+    "port": "8015:4173"
   },
   "skills-manager": {
     "port": "8016:8000",
@@ -80,5 +82,8 @@
     "env": {
       "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o IdentitiesOnly=yes -i /root/.ssh/id_ed25519"
     }
+  },
+  "bitrate-calculator": {
+    "port": "8017:8080"
   }
 }

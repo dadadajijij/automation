@@ -409,6 +409,9 @@ def render_dashboard_page(
             .toolbar input {{ padding: 8px 10px; min-width: 0; }}
             #userFilter {{ width: 220px; }}
             #searchInput {{ width: 300px; }}
+            mark {{ background: #ffe08a; color: #251b00; border-radius: 2px; }}
+            button:disabled {{ cursor: default; opacity: .45; }}
+            #conversationDetail {{ overflow-wrap: anywhere; line-height: 1.8; }}
             .toolbar-nav {{ display: flex; gap: 8px; margin-left: auto; }}
             button {{
               cursor: pointer;
@@ -600,7 +603,8 @@ def render_dashboard_page(
             <div class="toolbar">
               <input id="userFilter" type="text" placeholder="搜索用户" autocomplete="off" />
               <input id="searchInput" type="text" placeholder="搜索会话信息" autocomplete="off" />
-              <button id="refreshBtn">刷新</button>
+              <span class="meta">按回车应用搜索条件</span><button id="refreshBtn">刷新</button><button id="resetBtn">重置全部</button>
+              <button id="clearUserBtn">清除用户条件</button><button id="clearSearchBtn">清除会话条件</button>
               <div class="toolbar-nav">
               <a class="nav-link" id="chatLink">在线对话</a>
               <a class="nav-link" id="latencyLink">耗时统计</a>
@@ -610,10 +614,10 @@ def render_dashboard_page(
 
           <main>
             <div class="summary">
-              <div class="stat"><div class="label">用户</div><div class="value" id="usersCount">-</div></div>
-              <div class="stat"><div class="label">会话</div><div class="value" id="sessionsCount">-</div></div>
-              <div class="stat"><div class="label">请求</div><div class="value" id="requestsCount">-</div></div>
-              <div class="stat"><div class="label">消息</div><div class="value" id="messagesCount">-</div></div>
+              <div class="stat"><div class="label">全局用户</div><div class="value" id="usersCount">-</div></div>
+              <div class="stat"><div class="label">全局会话</div><div class="value" id="sessionsCount">-</div></div>
+              <div class="stat"><div class="label">全局请求</div><div class="value" id="requestsCount">-</div></div>
+              <div class="stat"><div class="label">全局消息</div><div class="value" id="messagesCount">-</div></div>
             </div>
 
             <div class="layout">
@@ -652,6 +656,7 @@ def render_dashboard_page(
                     </thead>
                     <tbody id="sessionsTable"></tbody>
                   </table>
+                  <div style="display:flex;gap:8px;margin-top:10px"><button id="allUsersBtn">全部匹配用户</button><button id="prevPageBtn">上一页</button><button id="nextPageBtn">下一页</button></div>
                 </div>
               </section>
 
@@ -663,7 +668,7 @@ def render_dashboard_page(
                 <div class="section-body detail-grid">
                   <div class="detail-box">
                     <h3>会话信息</h3>
-                    <pre id="conversationDetail">请选择一个会话</pre>
+                    <div id="conversationDetail">请选择一个会话</div>
                   </div>
                   <div class="detail-box">
                     <h3>请求 / 消息时间线</h3>
@@ -672,9 +677,9 @@ def render_dashboard_page(
                     </div>
                   </div>
                   <div class="detail-box">
-                    <h3>搜索结果</h3>
+                    <h3>当前会话命中导航</h3><button id="prevMatchBtn">上一处</button> <button id="nextMatchBtn">下一处</button> <label><input type="checkbox" id="onlyMatches" style="width:auto" />仅看命中</label>
                     <div class="messages" id="searchResults">
-                      <div class="notice">输入会话信息后按回车搜索</div>
+                      <div class="notice">输入会话信息后按回车筛选</div>
                     </div>
                   </div>
                 </div>
@@ -697,6 +702,8 @@ def render_dashboard_page(
               selectedSession: '',
               boundSkillIds: new Set(),
               skillsUser: '',
+              keyword: '', scopeUser: '', users: [], conversations: [], offset: 0,
+              generation: 0, timeline: [], matchIndex: -1,
             }};
             const els = {{
               searchInput: document.getElementById('searchInput'),
@@ -795,22 +802,17 @@ def render_dashboard_page(
             }}
 
             function renderUsers(items) {{
-              els.usersMeta.textContent = state.userFilterText ? `筛选：${{state.userFilterText}}` : '全部';
+              els.usersMeta.textContent = `${{items.length}} 个匹配用户${{state.userFilterText ? ' · ' + state.userFilterText : ''}}`;
               els.usersTable.innerHTML = items.length ? items.map((row) => `
                 <tr class="clickable ${{row.user_id === state.selectedUser ? 'selected' : ''}}" data-user="${{esc(row.user_id)}}">
                   <td><strong>${{esc(row.user_id)}}</strong><div class="meta">${{esc(row.default_hermes_profile || '-')}}</div></td>
-                  <td>${{row.conversation_count}}</td>
-                  <td>${{row.message_count}}</td>
-                </tr>
-              `).join('') : '<tr><td colspan="3" class="meta">暂无用户</td></tr>';
+                  <td>${{row.conversation_count}}</td><td>${{row.message_count}}</td>
+                </tr>`).join('') : '<tr><td colspan="3" class="meta">没有匹配用户</td></tr>';
               els.usersTable.querySelectorAll('[data-user]').forEach((row) => {{
-                row.addEventListener('click', async () => {{
-                  state.selectedUser = row.getAttribute('data-user') || '';
-                  state.selectedSession = '';
-                  renderConversation(null);
-                  await loadDashboard();
-                  await loadConversations();
-                  await loadUserDetails();
+                row.addEventListener('click', () => {{
+                  state.scopeUser = row.getAttribute('data-user') || '';
+                  state.selectedSession = ''; state.offset = 0;
+                  refreshAll();
                 }});
               }});
             }}
@@ -863,22 +865,21 @@ def render_dashboard_page(
             }}
 
             function renderConversations(items) {{
-              els.sessionsMeta.textContent = state.selectedUser ? `当前用户：${{state.selectedUser}}` : '全部';
               els.sessionsTable.innerHTML = items.length ? items.map((row) => `
                 <tr class="clickable ${{row.external_session_id === state.selectedSession ? 'selected' : ''}}" data-session="${{esc(row.external_session_id)}}" data-user="${{esc(row.user_id)}}">
-                  <td><strong>${{esc(row.title || row.external_session_id)}}</strong><div class="meta">${{esc(row.external_session_id)}}</div></td>
-                  <td><span class="pill ${{row.status === 'error' ? 'bad' : 'ok'}}">${{esc(row.status)}}</span></td>
-                  <td>${{row.message_count}}</td>
-                </tr>
-              `).join('') : '<tr><td colspan="3" class="meta">暂无会话</td></tr>';
+                  <td><strong>${{highlight(row.title || row.external_session_id)}}</strong><div class="meta">${{esc(row.external_session_id)}} · ${{esc(row.user_id)}}</div>${{state.keyword ? `<div class="meta">命中 ${{row.match_count}} 条消息${{!row.match_count ? '（会话标题 / ID 匹配）' : ''}}</div>${{row.match_preview ? `<div class="meta">…${{highlight(row.match_preview)}}…</div>` : ''}}` : ''}}</td>
+                  <td><span class="pill ${{row.status === 'error' ? 'bad' : 'ok'}}">${{esc(row.status)}}</span></td><td>${{row.message_count}}</td>
+                </tr>`).join('') : '<tr><td colspan="3" class="meta">当前条件下暂无会话</td></tr>';
               els.sessionsTable.querySelectorAll('[data-session]').forEach((row) => {{
                 row.addEventListener('click', async () => {{
+                  const generation = ++state.generation;
                   state.selectedSession = row.getAttribute('data-session') || '';
-                  state.selectedUser = row.getAttribute('data-user') || state.selectedUser;
-                  await loadDashboard();
-                  await loadConversations();
-                  await loadUserDetails();
-                  await loadConversation();
+                  state.selectedUser = row.getAttribute('data-user') || '';
+                  renderUsers(state.users); renderConversations(state.conversations);
+                  renderConversation(null); renderSkills(null);
+                  await Promise.all([loadConversation(generation), loadUserDetails().catch(error => {{
+                    if (generation === state.generation) els.skillsMeta.textContent = `Skills 加载失败：${{error.message}}`;
+                  }})]).catch(error => {{ if (generation === state.generation) showError(error); }});
                 }});
               }});
             }}
@@ -886,12 +887,45 @@ def render_dashboard_page(
             function renderConversation(data) {{
               if (!data) {{
                 els.detailMeta.textContent = '未选择';
-                els.conversationDetail.textContent = '请选择一个会话';
-                els.messagesList.innerHTML = '<div class="notice">请选择一个会话查看消息</div>';
+                els.conversationDetail.textContent = '当前没有选中的会话';
+                els.messagesList.innerHTML = '<div class="notice">当前没有会话消息</div>';
+                state.timeline = []; state.matchIndex = -1;
+                document.getElementById('prevMatchBtn').disabled = true;
+                document.getElementById('nextMatchBtn').disabled = true;
+                els.searchResults.textContent = '当前没有命中内容';
                 return;
               }}
-              els.detailMeta.textContent = data.external_session_id;
-              els.conversationDetail.textContent = JSON.stringify(data, null, 2);
+              els.detailMeta.textContent = `${{data.user_id}} / ${{data.external_session_id}}`;
+              els.conversationDetail.innerHTML = [
+                ['用户', data.user_id], ['会话 ID', data.external_session_id], ['标题', data.title],
+                ['状态', data.status], ['创建时间', data.created_at], ['更新时间', data.updated_at],
+              ].map(([label, value]) => `<div><strong>${{label}}：</strong>${{esc(value || '-')}}</div>`).join('') +
+                `<details><summary>展开原始 JSON</summary><pre>${{esc(JSON.stringify(data, null, 2))}}</pre></details>`;
+            }}
+
+            function highlight(value) {{
+              const text = String(value ?? '');
+              if (!state.keyword) return esc(text);
+              const lower = text.toLowerCase(), keyword = state.keyword.toLowerCase();
+              let out = '', pos = 0, index;
+              while ((index = lower.indexOf(keyword, pos)) !== -1) {{
+                out += esc(text.slice(pos, index)) + '<mark>' + esc(text.slice(index, index + keyword.length)) + '</mark>';
+                pos = index + keyword.length;
+              }}
+              return out + esc(text.slice(pos));
+            }}
+            function isMatch(row) {{
+              if (!state.keyword) return false;
+              return [row.prompt, row.content, row.role, row.kind].some(value =>
+                String(value || '').toLowerCase().includes(state.keyword.toLowerCase()));
+            }}
+            function navigateMatch(delta = 0) {{
+              const matches = Array.from(els.messagesList.querySelectorAll('[data-hit]'));
+              if (!matches.length) return;
+              state.matchIndex = (Math.max(0, state.matchIndex) + delta + matches.length) % matches.length;
+              matches.forEach((node, index) => {{ node.style.outline = index === state.matchIndex ? '2px solid var(--accent)' : ''; }});
+              matches[state.matchIndex].scrollIntoView({{behavior: 'smooth', block: 'nearest'}});
+              els.searchResults.textContent = `当前会话命中 ${{matches.length}} 条请求 / 消息 · 第 ${{state.matchIndex + 1}} 条`;
             }}
 
             function renderMessages(items) {{
@@ -900,70 +934,53 @@ def render_dashboard_page(
                   .filter((row) => row.event_type === 'request')
                   .map((row) => JSON.stringify([row.user_id, row.prompt]))
               );
+              state.timeline = items;
               const visibleItems = items.filter((row) => !(
                 row.event_type === 'message' &&
                 row.role === 'user' &&
                 requestKeys.has(JSON.stringify([row.user_id, row.content]))
               ));
-              els.messagesList.innerHTML = visibleItems.length ? visibleItems.map((row) => `
-                <div class="msg">
+              const shownItems = document.getElementById('onlyMatches').checked ? visibleItems.filter(isMatch) : visibleItems;
+              els.messagesList.innerHTML = shownItems.length ? shownItems.map((row) => `
+                <div class="msg" ${{isMatch(row) ? 'data-hit="true"' : ''}}>
                   <div class="msg-head">
                     <span><strong>${{row.event_type === 'request' ? '用户请求' : esc(row.role)}}</strong> / ${{row.event_type === 'request' ? esc(row.status) : esc(row.kind)}}</span>
                     <span>${{esc(row.created_at)}}</span>
                   </div>
                   <div class="meta">${{esc(row.model || '-')}} • ${{esc(row.provider || '-')}}</div>
                   ${{row.event_type === 'request' ? `
-                    <div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{esc(row.prompt)}}</div>
+                    <div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{highlight(row.prompt)}}</div>
                     ${{renderRuntimeAudit(row.runtime_audit)}}
                     ${{row.request_body ? `<details class="request-body"><summary>展开原始 Body</summary><pre>${{esc(row.request_body)}}</pre></details>` : ''}}
                     ${{row.stages && row.stages.length ? `<details class="request-stages"><summary>展开阶段耗时</summary>${{row.stages.map((stage) => `<div class="request-stage"><span>${{esc(stage.stage)}}</span><span>${{formatDuration(stage.duration_ms)}}</span>${{stage.detail ? `<span class="request-stage-detail">${{esc(stage.detail)}}</span>` : ''}}</div>`).join('')}}</details>` : ''}}
                     <div class="meta" style="margin-top:8px;">${{row.status === 'completed' ? 'Hermes 已成功返回' : row.status === 'superseded' ? '已被同一会话的后续请求中断' : row.status === 'failed' ? 'Hermes 请求失败' : 'Hermes 正在处理' }}${{row.http_status ? ` • HTTP ${{esc(row.http_status)}}` : ''}}</div>
                     ${{row.error_detail ? `<div style="margin-top:8px; white-space:pre-wrap; word-break:break-word; color:var(--danger);">${{esc(row.error_detail)}}</div>` : ''}}
-                  ` : `<div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{esc(row.content)}}</div>`}}
+                  ` : `<div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{highlight(row.content)}}</div>`}}
                 </div>
-              `).join('') : '<div class="notice">这个会话没有请求或消息</div>';
+              `).join('') : '<div class="notice">没有可展示的请求或消息</div>';
+              const hits = visibleItems.filter(isMatch).length;
+              els.searchResults.textContent = state.keyword ? (hits ? `当前会话命中 ${{hits}} 条请求 / 消息` : '会话标题 / ID 匹配，或消息元信息匹配；时间线中没有正文命中') : '输入会话信息后按回车筛选';
+              document.getElementById('prevMatchBtn').disabled = !hits;
+              document.getElementById('nextMatchBtn').disabled = !hits;
+              if (hits) navigateMatch();
             }}
 
-            function renderSearch(items) {{
-              els.searchResults.innerHTML = items.length ? items.map((row) => `
-                <div class="msg">
-                  <div class="msg-head">
-                    <span><strong>${{esc(row.conversation_title || row.external_session_id)}}</strong> • ${{esc(row.user_id)}}</span>
-                    <span>${{esc(row.created_at)}}</span>
-                  </div>
-                  <div class="meta">${{esc(row.external_session_id)}} • ${{esc(row.role)}} • ${{esc(row.kind)}}</div>
-                  <div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{esc(row.content)}}</div>
-                </div>
-              `).join('') : '<div class="notice">没有搜索结果</div>';
-              els.searchResults.closest('.detail-box')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+            function showError(error) {{
+              document.getElementById('footerNote').textContent = `加载失败：${{error.message || '未知错误'}}，请刷新重试`;
             }}
-
-            async function loadDashboard() {{
-              const keyword = state.userFilterText.trim();
-              const path = keyword ? adminPath(`/dashboard?user_query=${{encodeURIComponent(keyword)}}`) : adminPath('/dashboard');
-              const data = await api(path);
+            async function loadDashboard(generation) {{
+              const data = await api(adminPath('/dashboard?user_limit=1'));
+              if (generation !== state.generation) return;
               const summary = data.summary || {{}};
               els.usersCount.textContent = summary.users ?? 0;
               els.sessionsCount.textContent = summary.conversations ?? 0;
               els.requestsCount.textContent = summary.requests ?? 0;
               els.messagesCount.textContent = summary.messages ?? 0;
-              renderUsers(data.users || []);
-            }}
-
-            async function loadConversations() {{
-              const params = new URLSearchParams();
-              const keyword = els.searchInput.value.trim();
-              if (keyword && keyword.length < 2) {{
-                // leave it alone; the search box is for global search only
-              }}
-              if (state.selectedUser) params.set('user_id', state.selectedUser);
-              const path = params.toString() ? adminPath(`/conversations?${{params.toString()}}`) : adminPath('/conversations');
-              const data = await api(path);
-              renderConversations(data.conversations || []);
             }}
 
             async function loadUserDetails() {{
               const userId = state.selectedUser;
+              const generation = state.generation;
               renderSkills(null);
               if (!state.selectedUser) {{
                 return;
@@ -972,7 +989,7 @@ def render_dashboard_page(
                 api(adminPath(`/users/${{encodeURIComponent(state.selectedUser)}}`)),
                 api(route('/admin/v1/capabilities')),
               ]);
-              if (state.selectedUser !== userId) return;
+              if (state.selectedUser !== userId || generation !== state.generation) return;
               const bindings = userData.skills || {{}};
               const skills = capabilitiesData.skills || [];
               const availableIds = new Set(skills.map((skill) => skill.id));
@@ -1008,44 +1025,74 @@ def render_dashboard_page(
               }}
             }}
 
-            async function loadConversation() {{
-              if (!state.selectedSession) {{
-                renderConversation(null);
-                return;
-              }}
-              const timeline = await api(adminPath(`/conversations/${{encodeURIComponent(state.selectedSession)}}/timeline`));
+            async function loadConversation(generation) {{
+              const sessionId = state.selectedSession;
+              if (!sessionId) return;
+              const timeline = await api(adminPath(`/conversations/${{encodeURIComponent(sessionId)}}/timeline`));
+              if (generation !== state.generation || sessionId !== state.selectedSession) return;
               renderConversation(timeline.conversation);
               renderMessages(timeline.timeline || timeline.messages || []);
             }}
-
-            async function doSearch() {{
-              const keyword = els.searchInput.value.trim();
-              if (!keyword) {{
-                els.searchResults.innerHTML = '<div class="notice">请输入搜索会话信息</div>';
-                els.searchInput.focus();
-                return;
-              }}
-              els.searchResults.innerHTML = '<div class="notice">正在搜索…</div>';
-              try {{
-                const data = await api(adminPath(`/search?keyword=${{encodeURIComponent(keyword)}}`));
-                renderSearch(data.results || []);
-              }} catch (error) {{
-                els.searchResults.innerHTML = `<div class="notice" style="color:var(--danger);">搜索失败：${{esc(error.message || '未知错误')}}</div>`;
-              }}
+            function doSearch() {{
+              state.keyword = els.searchInput.value.trim();
+              state.userFilterText = els.userFilter.value.trim();
+              state.scopeUser = ''; state.selectedSession = ''; state.offset = 0;
+              document.getElementById('onlyMatches').checked = false;
+              refreshAll();
             }}
-
             async function refreshAll() {{
-              state.userFilterText = '';
-              state.selectedUser = '';
-              state.selectedSession = '';
-              els.userFilter.value = '';
-              await loadDashboard();
-              await loadConversations();
-              renderConversation(null);
-              renderSkills(null);
+              const generation = ++state.generation;
+              const previousSession = state.selectedSession;
+              state.selectedUser = ''; state.selectedSession = '';
+              renderConversation(null); renderSkills(null);
+              els.usersTable.innerHTML = '<tr><td colspan="3">正在加载…</td></tr>';
+              els.sessionsTable.innerHTML = '<tr><td colspan="3">正在加载…</td></tr>';
+              document.getElementById('footerNote').textContent = '正在加载…';
+              const params = new URLSearchParams({{keyword: state.keyword, user_query: state.userFilterText, offset: state.offset}});
+              if (state.scopeUser) params.set('user_id', state.scopeUser);
+              try {{
+                const [data] = await Promise.all([api(adminPath(`/browse?${{params}}`)), loadDashboard(generation)]);
+                if (generation !== state.generation) return;
+                state.users = data.users || []; state.conversations = data.conversations || [];
+                state.scopeUser = data.scoped_user || '';
+                const selected = state.conversations.find(row => row.external_session_id === previousSession) || state.conversations[0];
+                state.selectedSession = selected?.external_session_id || '';
+                state.selectedUser = selected?.user_id || state.scopeUser || state.users[0]?.user_id || '';
+                renderUsers(state.users); renderConversations(state.conversations);
+                els.sessionsMeta.textContent = `${{state.scopeUser ? '当前用户：' + state.scopeUser : '全部匹配用户'}} · ${{data.total_conversations}} 个会话`;
+                document.getElementById('prevPageBtn').disabled = !state.offset;
+                document.getElementById('nextPageBtn').disabled = !data.pagination?.has_more;
+                document.getElementById('allUsersBtn').disabled = !state.scopeUser || !!state.userFilterText;
+                document.getElementById('footerNote').textContent = `用户条件：${{state.userFilterText || '全部'}} · 会话条件：${{state.keyword || '全部'}} · ${{state.users.length}} 个用户 / ${{data.total_conversations}} 个会话${{state.keyword ? '（用户列表计数按匹配会话统计）' : ''}}`;
+                await Promise.all([loadConversation(generation), loadUserDetails().catch(error => {{
+                  if (generation === state.generation) els.skillsMeta.textContent = `Skills 加载失败：${{error.message}}`;
+                }})]);
+              }} catch (error) {{
+                if (generation !== state.generation) return;
+                state.selectedUser = ''; state.selectedSession = '';
+                state.users = []; state.conversations = [];
+                renderUsers([]); renderConversations([]); renderConversation(null); renderSkills(null);
+                showError(error);
+              }}
             }}
-
             els.refreshBtn.addEventListener('click', refreshAll);
+            document.getElementById('resetBtn').addEventListener('click', () => {{
+              els.userFilter.value = ''; els.searchInput.value = ''; doSearch();
+            }});
+            document.getElementById('clearUserBtn').addEventListener('click', () => {{ els.userFilter.value = ''; doSearch(); }});
+            document.getElementById('clearSearchBtn').addEventListener('click', () => {{ els.searchInput.value = ''; doSearch(); }});
+            document.getElementById('allUsersBtn').addEventListener('click', () => {{
+              state.scopeUser = ''; state.offset = 0; state.selectedSession = ''; refreshAll();
+            }});
+            for (const [id, delta] of [['prevPageBtn', -100], ['nextPageBtn', 100]]) {{
+              document.getElementById(id).addEventListener('click', () => {{
+                state.offset = Math.max(0, state.offset + delta); state.selectedSession = ''; refreshAll();
+              }});
+            }}
+            document.getElementById('prevMatchBtn').addEventListener('click', () => navigateMatch(-1));
+            document.getElementById('nextMatchBtn').addEventListener('click', () => navigateMatch(1));
+            document.getElementById('onlyMatches').addEventListener('change', () => {{ state.matchIndex = -1; renderMessages(state.timeline); }});
+
             els.saveSkillsBtn.addEventListener('click', saveSkills);
             els.logoutBtn.addEventListener('click', async () => {{
               // Do not follow the backend redirect here. Behind a subpath reverse
@@ -1063,13 +1110,7 @@ def render_dashboard_page(
               if (event.key === 'Enter') doSearch();
             }});
             els.userFilter.addEventListener('keydown', (event) => {{
-              if (event.key === 'Enter') {{
-                state.userFilterText = els.userFilter.value.trim();
-                loadDashboard();
-              }}
-            }});
-            els.userFilter.addEventListener('input', () => {{
-              state.userFilterText = els.userFilter.value.trim();
+              if (event.key === 'Enter') doSearch();
             }});
 
             refreshAll();
