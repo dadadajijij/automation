@@ -29,7 +29,8 @@ def runtime_subpath_findings_for_html(
                 "tag": ref.tag,
                 "attr": ref.attr,
                 "url": ref.url,
-                "message": f'Runtime HTML emits root-relative `{ref.attr}="{ref.url}"` outside deployment subpath `{base_path}`',
+                "resolved_url": normalized,
+                "message": f'Runtime HTML URL `{ref.attr}="{ref.url}"` on `{current_path}` resolves to `{normalized}` outside deployment subpath `{base_path}`',
             }
         )
     return findings

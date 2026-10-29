@@ -4774,6 +4774,8 @@ def main() -> int:
         analysis = collect_repo_analysis(repo_dir, args.source_type, args.source, args.ref)
         result["analysis_summary"] = summarize_analysis(analysis, args.source_type, project_slug)
         result["repo_dir"] = str(repo_dir)
+        vite_config_adaptations: List[dict] = []
+        artifacts["vite_config_adaptations"] = vite_config_adaptations
         subpath_prepare = subpath_prepare_subpath_sources(
             repo_dir,
             project_slug,
@@ -4790,6 +4792,8 @@ def main() -> int:
                     read_text=read_text,
                     write_text=write_text,
                     preview_allowed_host=DEFAULT_EXTERNAL_ACCESS_HOST,
+                    deployment_root=repo_dir_arg,
+                    adaptation_report=vite_config_adaptations,
                 ),
                 apply_nextjs_subpath_adapter_fn=apply_nextjs_subpath_adapter,
                 apply_vite_subpath_adapter_fn=apply_vite_subpath_adapter,

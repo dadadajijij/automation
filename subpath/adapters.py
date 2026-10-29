@@ -1,11 +1,14 @@
 import json
 import os
 import re
+import shlex
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from .common import build_deployment_base_path
 from .models import FrontendProjectStrategy, SubpathPlan
+from .vite_base import direct_config_base, rewrite_vite_base
 
 
 NEXTJS_RUNTIME_SHIM_BASENAME = "ka_tool_base_runtime"
@@ -175,22 +178,91 @@ def ensure_vite_base_config(
         return []
     base_path = f"{build_deployment_base_path(project_slug)}/"
     original = read_text(config_path)
-    rewritten = original
-    if re.search(r"defineConfig\(\s*\{\s*\}", rewritten):
-        rewritten = re.sub(
-            r"defineConfig\(\s*\{\s*\}",
-            f'defineConfig({{\n  base: "{base_path}",\n}}',
-            rewritten,
-            count=1,
-        )
-    if "base:" not in rewritten:
-        rewritten = re.sub(r"(defineConfig\(\s*\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
-        rewritten = re.sub(r"(export\s+default\s+\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
+    # Legacy callers lack a deployment plan; preserve their existing policy.
+    rewritten, _reason = rewrite_vite_base(original, base_path)
     rewritten = ensure_vite_preview_allowed_host(rewritten, preview_allowed_host)
     if rewritten != original:
         write_text(config_path, rewritten)
         return [config_path.relative_to(repo_dir).as_posix()]
     return []
+
+
+def _confirmed_vite_build(
+    config_path: Path,
+    deployment_root: Path,
+    read_text: Callable[[Path], str],
+) -> str:
+    """Prove a standard Docker/npm build uses this config without running code.
+
+    Unknown Dockerfiles, scripts and workspace layouts deliberately keep the
+    previous behavior. They still receive the existing runtime audit.
+    """
+    package_root = config_path.parent.resolve()
+    package_path = package_root / "package.json"
+    docker_path = deployment_root / "Dockerfile"
+    if not package_path.is_file() or not docker_path.is_file():
+        return "build_not_confirmed"
+    try:
+        package = json.loads(read_text(package_path))
+        scripts = package.get("scripts", {})
+        script = scripts.get("build", "")
+        if not isinstance(script, str) or any(scripts.get(key) for key in ("prebuild", "postbuild")):
+            return "build_not_confirmed"
+        matches = list(re.finditer(r"(?:^|&&|;)\s*(?:npx\s+)?vite\s+build(?P<args>[^;&|]*)", script))
+        if len(matches) != 1 or matches[0].end() != len(script):
+            return "build_not_confirmed"
+        args = shlex.split(matches[0].group("args"))
+    except (ValueError, AttributeError):
+        return "build_not_confirmed"
+    selected_config = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--base" or arg.startswith("--base="):
+            return "cli_base_override"
+        if arg in ("--config", "-c", "--mode", "-m"):
+            index += 1
+            if index >= len(args):
+                return "build_not_confirmed"
+            if arg in ("--config", "-c"):
+                selected_config = args[index]
+        elif arg.startswith("--config="):
+            selected_config = arg.split("=", 1)[1]
+        elif not arg.startswith("--mode="):
+            # Positional roots, compact flags and unknown CLI options can
+            # change configuration selection. Keep them out of auto-repair.
+            return "build_not_confirmed"
+        index += 1
+    if selected_config is not None:
+        if (package_root / selected_config).resolve() != config_path.resolve():
+            return "different_build_config"
+    else:
+        defaults = [package_root / f"vite.config.{extension}" for extension in ("js", "mjs", "ts", "cjs", "mts", "cts")]
+        if next((path for path in defaults if path.is_file()), None) != config_path:
+            return "different_build_config"
+
+    # Limit automatic repair to an unambiguous single-stage root build. A
+    # workspace configuration with an already correct base remains untouched.
+    if package_root != deployment_root.resolve():
+        return "build_not_confirmed"
+    docker_text = read_text(docker_path).replace("\\\n", " ")
+    lines = [line.strip() for line in docker_text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if sum(bool(re.match(r"FROM\s", line, re.I)) for line in lines) != 1:
+        return "build_not_confirmed"
+    if sum(bool(re.match(r"WORKDIR\s", line, re.I)) for line in lines) != 1:
+        return "build_not_confirmed"
+    copy_index = next((i for i, line in enumerate(lines) if re.fullmatch(r"COPY\s+\.\s+\.", line, re.I)), None)
+    build_index = next((i for i, line in enumerate(lines) if re.fullmatch(r"RUN\s+(?:npm\s+run\s+build|pnpm\s+(?:run\s+)?build|yarn\s+(?:run\s+)?build)", line)), None)
+    if copy_index is None or build_index is None or copy_index >= build_index:
+        return "build_not_confirmed"
+    if any(re.match(r"(?:RUN|COPY|ADD)\s", line, re.I) for line in lines[copy_index + 1:build_index] + lines[build_index + 1:]):
+        return "build_not_confirmed"
+    base = direct_config_base(read_text(config_path))
+    if base is not None:
+        variable = re.search(r"process\s*\.\s*env\s*\.\s*([A-Za-z_$][\w$]*)", base[2])
+        if variable and re.search(rf"(?im)^\s*(?:ENV|ARG)\s+.*\b{re.escape(variable[1])}\b", docker_text):
+            return "build_env_override"
+    return "confirmed_root_build"
 
 
 def ensure_vite_base_config_for_project(
@@ -200,22 +272,29 @@ def ensure_vite_base_config_for_project(
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
     preview_allowed_host: Optional[str] = None,
+    deployment_root: Optional[Path] = None,
+    adaptation_report: Optional[List[dict]] = None,
 ) -> List[str]:
     for config_path in project.config_files:
         if config_path.name.startswith("vite.config.") or ("declaration" in project.evidence and config_path.suffix in {".ts", ".js", ".mjs", ".cjs"}):
             base_path = f"{build_deployment_base_path(project_slug)}/"
             original = read_text(config_path)
-            rewritten = original
-            if re.search(r"defineConfig\(\s*\{\s*\}", rewritten):
-                rewritten = re.sub(
-                    r"defineConfig\(\s*\{\s*\}",
-                    f'defineConfig({{\n  base: "{base_path}",\n}}',
-                    rewritten,
-                    count=1,
-                )
-            if "base:" not in rewritten:
-                rewritten = re.sub(r"(defineConfig\(\s*\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
-                rewritten = re.sub(r"(export\s+default\s+\{\n)", rf'\1  base: "{base_path}",' + "\n", rewritten, count=1)
+            eligibility = "preserved_proxy_mode"
+            if project.proxy_mode == "preserve_prefix":
+                eligibility = "entry_path_not_confirmed"
+                if project.runtime_entry_hint in (None, "/") and not any(path != "/" for path in project.runtime_entry_candidates):
+                    eligibility = _confirmed_vite_build(config_path, deployment_root or project.project_root, read_text)
+            rewritten, reason = rewrite_vite_base(original, base_path, repair_relative=eligibility == "confirmed_root_build")
+            if adaptation_report is not None:
+                adaptation_report.append({
+                    "project_id": project.project_id,
+                    "config_file": str(config_path),
+                    "proxy_mode": project.proxy_mode,
+                    "target_base": base_path,
+                    "action": reason,
+                    "build_evidence": eligibility,
+                    "base_changed": rewritten != original,
+                })
             rewritten = ensure_vite_preview_allowed_host(rewritten, preview_allowed_host)
             if rewritten != original:
                 write_text(config_path, rewritten)
@@ -647,6 +726,8 @@ def apply_framework_config_adapter(
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
     preview_allowed_host: Optional[str] = None,
+    deployment_root: Optional[Path] = None,
+    adaptation_report: Optional[List[dict]] = None,
 ) -> List[str]:
     if project.adapter == "vite":
         return ensure_vite_base_config_for_project(
@@ -655,6 +736,8 @@ def apply_framework_config_adapter(
             read_text=read_text,
             write_text=write_text,
             preview_allowed_host=preview_allowed_host,
+            deployment_root=deployment_root,
+            adaptation_report=adaptation_report,
         )
     if project.adapter == "nextjs":
         return ensure_nextjs_basepath_config_for_project(project, project_slug, read_text=read_text, write_text=write_text)
@@ -673,10 +756,17 @@ def apply_framework_config_adapters(
     read_text: Callable[[Path], str],
     write_text: Callable[[Path, str], None],
     preview_allowed_host: Optional[str] = None,
+    deployment_root: Optional[Path] = None,
+    adaptation_report: Optional[List[dict]] = None,
 ) -> List[str]:
     changed: List[str] = []
     repo_root = _shared_repo_root(plan)
+    seen_vite_configs: set[Path] = set()
     for project in plan.projects:
+        if project.adapter == "vite":
+            config_files = tuple(path for path in project.config_files if path.resolve() not in seen_vite_configs)
+            seen_vite_configs.update(path.resolve() for path in config_files)
+            project = replace(project, config_files=config_files)
         for item in apply_framework_config_adapter(
             project,
             project_slug,
@@ -684,6 +774,8 @@ def apply_framework_config_adapters(
             read_text=read_text,
             write_text=write_text,
             preview_allowed_host=preview_allowed_host,
+            deployment_root=deployment_root,
+            adaptation_report=adaptation_report,
         ):
             if "/" in item:
                 changed.append(item)

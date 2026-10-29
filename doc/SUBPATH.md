@@ -269,6 +269,35 @@ FrontendProjectStrategy(
 - 完成后仍必须进入源码级 rewrite
 - 不允许因为“框架原生支持 basePath”就跳过源码审计
 
+#### Vite 已有 base 的兼容修复
+
+`subpath/vite_base.py` 在不执行项目 JavaScript 的前提下，定位直接导出的配置对象及其顶层 `base`。缺少 `base` 的可识别对象继续补部署前缀；已有正确前缀、自定义路径、CDN 地址继续保留。
+
+新增的相对 base 修复仅在以下条件全部成立时启用：
+
+- 部署计划使用 `preserve_prefix`，入口为默认根入口；平台此模式的精确入口代理不补尾斜杠。
+- 实际配置是可识别的直接对象导出，base 为 `""`、`"."`、`"./"`，或 `process.env.NAME || "./"` / `??` 等同类简单回退表达式。
+- 配置位于部署根包，`scripts.build` 的最后一条命令是 `vite build`；默认配置文件或显式 `--config` 与所选文件一致。
+- 现有 Dockerfile 是可确认的单阶段构建，使用一个 WORKDIR、`COPY . .` 和直接的 npm/pnpm/yarn build 命令；没有额外产物修改步骤。
+- 没有 CLI `--base`、prebuild/postbuild 钩子，或 Dockerfile 对上述 base 环境变量的显式配置。
+
+满足条件时，仅在任务 `work-repo` 中将 base 改为 `/tools2/<slug>/`。相同配置文件只适配一次。`strip_prefix` 下已有的相对 base 保留，因此不改变 `abtestcompare` 的历史部署方式。
+
+函数/异步配置、spread、计算属性、重复 base、无法确认的构建链路均不做新增覆盖，继续接受现有运行时审计。首批不对 workspace、多阶段镜像或未参与部署的其他前端包扩展覆盖，也不新增全局阻断条件。
+
+任务 `result.json` 的 `artifacts.vite_config_adaptations` 记录配置路径、目标 base、处理动作、构建证据及 base 是否变化。`unsupported_config` 和 `build_not_confirmed` 表示未执行新增修复，不能据此认定项目不兼容。
+
+历史离线对比命令：
+
+```bash
+python3 scripts/check_vite_history.py \
+  --baseline-ref <可信的修复前平台提交> \
+  --include-shared-repos \
+  --output /tmp/vite-history-compatibility.json
+```
+
+脚本在内存中分别执行基线和当前平台的框架配置适配器，并检查二次执行是否幂等。历史 `work-repo` 使用保存的计划，当前共享 `repo` 则重新识别计划；所有项目配置均只作为文本读取。它不调用 Codex、不执行项目构建、不启动容器，也不改写 jobs。报告只证明框架配置适配的差异，不能替代重新构建和运行验证。基线会加载对应 Git 提交的平台 Python 代码，因此仅使用可信的平台版本。
+
 ### 7.2 源码级改写
 
 当前源码级策略分两类：
