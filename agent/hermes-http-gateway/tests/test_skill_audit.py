@@ -5,11 +5,28 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hermes_http_gateway.main import _normalize_skill_audit, _runtime_audit_with_private_skills, _request_event_payload
+from hermes_http_gateway.main import (
+    _normalize_skill_audit,
+    _runtime_audit_with_private_skills,
+    _request_event_payload,
+    _strip_internal_runtime_diagnostics,
+)
 from hermes_http_gateway.hermes_client import _read_skill_audit_file
 
 
 class SkillAuditTests(unittest.TestCase):
+    def test_internal_file_mutation_footer_is_hidden_and_audited(self):
+        answer, diagnostic = _strip_internal_runtime_diagnostics(
+            "结论：调查完成。\n\n⚠️ File-mutation verifier: 1 file(s) were NOT modified this turn.\n  • `/tmp/report.json` — [write_file] syntax validation failed"
+        )
+        self.assertEqual(answer, "结论：调查完成。")
+        self.assertEqual(diagnostic["customer_visible"], False)
+        self.assertEqual(diagnostic["source"], "hermes_file_mutation_verifier")
+
+    def test_normal_answer_is_unchanged_by_runtime_diagnostic_filter(self):
+        answer = "结论：没有发现持续异常。"
+        self.assertEqual(_strip_internal_runtime_diagnostics(answer), (answer, None))
+
     def test_selected_skills_do_not_overwrite_execution_telemetry(self):
         selected = [{"id": "demo", "source": "user_binding"}]
         result = _runtime_audit_with_private_skills(

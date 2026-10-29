@@ -383,6 +383,27 @@ def _request_event_payload(
     }
 
 
+_HERMES_FILE_MUTATION_FOOTER = re.compile(
+    r"(?:^|\n)⚠️ File-mutation verifier:.*\Z",
+    re.DOTALL,
+)
+
+
+def _strip_internal_runtime_diagnostics(answer: str) -> tuple[str, dict[str, Any] | None]:
+    """Keep Hermes developer diagnostics out of customer-visible HTTP replies."""
+    if not isinstance(answer, str):
+        return answer, None
+    match = _HERMES_FILE_MUTATION_FOOTER.search(answer)
+    if match is None:
+        return answer, None
+    return answer[: match.start()].rstrip(), {
+        "kind": "internal_runtime_diagnostic",
+        "source": "hermes_file_mutation_verifier",
+        "customer_visible": False,
+        "summary": "Hermes reported a file mutation failure; diagnostic hidden from customer response",
+    }
+
+
 def _runtime_audit_from_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the safe, structured runtime audit emitted by Hermes."""
     if not isinstance(usage, dict):
@@ -1001,10 +1022,17 @@ async def _run_chat_turn(
                     **hermes_skill_kwargs,
                 )
             _ensure_turn_current(run_key, run_generation)
+            customer_answer, runtime_diagnostic = _strip_internal_runtime_diagnostics(result.answer)
+            if runtime_diagnostic and isinstance(result.usage, dict):
+                gateway_audit = result.usage.setdefault("gateway_audit", {})
+                if isinstance(gateway_audit, dict):
+                    events = gateway_audit.setdefault("events", [])
+                    if isinstance(events, list):
+                        events.append(runtime_diagnostic)
             published_answer = await asyncio.to_thread(
                 publish_report_answer,
                 settings,
-                result.answer,
+                customer_answer,
                 user_id=user_id,
                 session_id=external_session_id,
                 request_id=request_event["id"],
