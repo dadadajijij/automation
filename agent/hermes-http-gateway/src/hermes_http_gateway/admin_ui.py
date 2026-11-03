@@ -539,13 +539,14 @@ def render_dashboard_page(
             .request-stages summary {{ cursor: pointer; color: var(--muted); font-size: 12px; }}
             .request-stage {{
               display: grid;
-              grid-template-columns: minmax(0, 1fr) auto;
+              grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.2fr);
               gap: 8px;
               margin-top: 6px;
               color: var(--muted);
               font-size: 12px;
             }}
-            .request-stage-detail {{ grid-column: 1 / -1; overflow-wrap: anywhere; }}
+            .request-stage-detail {{ overflow-wrap: anywhere; text-align: right; }}
+            .request-stage.nested {{ padding-left: 16px; color: var(--muted); }}
             .runtime-audit {{ margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.55; }}
             .runtime-audit strong {{ color: var(--text); font-weight: 600; }}
             .runtime-audit-details {{ margin-top: 8px; }}
@@ -952,7 +953,7 @@ def render_dashboard_page(
                     <div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{highlight(row.prompt)}}</div>
                     ${{renderRuntimeAudit(row.runtime_audit)}}
                     ${{row.request_body ? `<details class="request-body"><summary>展开原始 Body</summary><pre>${{esc(row.request_body)}}</pre></details>` : ''}}
-                    ${{row.stages && row.stages.length ? `<details class="request-stages"><summary>展开阶段耗时</summary>${{row.stages.map((stage) => `<div class="request-stage"><span>${{esc(stage.stage)}}</span><span>${{formatDuration(stage.duration_ms)}}</span>${{stage.detail ? `<span class="request-stage-detail">${{esc(stage.detail)}}</span>` : ''}}</div>`).join('')}}</details>` : ''}}
+                    ${{row.stages && row.stages.length ? `<details class="request-stages"><summary>展开阶段耗时</summary>${{row.stages.map((stage) => `<div class="request-stage${{stage.nested ? ' nested' : ''}}"><span>${{esc(stage.stage)}}</span><span>${{formatDuration(stage.duration_ms)}}</span>${{stage.detail ? `<span class="request-stage-detail">${{esc(stage.detail)}}</span>` : ''}}</div>`).join('')}}</details>` : ''}}
                     <div class="meta" style="margin-top:8px;">${{row.status === 'completed' ? 'Hermes 已成功返回' : row.status === 'superseded' ? '已被同一会话的后续请求中断' : row.status === 'failed' ? 'Hermes 请求失败' : 'Hermes 正在处理' }}${{row.http_status ? ` • HTTP ${{esc(row.http_status)}}` : ''}}</div>
                     ${{row.error_detail ? `<div style="margin-top:8px; white-space:pre-wrap; word-break:break-word; color:var(--danger);">${{esc(row.error_detail)}}</div>` : ''}}
                   ` : `<div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{highlight(row.content)}}</div>`}}

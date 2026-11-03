@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
+import sqlite3
 import time
 import uuid
 import shutil
@@ -26,6 +28,7 @@ from .attachments import (
     DownloadedFile,
     DownloadedImage,
     attachment_session_dir,
+    attachment_request_dir,
     cleanup_old_attachment_dirs,
     download_file,
     download_image,
@@ -358,12 +361,18 @@ def _message_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _request_event_payload(
-    row: dict[str, Any], stages: list[dict[str, Any]] | None = None
+    row: dict[str, Any],
+    stages: list[dict[str, Any]] | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_audit = row.get("runtime_audit")
     if isinstance(runtime_audit, dict) and "private_skills" in runtime_audit:
         runtime_audit = dict(runtime_audit)
         runtime_audit["skills"] = runtime_audit.pop("private_skills")
+    if timing is None and isinstance(runtime_audit, dict):
+        candidate = runtime_audit.get("timing")
+        if isinstance(candidate, dict):
+            timing = candidate
     return {
         "event_type": "request",
         "id": row["id"],
@@ -377,6 +386,7 @@ def _request_event_payload(
         "provider": row["provider"],
         "request_body": row.get("request_body"),
         "runtime_audit": runtime_audit,
+        "timing": timing,
         "stages": stages or [],
         "created_at": row["created_at"],
         "completed_at": row["completed_at"],
@@ -425,7 +435,188 @@ def _runtime_audit_from_usage(usage: dict[str, Any] | None) -> dict[str, Any] | 
     context_window = audit.get("context_window")
     if isinstance(context_window, int) and context_window > 0:
         result["context_window"] = context_window
+    timing = audit.get("timing")
+    if isinstance(timing, dict):
+        result["timing"] = timing
     return result
+
+
+def _hermes_state_db_candidates(settings: Settings) -> list[Path]:
+    candidates: list[Path] = []
+    configured_home = os.environ.get("HERMES_HOME", "").strip()
+    if configured_home:
+        candidates.append(Path(configured_home) / "state.db")
+    candidates.extend(
+        [
+            Path.home() / ".hermes" / "state.db",
+            settings.hermes_workdir / ".hermes" / "state.db",
+        ]
+    )
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _hermes_runtime_breakdown(
+    settings: Settings,
+    hermes_session_id: str | None,
+    *,
+    window_start: str | None = None,
+    window_end: str | None = None,
+) -> dict[str, Any] | None:
+    """Derive coarse model/tool timing from Hermes' persisted message clock.
+
+    Hermes writes an assistant message after each model call and tool messages
+    after tool execution.  The gap before an assistant message is therefore
+    model decision time; the interval from an assistant tool call to its tool
+    results is tool time.  This is intentionally best effort because older
+    Hermes sessions may not have a readable state database.
+    """
+    if not hermes_session_id:
+        return None
+    db_path = next((path for path in _hermes_state_db_candidates(settings) if path.exists()), None)
+    if db_path is None:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT role, timestamp, tool_calls FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+            (hermes_session_id,),
+        ).fetchall()
+        conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if not rows:
+        return None
+
+    try:
+        lower = datetime.fromisoformat(window_start).timestamp() - 5 if window_start else None
+        upper = datetime.fromisoformat(window_end).timestamp() + 5 if window_end else None
+    except (TypeError, ValueError, OverflowError):
+        lower = upper = None
+    if lower is not None or upper is not None:
+        rows = [
+            row for row in rows
+            if (lower is None or float(row["timestamp"]) >= lower)
+            and (upper is None or float(row["timestamp"]) <= upper)
+        ]
+    if not rows:
+        return None
+
+    model_ms = 0.0
+    tool_ms = 0.0
+    model_calls = 0
+    tool_calls = 0
+    previous_timestamp: float | None = None
+    index = 0
+    while index < len(rows):
+        row = rows[index]
+        timestamp = float(row["timestamp"])
+        if row["role"] == "assistant":
+            try:
+                calls = json.loads(row["tool_calls"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                calls = []
+            if not isinstance(calls, list):
+                calls = []
+            model_calls += 1
+            tool_calls += len(calls)
+            if previous_timestamp is not None:
+                model_ms += max(0.0, (timestamp - previous_timestamp) * 1000.0)
+            if calls:
+                tool_end = timestamp
+                cursor = index + 1
+                while cursor < len(rows) and rows[cursor]["role"] == "tool":
+                    tool_end = max(tool_end, float(rows[cursor]["timestamp"]))
+                    cursor += 1
+                tool_ms += max(0.0, (tool_end - timestamp) * 1000.0)
+                previous_timestamp = tool_end
+                index = cursor - 1
+            else:
+                previous_timestamp = timestamp
+        elif previous_timestamp is None:
+            previous_timestamp = timestamp
+        index += 1
+
+    measured_ms = model_ms + tool_ms
+    return {
+        "version": 1,
+        "model_wait_ms": round(model_ms, 1),
+        "tool_execution_ms": round(tool_ms, 1),
+        "cli_overhead_ms": None,
+        "model_calls": model_calls,
+        "tool_calls": tool_calls,
+        "source": "Hermes state.db message timestamps",
+        "hermes_session_id": hermes_session_id,
+        "measured_ms": round(measured_ms, 1),
+    }
+
+
+def _timing_stages(timing: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not timing:
+        return []
+    stages: list[dict[str, Any]] = []
+    model_ms = float(timing.get("model_wait_ms") or 0)
+    tool_ms = float(timing.get("tool_execution_ms") or 0)
+    overhead = timing.get("cli_overhead_ms")
+    if model_ms:
+        stages.append({"stage": "模型决策等待", "duration_ms": model_ms,
+                       "detail": f"{timing.get('model_calls', 0)} 次模型调用",
+                       "nested": True})
+    if tool_ms:
+        stages.append({"stage": "Hermes 工具执行", "duration_ms": tool_ms,
+                       "detail": f"{timing.get('tool_calls', 0)} 次工具调用",
+                       "nested": True})
+    if overhead is not None and float(overhead) > 0:
+        stages.append({"stage": "Hermes CLI 初始化/收尾", "duration_ms": float(overhead),
+                       "detail": "总运行时间扣除模型与工具时间",
+                       "nested": True})
+    return stages
+
+
+def _request_timing(
+    settings: Settings,
+    hermes_session_id: str | None,
+    stages: list[dict[str, Any]],
+    *,
+    window_start: str | None = None,
+    window_end: str | None = None,
+    fallback_timing: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    timing = _hermes_runtime_breakdown(
+        settings,
+        hermes_session_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    if not timing:
+        timing = dict(fallback_timing) if isinstance(fallback_timing, dict) else None
+    if not timing:
+        return None, stages
+    if timing.get("cli_overhead_ms") is None:
+        total_ms = sum(
+            float(item.get("duration_ms") or 0)
+            for item in stages
+            if item.get("stage") == "Hermes CLI 运行"
+        )
+        overhead = max(0.0, total_ms - float(timing.get("measured_ms") or 0))
+        timing["cli_overhead_ms"] = round(overhead, 1)
+    expanded: list[dict[str, Any]] = []
+    inserted = False
+    for stage in stages:
+        expanded.append(stage)
+        if stage.get("stage") == "Hermes CLI 运行":
+            expanded.extend(_timing_stages(timing))
+            inserted = True
+    if not inserted:
+        expanded.extend(_timing_stages(timing))
+    return timing, expanded
 
 
 def _runtime_audit_with_private_skills(
@@ -732,8 +923,6 @@ def _attachment_root_for_prompt(
         if len(parents) == 1:
             return next(iter(parents))
         return settings.attachment_storage_root
-    if "@" in prompt:
-        return attachment_session_dir(settings, external_session_id)
     return None
 
 
@@ -898,7 +1087,7 @@ async def _run_chat_turn(
         begin_attachment_download(run_key)
         download_started_at = time.perf_counter()
         try:
-            target_dir = attachment_session_dir(settings, external_session_id)
+            target_dir = attachment_request_dir(settings, request_event["id"])
             downloaded_images = await asyncio.to_thread(
                 _prepare_image_attachments,
                 settings,
@@ -1023,6 +1212,15 @@ async def _run_chat_turn(
                 )
             _ensure_turn_current(run_key, run_generation)
             customer_answer, runtime_diagnostic = _strip_internal_runtime_diagnostics(result.answer)
+            timing, _ = _request_timing(
+                settings,
+                result.session_id or conversation.get("hermes_session_id"),
+                [{"stage": "Hermes CLI 运行", "duration_ms": (time.perf_counter() - hermes_started_at) * 1000}],
+            )
+            if timing is not None and isinstance(result.usage, dict):
+                gateway_audit = result.usage.setdefault("gateway_audit", {})
+                if isinstance(gateway_audit, dict):
+                    gateway_audit["timing"] = timing
             if runtime_diagnostic and isinstance(result.usage, dict):
                 gateway_audit = result.usage.setdefault("gateway_audit", {})
                 if isinstance(gateway_audit, dict):
@@ -1171,7 +1369,7 @@ async def _admin_chat_request(request: Request, settings: Settings) -> dict[str,
     uploads = [item for item in form.getlist("files") if hasattr(item, "read")]
 
     external_session_id = _validate_session_id(session_id)
-    target_dir = attachment_session_dir(settings, external_session_id)
+    target_dir = attachment_request_dir(settings, f"upload-{uuid.uuid4()}")
     prepared = await _prepare_uploaded_attachments(settings, uploads, target_dir)
     try:
         # Prepared uploads are already local, so this marker is never resolved as a URL.
@@ -1526,10 +1724,23 @@ def admin_conversation_timeline(request: Request, session_id: str):
         _message_payload(row) for row in list_messages_by_session(settings, conversation_id)
     ]
     stages_by_request = list_request_stages_by_session(settings, conversation_id)
-    requests = [
-        _request_event_payload(row, stages_by_request.get(row["id"], []))
-        for row in list_request_events_by_session(settings, conversation_id)
-    ]
+    requests = []
+    for row in list_request_events_by_session(settings, conversation_id):
+        stages = stages_by_request.get(row["id"], [])
+        stored_timing = None
+        if isinstance(row.get("runtime_audit"), dict):
+            candidate = row["runtime_audit"].get("timing")
+            if isinstance(candidate, dict):
+                stored_timing = candidate
+        timing, stages = _request_timing(
+            settings,
+            conversation.get("hermes_session_id"),
+            stages,
+            window_start=row.get("created_at"),
+            window_end=row.get("completed_at"),
+            fallback_timing=stored_timing,
+        )
+        requests.append(_request_event_payload(row, stages, timing))
     timeline = sorted(
         [*messages, *requests],
         key=lambda item: (item["created_at"], 0 if item["event_type"] == "request" else 1),

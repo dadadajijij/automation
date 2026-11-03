@@ -667,6 +667,12 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(payload["requests"][0]["stages"][0]["stage"], "Hermes CLI 运行")
         self.assertEqual(payload["requests"][0]["stages"][0]["duration_ms"], 1250.4)
 
+    def test_dashboard_places_timing_details_in_stage_rows(self):
+        page = render_dashboard_page(username="admin", csrf_token="csrf")
+        self.assertNotIn("Hermes CLI 运行拆分：", page)
+        self.assertIn("stage.nested", page)
+        self.assertIn("stage.nested ? ' nested'", page)
+
     def test_new_chat_turn_waits_for_previous_attachment_and_reuses_it(self):
         download_started = threading.Event()
         release_download = threading.Event()

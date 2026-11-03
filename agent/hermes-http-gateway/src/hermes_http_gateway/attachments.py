@@ -203,6 +203,15 @@ def attachment_session_dir(settings: Settings, external_session_id: str) -> Path
     return target
 
 
+def attachment_request_dir(settings: Settings, request_id: str) -> Path:
+    """Return an isolated directory for one HTTP request's input files."""
+    cleanup_old_attachment_dirs(settings)
+    today = datetime.now().date().isoformat()
+    target = settings.attachment_storage_root / today / "requests" / request_id
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return target
+
+
 def download_image(settings: Settings, *, url: str, target_dir: Path) -> DownloadedImage:
     data, content_type = _download_url(
         settings,
@@ -250,6 +259,7 @@ def store_image(
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{digest}{_MIME_SUFFIX[mime_type]}"
     path.write_bytes(data)
+    path.chmod(0o600)
     return DownloadedImage(
         source_url=source,
         local_path=path,
@@ -272,6 +282,7 @@ def store_file(
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{digest}{suffix}"
     path.write_bytes(data)
+    path.chmod(0o600)
     return DownloadedFile(
         source_url=source,
         local_path=path,

@@ -12,6 +12,7 @@ from hermes_http_gateway.main import (
     _strip_internal_runtime_diagnostics,
 )
 from hermes_http_gateway.hermes_client import _read_skill_audit_file
+from hermes_http_gateway.main import _timing_stages
 
 
 class SkillAuditTests(unittest.TestCase):
@@ -83,6 +84,19 @@ class SkillAuditTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_read_skill_audit_file(path)["events"][0]["status"], "failed")
+
+    def test_timing_stages_expose_model_and_tool_breakdown(self):
+        stages = _timing_stages({
+            "model_wait_ms": 1_069_789,
+            "tool_execution_ms": 92_667.8,
+            "cli_overhead_ms": 9_100,
+            "model_calls": 30,
+            "tool_calls": 39,
+        })
+        self.assertEqual([item["stage"] for item in stages], [
+            "模型决策等待", "Hermes 工具执行", "Hermes CLI 初始化/收尾"
+        ])
+        self.assertEqual(stages[0]["detail"], "30 次模型调用")
 
 
 if __name__ == "__main__":

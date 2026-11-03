@@ -275,6 +275,26 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
 
 
 class TestShellFileOpsHelpers:
+    def test_attachment_root_blocks_read_and_search_outside_root(self, mock_env, tmp_path, monkeypatch):
+        allowed = tmp_path / "input"
+        allowed.mkdir()
+        monkeypatch.setenv("HERMES_ATTACHMENT_ROOT", str(allowed))
+        ops = ShellFileOperations(mock_env)
+
+        read = ops.read_file(str(tmp_path / "other.log"))
+        search = ops.search("needle", str(tmp_path), target="files")
+
+        assert "outside the current request attachment root" in read.error
+        assert "outside the current request attachment root" in search.error
+
+    def test_attachment_root_allows_paths_inside_root(self, mock_env, tmp_path, monkeypatch):
+        allowed = tmp_path / "input"
+        allowed.mkdir()
+        monkeypatch.setenv("HERMES_ATTACHMENT_ROOT", str(allowed))
+        ops = ShellFileOperations(mock_env)
+
+        assert ops._attachment_path_error(str(allowed / "log.txt")) is None
+
     def test_normalize_read_pagination_clamps_invalid_values(self):
         assert normalize_read_pagination(offset=0, limit=0) == (1, 1)
         assert normalize_read_pagination(offset=-10, limit=-5) == (1, 1)

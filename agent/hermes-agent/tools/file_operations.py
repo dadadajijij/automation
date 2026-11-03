@@ -1127,6 +1127,31 @@ class ShellFileOperations(FileOperations):
                         return user_home + suffix
         
         return path
+
+    def _attachment_path_error(self, path: str) -> str | None:
+        """Return an error when a gateway attachment boundary is configured.
+
+        ``HERMES_ATTACHMENT_ROOT`` is set by the HTTP gateway for request
+        attachments.  It must constrain every file read/search, not only
+        ``@file`` expansion.  CLI sessions without the variable retain their
+        normal workspace behavior.
+        """
+        raw_root = os.environ.get("HERMES_ATTACHMENT_ROOT", "").strip()
+        if not raw_root:
+            return None
+        try:
+            root = Path(raw_root).expanduser().resolve(strict=True)
+            candidate = Path(path).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(self.cwd) / candidate
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            return (
+                "Access denied: path is outside the current request attachment "
+                "root. Only files from this request may be read."
+            )
+        return None
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands.
@@ -1471,6 +1496,8 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+        if (boundary_error := self._attachment_path_error(path)):
+            return ReadResult(error=boundary_error)
         
         offset, limit = normalize_read_pagination(offset, limit)
         
@@ -1760,6 +1787,8 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
+        if (boundary_error := self._attachment_path_error(path)):
+            return ReadResult(error=boundary_error)
         stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
             return self._suggest_similar_files(path)
@@ -1802,6 +1831,8 @@ class ShellFileOperations(FileOperations):
     def read_file_bytes(self, path: str, max_bytes: Optional[int] = None) -> ReadResult:
         """Read binary-safe bytes from any shell-backed environment."""
         path = self._expand_path(path)
+        if (boundary_error := self._attachment_path_error(path)):
+            return ReadResult(error=boundary_error)
         stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
             return ReadResult(error=f"File not found: {path}")
@@ -2783,6 +2814,8 @@ class ShellFileOperations(FileOperations):
 
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+        if (boundary_error := self._attachment_path_error(path)):
+            return SearchResult(error=boundary_error)
         
         # Validate that the path exists before searching
         check = self._exec(f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found")
