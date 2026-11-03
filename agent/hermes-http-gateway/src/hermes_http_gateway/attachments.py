@@ -6,6 +6,7 @@ import mimetypes
 import re
 import shutil
 import socket
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -204,12 +205,43 @@ def attachment_session_dir(settings: Settings, external_session_id: str) -> Path
 
 
 def attachment_request_dir(settings: Settings, request_id: str) -> Path:
-    """Return an isolated directory for one HTTP request's input files."""
+    """Return an isolated input directory for one HTTP request."""
     cleanup_old_attachment_dirs(settings)
     today = datetime.now().date().isoformat()
-    target = settings.attachment_storage_root / today / "requests" / request_id
+    target = settings.attachment_storage_root / today / "requests" / request_id / "input"
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
     return target
+
+
+def request_workspace(settings: Settings, request_id: str) -> dict[str, Path]:
+    """Create the isolated input/work/audit/output workspace for a request."""
+    cleanup_old_attachment_dirs(settings)
+    today = datetime.now().date().isoformat()
+    root = settings.attachment_storage_root / today / "requests" / request_id
+    paths = {name: root / name for name in ("input", "work", "audit", "output")}
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return {"root": root, **paths}
+
+
+def write_request_manifest(
+    workspace: dict[str, Path], *, request_id: str, session_id: str,
+    user_id: str, files: list[DownloadedImage | DownloadedFile],
+) -> Path:
+    manifest = {
+        "request_id": request_id,
+        "session_id": session_id,
+        "user_id": user_id,
+        "input_root": str(workspace["input"]),
+        "work_root": str(workspace["work"]),
+        "audit_root": str(workspace["audit"]),
+        "output_root": str(workspace["output"]),
+        "files": [item.public_payload() | {"source": "request_attachment"} for item in files],
+    }
+    path = workspace["audit"] / "manifest.json"
+    path.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def download_image(settings: Settings, *, url: str, target_dir: Path) -> DownloadedImage:

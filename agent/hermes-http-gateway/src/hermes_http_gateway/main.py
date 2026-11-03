@@ -29,6 +29,8 @@ from .attachments import (
     DownloadedImage,
     attachment_session_dir,
     attachment_request_dir,
+    request_workspace,
+    write_request_manifest,
     cleanup_old_attachment_dirs,
     download_file,
     download_image,
@@ -1007,6 +1009,7 @@ async def _run_chat_turn(
         provider=effective_provider,
         request_body=request_body,
     )
+    workspace = request_workspace(settings, request_event["id"])
     merged_question_text, merged_request_ids = _merge_recent_superseded_prompts(
         settings,
         user_id=user_id,
@@ -1087,7 +1090,7 @@ async def _run_chat_turn(
         begin_attachment_download(run_key)
         download_started_at = time.perf_counter()
         try:
-            target_dir = attachment_request_dir(settings, request_event["id"])
+            target_dir = workspace["input"]
             downloaded_images = await asyncio.to_thread(
                 _prepare_image_attachments,
                 settings,
@@ -1116,6 +1119,13 @@ async def _run_chat_turn(
                 run_key,
                 images=downloaded_images,
                 files=downloaded_files,
+            )
+            write_request_manifest(
+                workspace,
+                request_id=request_event["id"],
+                session_id=external_session_id,
+                user_id=user_id,
+                files=[*downloaded_images, *downloaded_files],
             )
     elif prepared_attachments is None:
         cleanup_old_attachment_dirs(settings)
@@ -1146,6 +1156,14 @@ async def _run_chat_turn(
         else:
             turn_images = _dedupe_downloaded(prepared_attachments.images)
             turn_files = _dedupe_downloaded(prepared_attachments.files)
+        if turn_images or turn_files:
+            write_request_manifest(
+                workspace,
+                request_id=request_event["id"],
+                session_id=external_session_id,
+                user_id=user_id,
+                files=[*turn_images, *turn_files],
+            )
         hermes_prompt = _prompt_with_attachments(merged_question_text, turn_images, turn_files)
         image_paths = [item.local_path for item in turn_images]
         attachment_root = _attachment_root_for_prompt(
@@ -1369,7 +1387,7 @@ async def _admin_chat_request(request: Request, settings: Settings) -> dict[str,
     uploads = [item for item in form.getlist("files") if hasattr(item, "read")]
 
     external_session_id = _validate_session_id(session_id)
-    target_dir = attachment_request_dir(settings, f"upload-{uuid.uuid4()}")
+    target_dir = request_workspace(settings, f"upload-{uuid.uuid4()}")["input"]
     prepared = await _prepare_uploaded_attachments(settings, uploads, target_dir)
     try:
         # Prepared uploads are already local, so this marker is never resolved as a URL.
