@@ -123,6 +123,7 @@ class Settings:
     report_max_bytes: int = 10 * 1024 * 1024
     category_names_file: Path = field(default_factory=lambda: DEFAULT_CATEGORY_NAMES_FILE)
     skill_names_file: Path = field(default_factory=lambda: DEFAULT_SKILL_NAMES_FILE)
+    gateway_default_skill: str = "agora-wecom-support-assistant"
 
 
 def load_settings() -> Settings:
@@ -161,4 +162,8 @@ def load_settings() -> Settings:
         ).strip().rstrip("/"),
         report_retention_days=_env_int("REPORT_RETENTION_DAYS", 7),
         report_max_bytes=_env_int("REPORT_MAX_BYTES", 10 * 1024 * 1024),
+        gateway_default_skill=(
+            os.environ.get("GATEWAY_DEFAULT_SKILL", "agora-wecom-support-assistant").strip()
+            or "agora-wecom-support-assistant"
+        ),
     )

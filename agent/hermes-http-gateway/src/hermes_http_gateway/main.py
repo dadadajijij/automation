@@ -625,6 +625,7 @@ def _runtime_audit_with_private_skills(
     usage: dict[str, Any] | None,
     private_skills: list[dict[str, Any]],
     skill_audit: dict[str, Any] | None = None,
+    executed_skills: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     audit = _runtime_audit_from_usage(usage) or {}
     usage_skill_audit = None
@@ -633,9 +634,107 @@ def _runtime_audit_with_private_skills(
     normalized = _normalize_skill_audit(skill_audit or usage_skill_audit, private_skills)
     if private_skills:
         audit["skills"] = private_skills
+    if executed_skills:
+        if normalized is None:
+            normalized = {"version": 1, "telemetry": "gateway_detected", "skills": []}
+        existing = {
+            str(item.get("id")) for item in normalized.get("skills", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        for item in executed_skills:
+            skill_id = str(item.get("id") or "").strip()
+            if skill_id and skill_id not in existing:
+                normalized.setdefault("skills", []).append(item)
+                existing.add(skill_id)
+    if normalized is not None:
+        actual = [
+            item for item in normalized.get("skills", [])
+            if isinstance(item, dict)
+            and str(item.get("status") or "").lower() in {"running", "succeeded", "failed", "timeout", "partial"}
+        ]
+        if actual:
+            audit["executed_skills"] = actual[:128]
     if normalized is not None:
         audit["skill_audit"] = normalized
     return audit or None
+
+
+def _detect_executed_skills(
+    settings: Settings,
+    hermes_session_id: str | None,
+    *,
+    window_start: str | None = None,
+    window_end: str | None = None,
+) -> list[dict[str, Any]]:
+    """Detect auxiliary Skills invoked by Hermes tools in this request.
+
+    Hermes' native Skill audit reports selected Skills, but shell based helper
+    Skills (such as Bailian RAG) appear as terminal commands. Inspect the
+    persisted tool calls for the request window so the audit reflects actual
+    execution as well as selection.
+    """
+    if not hermes_session_id:
+        return []
+    db_path = next((path for path in _hermes_state_db_candidates(settings) if path.exists()), None)
+    if db_path is None:
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT role, content, tool_calls, tool_call_id, timestamp "
+            "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+            (hermes_session_id,),
+        ).fetchall()
+        conn.close()
+    except (OSError, sqlite3.Error):
+        return []
+    try:
+        lower = datetime.fromisoformat(window_start).timestamp() - 5 if window_start else None
+        upper = datetime.fromisoformat(window_end).timestamp() + 5 if window_end else None
+    except (TypeError, ValueError, OverflowError):
+        lower = upper = None
+    if lower is not None or upper is not None:
+        rows = [
+            row for row in rows
+            if (lower is None or float(row["timestamp"]) >= lower)
+            and (upper is None or float(row["timestamp"]) <= upper)
+        ]
+    tool_result_ids = {str(row["tool_call_id"]) for row in rows if row["role"] == "tool" and row["tool_call_id"]}
+    detected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["role"] != "assistant" or not row["tool_calls"]:
+            continue
+        try:
+            calls = json.loads(row["tool_calls"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") if isinstance(call.get("function"), dict) else call
+            name = str(function.get("name") or "")
+            arguments = str(function.get("arguments") or "")
+            command = f"{name} {arguments}"
+            skill_id = None
+            if "bailian_search_all.py" in command or "agora-bailian-rag" in command:
+                skill_id = "agora-bailian-rag"
+            else:
+                match = re.search(r"/skills/([A-Za-z0-9._-]+)(?:/|\b)", command)
+                if match:
+                    skill_id = match.group(1)
+            if not skill_id:
+                continue
+            call_id = str(call.get("id") or call.get("call_id") or "")
+            detected[skill_id] = {
+                "id": skill_id,
+                "status": "succeeded" if call_id in tool_result_ids else "running",
+                "source": "hermes_tool_call",
+                "invocation_count": 1,
+            }
+    return list(detected.values())
 
 
 _SKILL_STATUSES = {"selected", "running", "succeeded", "failed", "timeout", "skipped", "unavailable", "unknown", "partial"}
@@ -716,6 +815,17 @@ def _normalize_skill_audit(
         "telemetry": "received",
         "skills": skills[:128],
     }
+
+
+def _effective_gateway_skill_ids(
+    bindings: list[dict[str, Any]], default_skill: str
+) -> tuple[list[str], str]:
+    """Select explicit user bindings, or the gateway default when absent."""
+    selected = [str(item.get("id") or "").strip() for item in bindings]
+    selected = list(dict.fromkeys(item for item in selected if item))
+    if selected:
+        return selected, "user_binding"
+    return [default_skill], "gateway_default"
 
 
 def _actual_runtime(usage: dict[str, Any] | None, fallback_model: str | None, fallback_provider: str | None) -> tuple[str | None, str | None]:
@@ -1021,22 +1131,32 @@ async def _run_chat_turn(
     private_skills: list[dict[str, Any]] = []
     private_catalog_error: str | None = None
     private_catalog_started_at = time.perf_counter()
-    try:
-        catalog = await asyncio.to_thread(list_private_skills, settings)
-        catalog_by_id = {str(item["id"]): item for item in catalog if item.get("enabled")}
-        for binding in list_user_private_skill_bindings(settings, user_id):
-            skill = catalog_by_id.get(str(binding["skill_id"]))
-            if skill is None:
-                continue
-            private_skills.append(
-                {
-                    "id": skill["id"],
-                    "version": skill.get("version") or "",
-                    "source": "user_binding",
-                }
-            )
-    except PrivateSkillCatalogError as exc:
-        private_catalog_error = str(exc)
+    bindings = list_user_private_skill_bindings(settings, user_id)
+    if not bindings:
+        selected_ids, selection_mode = _effective_gateway_skill_ids(
+            [], settings.gateway_default_skill
+        )
+        private_skills = [
+            {"id": skill_id, "version": "", "source": selection_mode}
+            for skill_id in selected_ids
+        ]
+    else:
+        try:
+            catalog = await asyncio.to_thread(list_private_skills, settings)
+            catalog_by_id = {str(item["id"]): item for item in catalog if item.get("enabled")}
+            for binding in bindings:
+                skill = catalog_by_id.get(str(binding["skill_id"]))
+                if skill is None:
+                    continue
+                private_skills.append(
+                    {
+                        "id": skill["id"],
+                        "version": skill.get("version") or "",
+                        "source": "user_binding",
+                    }
+                )
+        except PrivateSkillCatalogError as exc:
+            private_catalog_error = str(exc)
 
     def finish_request(
         status: str,
@@ -1267,6 +1387,14 @@ async def _run_chat_turn(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except HermesInvocationError as exc:
             record_stage("Hermes CLI 运行", hermes_started_at, str(exc))
+            error_usage = exc.usage if isinstance(exc.usage, dict) else {}
+            error_session_id = error_usage.get("session_id") if isinstance(error_usage.get("session_id"), str) else conversation.get("hermes_session_id")
+            executed_skills = _detect_executed_skills(
+                settings,
+                error_session_id,
+                window_start=request_event["created_at"],
+                window_end=datetime.now(timezone.utc).isoformat(),
+            )
             append_message(
                 settings,
                 external_session_id=external_session_id,
@@ -1290,7 +1418,7 @@ async def _run_chat_turn(
                 http_status=502,
                 error_detail=str(exc),
                 runtime_audit=_runtime_audit_with_private_skills(
-                    exc.usage, private_skills, exc.skill_audit
+                    exc.usage, private_skills, exc.skill_audit, executed_skills
                 ),
             )
             raise HTTPException(
@@ -1339,6 +1467,12 @@ async def _run_chat_turn(
         actual_model, actual_provider = _actual_runtime(
             result.usage, effective_model, effective_provider
         )
+        executed_skills = _detect_executed_skills(
+            settings,
+            result.session_id or conversation.get("hermes_session_id"),
+            window_start=request_event["created_at"],
+            window_end=datetime.now(timezone.utc).isoformat(),
+        )
         append_message(
             settings,
             external_session_id=external_session_id,
@@ -1357,7 +1491,7 @@ async def _run_chat_turn(
             "completed",
             http_status=200,
             runtime_audit=_runtime_audit_with_private_skills(
-                result.usage, private_skills, result.skill_audit
+                result.usage, private_skills, result.skill_audit, executed_skills
             ),
         )
 

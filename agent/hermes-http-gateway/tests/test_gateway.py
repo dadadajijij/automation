@@ -57,6 +57,22 @@ def _init_temp_db(settings: Settings) -> None:
     gateway.init_db(settings)
 
 
+class SkillSelectionTests(unittest.TestCase):
+    def test_default_skill_is_used_without_user_bindings(self):
+        self.assertEqual(
+            gateway._effective_gateway_skill_ids([], "agora-wecom-support-assistant"),
+            (["agora-wecom-support-assistant"], "gateway_default"),
+        )
+
+    def test_user_bindings_replace_gateway_default(self):
+        selected, mode = gateway._effective_gateway_skill_ids(
+            [{"id": "xindongfang-troubleshooting"}],
+            "agora-wecom-support-assistant",
+        )
+        self.assertEqual(selected, ["xindongfang-troubleshooting"])
+        self.assertEqual(mode, "user_binding")
+
+
 def _chat_request(question: str, **kwargs) -> gateway.ChatRequest:
     attachments = kwargs.pop("attachments", None)
     return gateway.ChatRequest(

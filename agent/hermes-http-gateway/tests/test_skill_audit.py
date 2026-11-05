@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from hermes_http_gateway.main import (
+    _detect_executed_skills,
     _normalize_skill_audit,
     _runtime_audit_with_private_skills,
     _request_event_payload,
@@ -16,6 +17,27 @@ from hermes_http_gateway.main import _timing_stages
 
 
 class SkillAuditTests(unittest.TestCase):
+    def test_detected_auxiliary_skill_is_published_separately(self):
+        usage = {"gateway_audit": {"skills": [{"id": "agora-wecom-support-assistant", "status": "succeeded"}]}}
+        result = _runtime_audit_with_private_skills(
+            usage,
+            [{"id": "agora-wecom-support-assistant", "source": "gateway_default"}],
+            executed_skills=[{
+                "id": "agora-bailian-rag",
+                "status": "succeeded",
+                "source": "hermes_tool_call",
+            }],
+        )
+        self.assertEqual(result["skills"][0]["id"], "agora-wecom-support-assistant")
+        self.assertIn(
+            "agora-bailian-rag",
+            [item["id"] for item in result["executed_skills"]],
+        )
+        self.assertIn(
+            "agora-bailian-rag",
+            [item["id"] for item in result["skill_audit"]["skills"]],
+        )
+
     def test_internal_file_mutation_footer_is_hidden_and_audited(self):
         answer, diagnostic = _strip_internal_runtime_diagnostics(
             "结论：调查完成。\n\n⚠️ File-mutation verifier: 1 file(s) were NOT modified this turn.\n  • `/tmp/report.json` — [write_file] syntax validation failed"

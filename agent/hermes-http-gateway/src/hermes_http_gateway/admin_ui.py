@@ -772,11 +772,13 @@ def render_dashboard_page(
               const vision = [...events].reverse().find((event) => event.kind === 'auxiliary' && event.task === 'vision');
               const fallback = events.some((event) => event.kind === 'main_fallback');
               const skills = Array.isArray(audit.skills) ? audit.skills : [];
+              const executedSkills = Array.isArray(audit.executed_skills) ? audit.executed_skills : [];
               const summary = [
                 finalRoute ? `实际主模型：${{finalRoute}}${{fallback ? '（已回退）' : ''}}` : '',
                 image ? `图片：${{image.input_mode || '-'}}` : '',
                 vision ? `视觉：${{[vision.model, vision.provider].filter(Boolean).join(' • ') || '-'}}` : '',
                 skills.length ? `Skills：${{skills.map((skill) => skill.id).filter(Boolean).join(', ')}}` : '',
+                executedSkills.length ? `实际执行：${{executedSkills.map((skill) => `${{skill.id || '-'}}=${{skill.status || 'unknown'}}`).join(', ')}}` : '',
                 skillResults.length ? `Skill 状态：${{skillResults.map((skill) => `${{skill.id || '-'}}=${{skill.status || 'unknown'}}`).join(', ')}}` : '',
                 audit.context_window ? `上下文：${{audit.context_window}}` : '',
               ].filter(Boolean);
