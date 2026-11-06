@@ -76,17 +76,17 @@ class CategoryTests(unittest.TestCase):
             {"id": "test"},
             "Import",
         )
-        created = self.request("/api/categories", {"slug": "customer-private", "name_zh": "客户私有"}, "POST")
+        created = self.request("/api/categories", {"slug": "custom-private", "name_zh": "客户私有"}, "POST")
         self.assertEqual(created.status_code, 201, created.text)
-        moved = self.request("/api/skills/alpha/category", {"category": "customer-private"}, "PATCH")
+        moved = self.request("/api/skills/alpha/category", {"category": "custom-private"}, "PATCH")
         self.assertEqual(moved.status_code, 200, moved.text)
-        self.assertEqual(moved.json()["skill"]["category_slug"], "customer-private")
-        self.assertTrue((self.root / "skills/customer-private/alpha/SKILL.md").is_file())
+        self.assertEqual(moved.json()["skill"]["category_slug"], "custom-private")
+        self.assertTrue((self.root / "skills/custom-private/alpha/SKILL.md").is_file())
         self.assertFalse((self.root / "skills/general/alpha").exists())
 
         detail = self.request("/api/skills/alpha")
         self.assertEqual(detail.status_code, 200)
-        self.assertEqual(detail.json()["skill"]["category_slug"], "customer-private")
+        self.assertEqual(detail.json()["skill"]["category_slug"], "custom-private")
 
     def test_batch_move_and_category_delete_moves_skills_to_general(self):
         manager.install_skill_packages(
@@ -129,40 +129,42 @@ class CategoryTests(unittest.TestCase):
             {"id": "test"},
             "Import",
         )
-        self.assertEqual(self.request("/api/categories", {"slug": "customer-private"}, "POST").status_code, 201)
-        self.assertEqual(self.request("/api/skills/alpha/category", {"category": "customer-private"}, "PATCH").status_code, 200)
-        renamed = self.request("/api/categories/customer-private", {"display_name": "customer-internal"}, "PATCH")
+        self.assertEqual(self.request("/api/categories", {"slug": "custom-private"}, "POST").status_code, 201)
+        self.assertEqual(self.request("/api/skills/alpha/category", {"category": "custom-private"}, "PATCH").status_code, 200)
+        renamed = self.request("/api/categories/custom-private", {"display_name": "customer-internal"}, "PATCH")
         self.assertEqual(renamed.status_code, 200, renamed.text)
         self.assertEqual(renamed.json()["category"]["slug"], "customer-internal")
         self.assertTrue((self.root / "skills/customer-internal/alpha/SKILL.md").exists())
-        self.assertFalse((self.root / "skills/customer-private").exists())
+        self.assertFalse((self.root / "skills/custom-private").exists())
         row = manager.db().execute("SELECT category_slug FROM skills WHERE name='alpha'").fetchone()
         self.assertEqual(row[0], "customer-internal")
 
     def test_category_json_lifecycle(self):
         created = self.request(
             "/api/categories",
-            {"slug": "customer-private", "name_zh": "客户私有"},
+            {"slug": "custom-private", "name_zh": "客户私有"},
             "POST",
         )
         self.assertEqual(created.status_code, 201, created.text)
         self.assertEqual(created.json()["category"]["name_zh"], "客户私有")
         self.assertEqual(
             set(created.json()["category"]),
-            {"slug", "display_name", "name_zh", "description", "is_system", "skill_count"},
+            {"slug", "display_name", "name_zh", "description", "is_system", "skill_count",
+             "parent_slug", "created_by", "created_at", "updated_at", "direct_skill_count",
+             "is_protected", "can_store_skills", "can_delete", "can_rename", "can_move_into", "storage_relpath"},
         )
 
         mapping = json.loads(manager.category_names_path().read_text(encoding="utf-8"))
-        self.assertEqual(mapping["customer-private"], "客户私有")
+        self.assertEqual(mapping["custom-private"], "客户私有")
 
         renamed = self.request(
-            "/api/categories/customer-private",
+            "/api/categories/custom-private",
             {"slug": "customer-internal", "name_zh": "客户内部"},
             "PATCH",
         )
         self.assertEqual(renamed.status_code, 200, renamed.text)
         mapping = json.loads(manager.category_names_path().read_text(encoding="utf-8"))
-        self.assertNotIn("customer-private", mapping)
+        self.assertNotIn("custom-private", mapping)
         self.assertEqual(mapping["customer-internal"], "客户内部")
 
         deleted = self.request("/api/categories/customer-internal", method="DELETE")
@@ -174,43 +176,43 @@ class CategoryTests(unittest.TestCase):
         self.assertEqual(
             self.request(
                 "/api/categories",
-                {"slug": "customer-private", "name_zh": "客户私有A"},
+                {"slug": "custom-private", "name_zh": "客户私有A"},
                 "POST",
             ).status_code,
             201,
         )
         self.assertEqual(
             self.request(
-                "/api/categories/customer-private",
+                "/api/categories/custom-private",
                 {"name_zh": "客户私有B"},
                 "PATCH",
             ).status_code,
             200,
         )
         manager.startup()
-        row = manager.db().execute("SELECT name_zh FROM categories WHERE slug='customer-private'").fetchone()
+        row = manager.db().execute("SELECT name_zh FROM categories WHERE slug='custom-private'").fetchone()
         self.assertEqual(row[0], "客户私有B")
 
     def test_general_cannot_rename_slug(self):
         response = self.request("/api/categories/general", {"slug": "shared", "name_zh": "共享"}, "PATCH")
         self.assertEqual(response.status_code, 409)
 
-    def test_non_admin_cannot_manage_categories_but_can_move_and_delete_one_skill(self):
+    def test_non_admin_can_manage_custom_categories_and_single_skills(self):
         manager.install_skill_packages(
             [{"name": "alpha", "files": {"SKILL.md": b"# Alpha"}}],
             {"id": "test"},
             "Import",
         )
-        self.request("/api/categories", {"slug": "customer-private", "name_zh": "客户私有"}, "POST")
+        self.request("/api/categories", {"slug": "custom-private", "name_zh": "客户私有"}, "POST")
 
         async def regular_user(request):
             return {"id": "customer@example.com", "email": "customer@example.com", "display_name": "Customer"}
 
         with patch.object(manager, "current_user", regular_user):
-            self.assertEqual(self.request("/api/categories", {"slug": "blocked", "name_zh": "禁止"}, "POST").status_code, 403)
-            self.assertEqual(self.request("/api/skills/batch-category", {"names": ["alpha"], "category": "customer-private"}, "POST").status_code, 403)
+            self.assertEqual(self.request("/api/categories", {"slug": "allowed", "name_zh": "自定义"}, "POST").status_code, 201)
+            self.assertEqual(self.request("/api/skills/batch-category", {"names": ["alpha"], "category": "custom-private"}, "POST").status_code, 403)
             self.assertEqual(self.request("/api/skills/batch-delete", {"names": ["alpha"]}, "POST").status_code, 403)
-            self.assertEqual(self.request("/api/skills/alpha/category", {"category": "customer-private"}, "PATCH").status_code, 200)
+            self.assertEqual(self.request("/api/skills/alpha/category", {"category": "custom-private"}, "PATCH").status_code, 200)
             self.assertEqual(self.request("/api/skills/alpha", method="DELETE").status_code, 200)
 
     def test_me_reports_management_capability(self):

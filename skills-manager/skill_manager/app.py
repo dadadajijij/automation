@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import io
 import ipaddress
 import json
@@ -16,11 +17,13 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from contextlib import contextmanager
+from uuid import uuid4
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import ParseResult, parse_qs, quote, unquote, urlparse
 
 import httpx
 import yaml
@@ -41,6 +44,15 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,255}$")
 DEFAULT_CATEGORY = "general"
 MAX_ARCHIVED_VERSIONS = 2
+PROTECTED_NAME_CATEGORIES = frozenset({"customer-common", "current-common"})
+FIXED_CATEGORIES = {
+    "general": ("默认", None),
+    "internal": ("内部", None),
+    "customer": ("客户", None),
+    "customer-private": ("客户私有", "customer"),
+    "customer-common": ("客户通用", "customer"),
+    "current-common": ("现有通用", "customer"),
+}
 
 app = FastAPI(title="Athena Skill Manager", docs_url="/api/docs")
 logger = logging.getLogger(__name__)
@@ -79,6 +91,7 @@ class CategoryCreate(BaseModel):
     name_zh: str | None = Field(default=None, min_length=1, max_length=120)
     display_name: str | None = Field(default=None, min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
+    parent_slug: str | None = Field(default=None, max_length=64)
 
 
 class CategoryUpdate(BaseModel):
@@ -86,6 +99,7 @@ class CategoryUpdate(BaseModel):
     name_zh: str | None = Field(default=None, min_length=1, max_length=120)
     display_name: str | None = Field(default=None, min_length=1, max_length=120)
     description: str | None = Field(default=None, max_length=500)
+    parent_slug: str | None = Field(default=None, max_length=64)
 
 
 class CategoryAssignment(BaseModel):
@@ -128,6 +142,13 @@ def db() -> sqlite3.Connection:
               archive_path TEXT NOT NULL, actor_id TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL,
               UNIQUE(skill_name, version)
             );
+            CREATE TABLE IF NOT EXISTS export_state (
+              name TEXT PRIMARY KEY, dirty INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT OR IGNORE INTO export_state(name,dirty) VALUES('skill_names',1);
+            INSERT OR IGNORE INTO export_state(name,dirty) VALUES('category_names',1);
+            CREATE TABLE IF NOT EXISTS storage_operations (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY);
             """
         )
         columns = {row[1] for row in connection.execute("PRAGMA table_info(skills)").fetchall()}
@@ -144,7 +165,7 @@ def db() -> sqlite3.Connection:
                     skill_name_mapping = {
                         str(name): str(display_name).strip()
                         for name, display_name in raw_mapping.items()
-                        if str(display_name).strip()
+                        if isinstance(display_name, str) and display_name.strip()
                     }
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             logger.warning("Unable to read skill_names.json; keeping database names", exc_info=True)
@@ -152,19 +173,43 @@ def db() -> sqlite3.Connection:
             name_zh = skill["name_zh"] or skill_name_mapping.get(skill["name"]) or skill["name"]
             if name_zh != skill["name_zh"]:
                 connection.execute("UPDATE skills SET name_zh=? WHERE name=?", (name_zh, skill["name"]))
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS skill_names_insert AFTER INSERT ON skills
+            BEGIN UPDATE export_state SET dirty=1 WHERE name='skill_names'; END;
+            CREATE TRIGGER IF NOT EXISTS skill_names_update AFTER UPDATE OF name,name_zh ON skills
+            BEGIN UPDATE export_state SET dirty=1 WHERE name='skill_names'; END;
+            CREATE TRIGGER IF NOT EXISTS skill_names_delete AFTER DELETE ON skills
+            BEGIN UPDATE export_state SET dirty=1 WHERE name='skill_names'; END;
+            """
+        )
         category_columns = {row[1] for row in connection.execute("PRAGMA table_info(categories)").fetchall()}
         if "name_zh" not in category_columns:
             connection.execute("ALTER TABLE categories ADD COLUMN name_zh TEXT NOT NULL DEFAULT ''")
+        if "parent_slug" not in category_columns:
+            connection.execute("ALTER TABLE categories ADD COLUMN parent_slug TEXT")
+            connection.execute("UPDATE categories SET parent_slug='customer' WHERE slug IN ('customer-private','customer-common','current-common')")
+            connection.execute("UPDATE categories SET name_zh='内部',display_name='内部' WHERE slug='internal' AND name_zh IN ('','内部使用')")
         stamp = now()
-        connection.execute(
-            "INSERT OR IGNORE INTO categories(slug,display_name,name_zh,description,is_system,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            (DEFAULT_CATEGORY, "默认", "默认", "", 1, "system", stamp, stamp),
-        )
+        for slug, (name_zh, parent_slug) in FIXED_CATEGORIES.items():
+            connection.execute(
+                "INSERT OR IGNORE INTO categories(slug,display_name,name_zh,parent_slug,description,is_system,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (slug, name_zh, name_zh, parent_slug, "", 1, "system", stamp, stamp),
+            )
+            connection.execute("UPDATE categories SET is_system=1 WHERE slug=? AND is_system<>1", (slug,))
         for category in connection.execute("SELECT slug,display_name,name_zh FROM categories").fetchall():
-            zh = "默认" if category["slug"] == DEFAULT_CATEGORY else category["name_zh"] or category["display_name"]
+            zh = category["name_zh"] or category["display_name"]
             if zh != category["name_zh"] or category["display_name"] != zh:
                 connection.execute("UPDATE categories SET display_name=?,name_zh=? WHERE slug=?", (zh, zh, category["slug"]))
         connection.commit()
+        connection.executescript("""
+            CREATE TRIGGER IF NOT EXISTS category_names_insert AFTER INSERT ON categories
+            BEGIN UPDATE export_state SET dirty=1 WHERE name='category_names'; END;
+            CREATE TRIGGER IF NOT EXISTS category_names_update AFTER UPDATE ON categories
+            BEGIN UPDATE export_state SET dirty=1 WHERE name='category_names'; END;
+            CREATE TRIGGER IF NOT EXISTS category_names_delete AFTER DELETE ON categories
+            BEGIN UPDATE export_state SET dirty=1 WHERE name='category_names'; END;
+        """)
     except Exception:
         connection.close()
         raise
@@ -182,16 +227,188 @@ def validate_category(slug: str) -> str:
     return slug
 
 
-def category_root(category: str) -> Path:
-    return SKILLS_ROOT / validate_category(category)
+def category_relative_path(slug: str, parent: str | None) -> Path:
+    slug = validate_category(slug)
+    if parent is None:
+        return Path(slug)
+    return Path(validate_category(parent)) / slug.replace("-", "_") / slug
 
 
-def skill_root(category: str, name: str) -> Path:
-    return category_root(category) / validate_name(name)
+def checked_storage_path(path: Path) -> Path:
+    # Refuse symlinked ancestors as well as escapes, including dangling links.
+    path.relative_to(SKILLS_ROOT)
+    if not path.resolve().is_relative_to(SKILLS_ROOT.resolve()):
+        raise HTTPException(409, "Storage path escapes the skills directory")
+    for part in (path, *path.parents):
+        if part.is_symlink():
+            raise HTTPException(409, "Storage path contains a symbolic link")
+        if part == SKILLS_ROOT:
+            break
+    return path
+
+
+def category_root(category: str, connection: sqlite3.Connection | None = None) -> Path:
+    owns_connection = connection is None
+    connection = connection or sqlite3.connect(DB_PATH)
+    try:
+        row = connection.execute("SELECT parent_slug FROM categories WHERE slug=?", (validate_category(category),)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Category not found")
+        return checked_storage_path(SKILLS_ROOT / category_relative_path(category, row[0]))
+    finally:
+        if owns_connection:
+            connection.close()
+
+
+def skill_root(category: str, name: str, connection: sqlite3.Connection | None = None) -> Path:
+    return checked_storage_path(category_root(category, connection) / validate_name(name))
+
+
+def check_skill_destination(connection: sqlite3.Connection, category: str, name: str) -> Path:
+    # Child container directories share their parent's direct-Skill namespace.
+    for child in connection.execute("SELECT slug FROM categories WHERE parent_slug=?", (category,)):
+        if name == child[0].replace("-", "_"):
+            raise HTTPException(409, "Skill ID conflicts with a child category directory")
+    return skill_root(category, name, connection)
 
 
 def archive_path(category: str, name: str, version: int) -> Path:
     return ARCHIVES_ROOT / validate_category(category) / f"{validate_name(name)}-v{version}.zip"
+
+
+def write_atomic_json(path: Path, payload: Any) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".storage-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def recover_category_moves(connection: sqlite3.Connection) -> None:
+    journal = ROOT / ".category-moves.json"
+    if not journal.exists():
+        return
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    if not connection.execute("SELECT 1 FROM storage_operations WHERE id=?", (payload["id"],)).fetchone():
+        for old, new in reversed(payload["moves"]):
+            source, target = checked_storage_path(SKILLS_ROOT / old), checked_storage_path(SKILLS_ROOT / new)
+            if target.exists():
+                if source.exists():
+                    raise RuntimeError(f"Cannot recover category move; both paths exist: {source}")
+                source.parent.mkdir(parents=True, exist_ok=True)
+                target.rename(source)
+        for directory in reversed(payload.get("created", [])):
+            path = checked_storage_path(SKILLS_ROOT / directory)
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+    journal.unlink()
+
+
+@contextmanager
+def category_transaction(connection: sqlite3.Connection):
+    """Journal filesystem moves before applying them; the DB records commit completion."""
+    with (ROOT / ".category-moves.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        recover_category_moves(connection)
+        connection.execute("BEGIN IMMEDIATE")
+        journal = ROOT / ".category-moves.json"
+        payload = {"id": uuid4().hex, "moves": [], "created": []}
+
+        def mkdir(path):
+            checked_storage_path(path)
+            if path.exists():
+                if not path.is_dir():
+                    raise HTTPException(409, "Category path is not a directory")
+                return
+            if path.parent != SKILLS_ROOT:
+                mkdir(path.parent)
+            payload["created"].append(str(path.relative_to(SKILLS_ROOT)))
+            write_atomic_json(journal, payload)
+            path.mkdir()
+
+        def move(source, target):
+            checked_storage_path(source)
+            checked_storage_path(target)
+            if source == target:
+                return
+            if target.exists():
+                raise HTTPException(409, f"Target directory already exists: {target.name}")
+            if not source.is_dir():
+                raise HTTPException(409, f"Source directory is unavailable: {source.name}")
+            mkdir(target.parent)
+            payload["moves"].append([str(source.relative_to(SKILLS_ROOT)), str(target.relative_to(SKILLS_ROOT))])
+            write_atomic_json(journal, payload)
+            source.rename(target)
+
+        try:
+            yield move, mkdir
+            connection.execute("INSERT INTO storage_operations(id) VALUES(?)", (payload["id"],))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            recover_category_moves(connection)
+            raise
+        else:
+            journal.unlink(missing_ok=True)
+
+
+def remove_empty_category_dirs(paths: list[Path]) -> None:
+    for path in sorted(set(paths), key=lambda p: len(p.parts), reverse=True):
+        if path == SKILLS_ROOT:
+            continue
+        try:
+            if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            logger.warning("Category saved; empty directory cleanup deferred: %s", path, exc_info=True)
+
+
+def migrate_category_tree() -> None:
+    connection = db()
+    try:
+        with category_transaction(connection) as (move, mkdir):
+            if not connection.execute("SELECT 1 FROM schema_migrations WHERE name='category-tree-v1'").fetchone():
+                # Keep archives in their original locations; their DB paths remain valid.
+                for slug in ("customer-private", "customer-common", "current-common"):
+                    source = checked_storage_path(SKILLS_ROOT / slug)
+                    target = category_root(slug, connection)
+                    if source.exists():
+                        if target.is_dir() and not any(target.iterdir()):
+                            target.rmdir()
+                        move(source, target)
+                connection.execute("INSERT INTO schema_migrations(name) VALUES('category-tree-v1')")
+            for row in connection.execute("SELECT slug FROM categories"):
+                mkdir(category_root(row[0], connection))
+    finally:
+        connection.close()
+
+
+def backup_before_category_migration() -> None:
+    if not DB_PATH.exists():
+        return
+    with sqlite3.connect(DB_PATH) as connection:
+        table = connection.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone()
+        if table and connection.execute("SELECT 1 FROM schema_migrations WHERE name='category-tree-v1'").fetchone():
+            return
+        if (ROOT / ".category-moves.json").exists():
+            return  # Recovery uses the original backup, not a partial-move snapshot.
+        backup = ROOT / "backups" / ("category-tree-" + datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
+        backup.mkdir(parents=True)
+        with sqlite3.connect(backup / DB_PATH.name) as destination:
+            connection.backup(destination)
+        for path in (SKILLS_ROOT, ARCHIVES_ROOT, category_names_path(), skill_names_path()):
+            if path.is_dir():
+                shutil.copytree(path, backup / path.name, symlinks=True)
+            elif path.exists():
+                shutil.copy2(path, backup / path.name)
+        logger.info("Category tree migration backup: %s", backup)
 
 
 def migrate_legacy_skill_paths() -> None:
@@ -218,40 +435,107 @@ def skill_names_path() -> Path:
     return ROOT / "skill_names.json"
 
 
-def write_category_names_file(connection: sqlite3.Connection | None = None) -> None:
-    owns_connection = connection is None
-    connection = connection or db()
-    try:
-        payload = {
-            row["slug"]: row["name_zh"]
-            for row in connection.execute("SELECT slug,name_zh FROM categories ORDER BY slug").fetchall()
-        }
-    finally:
-        if owns_connection:
-            connection.close()
-    target = category_names_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(target)
+def write_category_names_file(connection: sqlite3.Connection | None = None, *, only_pending: bool = False) -> bool:
+    return write_names_file("category_names", connection, only_pending=only_pending)
 
 
-def write_skill_names_file(connection: sqlite3.Connection | None = None) -> None:
+def write_skill_names_file(connection: sqlite3.Connection | None = None, *, only_pending: bool = False) -> bool:
+    return write_names_file("skill_names", connection, only_pending=only_pending)
+
+
+def write_names_file(kind: str, connection: sqlite3.Connection | None = None, *, only_pending: bool = False) -> bool:
+    """Export a fresh committed snapshot; a failed export must not undo a saved operation."""
     owns_connection = connection is None
-    connection = connection or db()
+    temporary = None
     try:
-        payload = {
-            row["name"]: row["name_zh"] or row["name"]
-            for row in connection.execute("SELECT name,name_zh FROM skills ORDER BY name").fetchall()
-        }
+        connection = connection or db()
+        if connection.in_transaction:
+            raise RuntimeError("Export must run after the database transaction commits")
+        target = ROOT / f"{kind}.json"
+        with (ROOT / f".{kind}.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Hold the database write lock until replacement finishes so an older
+            # process cannot publish a snapshot taken before a newer mutation.
+            connection.execute("BEGIN IMMEDIATE")
+            pending = connection.execute("SELECT dirty FROM export_state WHERE name=?", (kind,)).fetchone()[0]
+            if only_pending and not pending and target.is_file():
+                connection.commit()
+                return True
+            payload = {
+                row[0]: row[1] or row[0]
+                for row in connection.execute("SELECT name,name_zh FROM skills ORDER BY name" if kind == "skill_names" else "SELECT slug,name_zh FROM categories ORDER BY slug")
+            }
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=ROOT,
+                                             prefix=f".{kind}-", suffix=".tmp", delete=False) as handle:
+                temporary = Path(handle.name)
+                os.fchmod(handle.fileno(), target.stat().st_mode & 0o777 if target.exists() else 0o644)
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            connection.execute("UPDATE export_state SET dirty=0 WHERE name=?", (kind,))
+            connection.commit()
+        return True
+    except (OSError, sqlite3.Error):
+        if connection is not None:
+            connection.rollback()
+        logger.exception("Data saved; %s.json export pending retry", kind)
+        return False
     finally:
-        if owns_connection:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Unable to remove temporary names export", exc_info=True)
+        if owns_connection and connection is not None:
             connection.close()
-    target = skill_names_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(target)
+
+
+@app.middleware("http")
+async def report_skill_names_sync(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/") and DB_PATH.is_file():
+        synced = await asyncio.to_thread(write_skill_names_file, only_pending=True)
+        response.headers["X-Skill-Names-Sync"] = "synced" if synced else "pending"
+        categories_synced = await asyncio.to_thread(write_category_names_file, only_pending=True)
+        response.headers["X-Category-Names-Sync"] = "synced" if categories_synced else "pending"
+    return response
+
+
+@app.on_event("startup")
+async def start_skill_names_retry() -> None:
+    async def retry():
+        while True:
+            await asyncio.sleep(30)
+            await asyncio.to_thread(write_skill_names_file, only_pending=True)
+            await asyncio.to_thread(write_category_names_file, only_pending=True)
+    app.state.skill_names_retry = asyncio.create_task(retry())
+
+
+@app.on_event("shutdown")
+async def stop_skill_names_retry() -> None:
+    task = getattr(app.state, "skill_names_retry", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def can_rename_skill(user: dict[str, str] | None, category: str) -> bool:
+    return category not in PROTECTED_NAME_CATEGORIES or is_manager(user)
+
+
+def require_category_write(user: dict[str, str] | None, category: str) -> None:
+    if not can_rename_skill(user, category):
+        raise HTTPException(403, f"Administrator permission required for category: {category}")
+
+
+def skill_with_permissions(row, user):
+    allowed = can_rename_skill(user, row["category_slug"])
+    return {**dict(row), "can_rename": allowed, "can_edit": allowed, "can_move": allowed, "can_delete": allowed}
 
 
 async def current_user(request: Request) -> dict[str, str] | None:
@@ -348,16 +632,39 @@ def validate_git_ref(ref: str | None) -> str | None:
     return ref
 
 
+def parse_git_address(raw_url: str) -> tuple[ParseResult, bool]:
+    address = raw_url.strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in address):
+        raise HTTPException(400, "Git URL contains control characters")
+    scp = re.fullmatch(
+        r"(?P<user>[A-Za-z0-9][A-Za-z0-9._-]*)@"
+        r"(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\]):(?P<path>.+)",
+        address,
+    )
+    if scp:
+        # Parse the host for validation, but retain Git's home-relative path semantics.
+        try:
+            parsed = urlparse(f"ssh://{scp['user']}@{scp['host']}")._replace(path=scp['path'])
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid Git SSH address") from exc
+        return parsed, True
+    try:
+        return urlparse(address), False
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid Git URL") from exc
+
+
 def validate_git_url(raw_url: str) -> str:
-    parsed = urlparse(raw_url.strip())
+    parsed, is_scp = parse_git_address(raw_url)
     if parsed.scheme not in {"http", "https", "ssh"} or not parsed.hostname:
-        raise HTTPException(400, "Git URL must use http, https, or ssh")
+        raise HTTPException(400, "Use an http/https/ssh URL or user@host:path Git address")
     if parsed.scheme in {"http", "https"}:
         return validate_download_url(parsed.geturl())
     hostname = parsed.hostname.lower().rstrip(".")
     allowed_hosts = allowed_url_hosts()
+    clone_address = raw_url.strip() if is_scp else parsed.geturl()
     if hostname in allowed_hosts or any(hostname.endswith("." + suffix) for suffix in allowed_hosts):
-        return parsed.geturl()
+        return clone_address
     try:
         addresses = {
             result[4][0]
@@ -367,13 +674,15 @@ def validate_git_url(raw_url: str) -> str:
         raise HTTPException(400, "Git URL host cannot be resolved") from exc
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise HTTPException(400, "Git URL resolves to a non-public address")
-    return parsed.geturl()
+    return clone_address
 
 
 def parse_git_source(raw_url: str, requested_ref: str | None) -> tuple[str, str | None]:
     """Resolve the repository and ref; browse subdirectories do not limit imports."""
-    parsed = urlparse(raw_url.strip())
+    parsed, is_scp = parse_git_address(raw_url)
     ref = validate_git_ref(requested_ref)
+    if is_scp:
+        return validate_git_url(raw_url), ref
 
     browse_match = re.search(r"/projects/([^/]+)/repos/([^/]+)/browse(?:/(.*))?$", parsed.path)
     if browse_match:
@@ -773,6 +1082,11 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
                     results.append({"name": name, "status": "skipped", "reason": "Skill already exists"})
                     continue
 
+                require_category_write(user, category)
+                destination = check_skill_destination(connection, category, name)
+                if not existing and destination.exists():
+                    raise HTTPException(409, f"Unmanaged directory already exists for Skill: {name}")
+
                 version = next_skill_version(connection, name, int(existing["version"]) if existing else 0)
                 archive = archive_path(category, name, version)
                 archive.parent.mkdir(parents=True, exist_ok=True)
@@ -782,7 +1096,6 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
                 staged_archive = Path(temp_dir) / f"{name}.zip"
                 write_skill_archive(staged, staged_archive)
 
-                destination = skill_root(category, name)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 backup = backup_root / name if destination.exists() else None
                 if backup:
@@ -821,13 +1134,14 @@ def install_skill_packages(packages: list[dict[str, Any]], user: dict[str, str],
 
 def clone_git_packages(raw_url: str, ref: str | None) -> list[dict[str, Any]]:
     clone_url, ref = parse_git_source(raw_url, ref)
+    address, is_scp = parse_git_address(clone_url)
     ensure_dirs()
     with tempfile.TemporaryDirectory(prefix="skill-git-", dir=ROOT) as temp_dir:
         checkout = Path(temp_dir) / "repository"
         command = ["git", "clone", "--depth", "1", "--no-tags"]
         git_env = os.environ.copy()
         username, password = git_env.get("username", ""), git_env.get("password", "")
-        if urlparse(clone_url).scheme in {"http", "https"} and (username or password):
+        if address.scheme in {"http", "https"} and (username or password):
             if not username or not password:
                 raise HTTPException(400, "Git authentication requires both username and password")
             askpass = Path(temp_dir) / "askpass"
@@ -864,7 +1178,8 @@ def clone_git_packages(raw_url: str, ref: str | None) -> list[dict[str, Any]]:
             detail = detail[:500]
             raise HTTPException(502, f"Git clone failed: {detail}")
 
-        repository_name = unquote(Path(urlparse(clone_url).path.rstrip("/")).name).removesuffix(".git")
+        repository_path = address.path if is_scp else unquote(address.path)
+        repository_name = Path(repository_path.rstrip("/")).name.removesuffix(".git")
         return discover_directory_packages(checkout, repository_name)
 
 
@@ -875,9 +1190,13 @@ def skill_row(row: sqlite3.Row) -> dict[str, Any]:
 @app.on_event("startup")
 def startup() -> None:
     ensure_dirs()
-    connection = db()
-    connection.close()
-    migrate_legacy_skill_paths()
+    with (ROOT / ".category-migration.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        backup_before_category_migration()
+        connection = db()
+        connection.close()
+        migrate_legacy_skill_paths()
+        migrate_category_tree()
     prune_all_skill_history()
     write_category_names_file()
     write_skill_names_file()
@@ -891,175 +1210,199 @@ async def me(request: Request) -> dict[str, Any]:
 
 @app.get("/api/skills")
 async def list_skills(request: Request) -> dict[str, Any]:
-    await current_user(request)
+    user = await current_user(request)
     connection = db(); rows = connection.execute("SELECT * FROM skills ORDER BY name").fetchall(); connection.close()
-    return {"skills": [skill_row(row) for row in rows]}
+    return {"skills": [skill_with_permissions(row, user) for row in rows]}
+
+
+def category_records(connection, user):
+    rows = [dict(row) for row in connection.execute(
+        """SELECT c.*,COUNT(s.name) AS direct_skill_count
+        FROM categories c LEFT JOIN skills s ON s.category_slug=c.slug GROUP BY c.slug"""
+    )]
+    fixed_order = {slug: index for index, slug in enumerate(FIXED_CATEGORIES)}
+    rows.sort(key=lambda c: (fixed_order.get(c["slug"], 100), c["slug"]))
+    for row in rows:
+        row["is_system"] = row["slug"] in FIXED_CATEGORIES
+        row["is_protected"] = row["slug"] in PROTECTED_NAME_CATEGORIES
+        row["can_store_skills"] = True
+        row["can_delete"] = not row["is_system"]
+        row["can_rename"] = not row["is_system"] or is_manager(user)
+        row["can_move_into"] = can_rename_skill(user, row["slug"])
+        row["storage_relpath"] = category_relative_path(row["slug"], row["parent_slug"]).as_posix()
+        row["skill_count"] = row["direct_skill_count"] + sum(
+            c["direct_skill_count"] for c in rows if c["parent_slug"] == row["slug"])
+    return rows
+
+
+def move_skills_in_transaction(connection, names, target, user, move):
+    category_root(target, connection)
+    require_category_write(user, target)
+    paths = selected_skill_paths(connection, names) if names else []
+    for name, category, source in paths:
+        require_category_write(user, category)
+        destination = check_skill_destination(connection, target, name)
+        if category != target and destination.exists():
+            raise HTTPException(409, f"Target already contains Skill: {name}")
+    for name, category, source in paths:
+        if category == target:
+            continue
+        move(source, check_skill_destination(connection, target, name))
+        connection.execute("UPDATE skills SET category_slug=?,updated_at=? WHERE name=?", (target, now(), name))
+    return [name for name, _, _ in paths]
 
 
 @app.get("/api/categories")
 async def list_categories(request: Request) -> dict[str, Any]:
-    await current_user(request)
+    user = await current_user(request)
     connection = db()
-    rows = connection.execute(
-        """SELECT c.slug,c.display_name,c.name_zh,c.description,c.is_system,c.created_by,c.created_at,c.updated_at,
-                  COUNT(s.name) AS skill_count
-           FROM categories c LEFT JOIN skills s ON s.category_slug=c.slug
-           GROUP BY c.slug ORDER BY c.is_system DESC, c.display_name, c.slug"""
-    ).fetchall()
-    connection.close()
-    return {"categories": [skill_row(row) for row in rows]}
+    try:
+        return {"categories": category_records(connection, user)}
+    finally:
+        connection.close()
 
 
 @app.post("/api/categories", status_code=201)
 async def create_category(payload: CategoryCreate, request: Request) -> dict[str, Any]:
-    user = await require_manager(request)
+    user = actor_for(await current_user(request))
     slug = validate_category(payload.slug)
+    parent = validate_category(payload.parent_slug) if payload.parent_slug is not None else None
     name_zh = (payload.name_zh or payload.display_name or slug).strip()
+    if not name_zh:
+        raise HTTPException(422, "Category display name cannot be blank")
+    ensure_dirs()
     connection = db()
+    moved = []
     try:
-        stamp = now()
-        connection.execute(
-            "INSERT INTO categories(slug,display_name,name_zh,description,is_system,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            (slug, name_zh, name_zh, payload.description.strip(), 0, user["id"], stamp, stamp),
-        )
-        connection.commit()
-    except sqlite3.IntegrityError as exc:
-        connection.rollback()
-        raise HTTPException(409, "Category already exists") from exc
+        with category_transaction(connection) as (move, mkdir):
+            if connection.execute("SELECT 1 FROM categories WHERE slug=?", (slug,)).fetchone():
+                raise HTTPException(409, "Category already exists")
+            first_child = False
+            if parent is not None:
+                row = connection.execute("SELECT parent_slug FROM categories WHERE slug=?", (parent,)).fetchone()
+                if row is None:
+                    raise HTTPException(404, "Parent category not found")
+                if row[0] is not None:
+                    raise HTTPException(422, "Only two category levels are supported")
+                first_child = not connection.execute("SELECT 1 FROM categories WHERE parent_slug=?", (parent,)).fetchone()
+            path = checked_storage_path(SKILLS_ROOT / category_relative_path(slug, parent))
+            container = path.parent if parent is not None else path
+            if container.exists():
+                raise HTTPException(409, "Category directory conflicts with existing storage")
+            stamp = now()
+            connection.execute(
+                "INSERT INTO categories(slug,display_name,name_zh,parent_slug,description,is_system,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (slug, name_zh, name_zh, parent, payload.description.strip(), 0, user["id"], stamp, stamp),
+            )
+            mkdir(path)
+            if first_child:
+                names = [r[0] for r in connection.execute("SELECT name FROM skills WHERE category_slug=?", (parent,))]
+                moved = move_skills_in_transaction(connection, names, slug, user, move)
+        result = next(c for c in category_records(connection, user) if c["slug"] == slug)
     finally:
         connection.close()
     write_category_names_file()
-    return {"category": {"slug": slug, "display_name": name_zh, "name_zh": name_zh, "description": payload.description.strip(), "is_system": False, "skill_count": 0}}
+    return {"category": result, "moved": moved, "moved_count": len(moved)}
 
 
 @app.patch("/api/categories/{slug}")
 async def update_category(slug: str, payload: CategoryUpdate, request: Request) -> dict[str, Any]:
-    await require_manager(request)
+    user = actor_for(await current_user(request))
     slug = validate_category(slug)
-    if all(value is None for value in (payload.slug, payload.name_zh, payload.display_name, payload.description)):
+    if not payload.model_fields_set:
         raise HTTPException(422, "No category fields to update")
     connection = db()
-    row = connection.execute("SELECT * FROM categories WHERE slug=?", (slug,)).fetchone()
-    if row is None:
-        connection.close()
-        raise HTTPException(404, "Category not found")
-    # `display_name` is retained for older API clients. New clients should
-    # send the path slug and the two localized names independently.
-    legacy_display_name_only = (
-        payload.display_name is not None
-        and payload.slug is None
-        and payload.name_zh is None
-    )
-    name_zh = (
-        payload.name_zh.strip()
-        if payload.name_zh is not None
-        else payload.display_name.strip()
-        if payload.display_name is not None
-        else row["name_zh"] or row["display_name"] or slug
-    )
-    description = payload.description.strip() if payload.description is not None else row["description"]
-    new_slug = (
-        validate_category(payload.slug.strip())
-        if payload.slug is not None
-        else validate_category(payload.display_name.strip())
-        if legacy_display_name_only
-        else slug
-    )
-    if row["is_system"] and new_slug != slug:
-        connection.close()
-        raise HTTPException(409, "The general category cannot be renamed")
-    if new_slug != slug and connection.execute("SELECT 1 FROM categories WHERE slug=?", (new_slug,)).fetchone():
-        connection.close()
-        raise HTTPException(409, "Category already exists")
-    old_category_dir = category_root(slug)
-    new_category_dir = category_root(new_slug)
-    old_archive_dir = ARCHIVES_ROOT / slug
-    new_archive_dir = ARCHIVES_ROOT / new_slug
-    moved_dirs: list[tuple[Path, Path]] = []
+    cleanup = []
     try:
-        if new_slug != slug:
-            if new_category_dir.exists() or new_archive_dir.exists():
-                raise HTTPException(409, "Target category path already exists")
-            if old_category_dir.exists():
-                old_category_dir.rename(new_category_dir)
-                moved_dirs.append((old_category_dir, new_category_dir))
-            if old_archive_dir.exists():
-                new_archive_dir.parent.mkdir(parents=True, exist_ok=True)
-                old_archive_dir.rename(new_archive_dir)
-                moved_dirs.append((old_archive_dir, new_archive_dir))
-            connection.execute("BEGIN IMMEDIATE")
+        with category_transaction(connection) as (move, mkdir):
+            row = connection.execute("SELECT * FROM categories WHERE slug=?", (slug,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Category not found")
+            if "parent_slug" in payload.model_fields_set and payload.parent_slug != row["parent_slug"]:
+                raise HTTPException(409, "Changing a category's parent is not supported")
+            legacy_slug = payload.display_name if payload.slug is None and payload.name_zh is None else None
+            new_slug = validate_category((payload.slug or legacy_slug or slug).strip())
+            name_zh = (payload.name_zh if payload.name_zh is not None else payload.display_name if payload.display_name is not None else row["name_zh"]).strip()
+            if not name_zh:
+                raise HTTPException(422, "Category display name cannot be blank")
+            if slug in FIXED_CATEGORIES:
+                if new_slug != slug:
+                    raise HTTPException(409, "Fixed category identifiers cannot be changed")
+                if not is_manager(user):
+                    raise HTTPException(403, "Administrator permission required to rename a fixed category")
+            if new_slug != slug:
+                if connection.execute("SELECT 1 FROM categories WHERE slug=?", (new_slug,)).fetchone():
+                    raise HTTPException(409, "Category already exists")
+                source = category_root(slug, connection)
+                target = checked_storage_path(SKILLS_ROOT / category_relative_path(new_slug, row["parent_slug"]))
+                container = target.parent if row["parent_slug"] else target
+                if container.exists():
+                    raise HTTPException(409, "Target category directory already exists")
+                if source.exists():
+                    move(source, target)
+                else:
+                    if connection.execute("SELECT 1 FROM skills WHERE category_slug=?", (slug,)).fetchone():
+                        raise HTTPException(409, "Category storage is missing")
+                    mkdir(target)
+                if row["parent_slug"]:
+                    cleanup.append(source.parent)
+                connection.execute("UPDATE skills SET category_slug=?,updated_at=? WHERE category_slug=?", (new_slug, now(), slug))
+                connection.execute("UPDATE categories SET parent_slug=? WHERE parent_slug=?", (new_slug, slug))
             connection.execute(
                 "UPDATE categories SET slug=?,display_name=?,name_zh=?,description=?,updated_at=? WHERE slug=?",
-                (new_slug, name_zh, name_zh, description, now(), slug),
+                (new_slug, name_zh, name_zh, payload.description.strip() if payload.description is not None else row["description"], now(), slug),
             )
-            connection.execute("UPDATE skills SET category_slug=?,updated_at=? WHERE category_slug=?", (new_slug, now(), slug))
-            old_prefix = str(old_archive_dir) + "/"
-            new_prefix = str(new_archive_dir) + "/"
-            connection.execute("UPDATE skill_versions SET archive_path=REPLACE(archive_path, ?, ?) WHERE archive_path LIKE ?", (old_prefix, new_prefix, old_prefix + "%"))
-        else:
-            connection.execute(
-                "UPDATE categories SET display_name=?,name_zh=?,description=?,updated_at=? WHERE slug=?",
-                (name_zh, name_zh, description, now(), slug),
-            )
-        connection.commit()
-    except HTTPException:
-        connection.rollback()
-        for old_path, new_path in reversed(moved_dirs):
-            if new_path.exists():
-                new_path.rename(old_path)
-        raise
-    except Exception:
-        connection.rollback()
-        for old_path, new_path in reversed(moved_dirs):
-            if new_path.exists():
-                new_path.rename(old_path)
-        raise
+        result = next(c for c in category_records(connection, user) if c["slug"] == new_slug)
     finally:
         connection.close()
+    remove_empty_category_dirs(cleanup)
     write_category_names_file()
-    return {
-        "category": {
-            "slug": new_slug,
-            "display_name": name_zh,
-            "name_zh": name_zh,
-            "description": description,
-            "is_system": bool(row["is_system"]),
-        }
-    }
+    return {"category": result}
 
 
 @app.delete("/api/categories/{slug}")
 async def delete_category(slug: str, request: Request) -> dict[str, Any]:
-    await require_manager(request)
+    user = actor_for(await current_user(request))
     slug = validate_category(slug)
-    if slug == DEFAULT_CATEGORY:
-        raise HTTPException(409, "The general category cannot be deleted")
+    if slug in FIXED_CATEGORIES:
+        raise HTTPException(409, "Fixed categories cannot be deleted")
     connection = db()
-    row = connection.execute("SELECT * FROM categories WHERE slug=?", (slug,)).fetchone()
-    if row is None:
+    cleanup = []
+    try:
+        with category_transaction(connection) as (move, mkdir):
+            row = connection.execute("SELECT * FROM categories WHERE slug=?", (slug,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Category not found")
+            removed = [slug] + [r[0] for r in connection.execute("SELECT slug FROM categories WHERE parent_slug=?", (slug,))]
+            if any(c in FIXED_CATEGORIES for c in removed):
+                raise HTTPException(409, "Category contains fixed children")
+            target = row["parent_slug"] or DEFAULT_CATEGORY
+            placeholders = ",".join("?" for _ in removed)
+            names = [r[0] for r in connection.execute(f"SELECT name FROM skills WHERE category_slug IN ({placeholders})", removed)]
+            paths = selected_skill_paths(connection, names) if names else []
+            directory = category_root(slug, connection)
+            if directory.exists():
+                # Never remove unknown files or symlinks as a side effect of deleting a group.
+                for path in directory.rglob("*"):
+                    if path.is_symlink() or (path.is_file() and not any(root in path.parents for _, _, root in paths)):
+                        raise HTTPException(409, "Category contains unmanaged files; deletion stopped")
+                cleanup = [directory, *[p for p in directory.rglob("*") if p.is_dir()]]
+            if row["parent_slug"]:
+                cleanup.append(directory.parent)
+            moved = move_skills_in_transaction(connection, names, target, user, move)
+            connection.execute(f"DELETE FROM categories WHERE slug IN ({placeholders})", removed)
+    finally:
         connection.close()
-        raise HTTPException(404, "Category not found")
-    skill_names = [row[0] for row in connection.execute("SELECT name FROM skills WHERE category_slug=?", (slug,)).fetchall()]
-    connection.close()
-    if skill_names:
-        move_selected_skills(skill_names, DEFAULT_CATEGORY)
-    connection = db()
-    connection.execute("DELETE FROM categories WHERE slug=?", (slug,))
-    connection.commit()
-    connection.close()
+    remove_empty_category_dirs(cleanup)
     write_category_names_file()
-    category_dir = category_root(slug)
-    if category_dir.is_dir() and not any(category_dir.iterdir()):
-        category_dir.rmdir()
-    return {"ok": True, "slug": slug}
-
+    return {"ok": True, "slug": slug, "removed_categories": removed, "moved": moved, "target_category": target}
 
 @app.get("/api/skills/{name}")
 async def get_skill(name: str, request: Request) -> dict[str, Any]:
-    await current_user(request); name = validate_name(name)
+    user = await current_user(request); name = validate_name(name)
     connection = db(); row = connection.execute("SELECT * FROM skills WHERE name=?", (name,)).fetchone(); connection.close()
     if row is None: raise HTTPException(404, "Skill not found")
-    return {"skill": skill_row(row), "files": list_skill_files(name, row["category_slug"])}
+    return {"skill": skill_with_permissions(row, user), "files": list_skill_files(name, row["category_slug"])}
 
 
 @app.get("/api/skills/{name}/files/{path:path}")
@@ -1104,6 +1447,7 @@ async def update_skill(name: str, payload: FileUpdate, request: Request) -> dict
     try:
         selected_skill_paths(connection, [name])
         row = connection.execute("SELECT * FROM skills WHERE name=?", (name,)).fetchone()
+        require_category_write(user, row["category_slug"])
     finally:
         connection.close()
     if payload.base_version is not None and payload.base_version != row["version"]:
@@ -1124,8 +1468,8 @@ async def update_skill(name: str, payload: FileUpdate, request: Request) -> dict
 
 @app.delete("/api/skills/{name}")
 async def delete_skill(name: str, request: Request) -> dict[str, bool]:
-    await current_user(request)
-    delete_selected_skills([name])
+    user = await current_user(request)
+    delete_selected_skills([name], user)
     return {"ok": True}
 
 
@@ -1134,11 +1478,16 @@ async def update_skill_name(name: str, payload: SkillNameUpdate, request: Reques
     user = actor_for(await current_user(request))
     name = validate_name(name)
     name_zh = payload.name_zh.strip()
+    if not name_zh:
+        raise HTTPException(422, "Skill display name cannot be blank")
     connection = db()
     try:
-        row = connection.execute("SELECT name FROM skills WHERE name=?", (name,)).fetchone()
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT name,category_slug FROM skills WHERE name=?", (name,)).fetchone()
         if row is None:
             raise HTTPException(404, "Skill not found")
+        if not can_rename_skill(user, row["category_slug"]):
+            raise HTTPException(403, "Administrator permission required to rename this Skill")
         connection.execute("UPDATE skills SET name_zh=?,updated_by=?,updated_at=? WHERE name=?", (name_zh, user["id"], now(), name))
         connection.commit()
     finally:
@@ -1159,19 +1508,21 @@ def selected_skill_paths(connection: sqlite3.Connection, names: list[str]) -> li
     paths = []
     for name in names:
         category = validate_category(found[name])
-        path = skill_root(category, name)
+        path = skill_root(category, name, connection)
         if path.is_symlink() or not path.is_dir():
             raise HTTPException(409, f"Skill directory is unavailable: {name}")
         paths.append((name, category, path))
     return paths
 
 
-def delete_selected_skills(names: list[str]) -> list[str]:
+def delete_selected_skills(names: list[str], user: dict[str, str] | None = None) -> list[str]:
     connection = db()
     moved: list[tuple[Path, Path]] = []
     try:
         connection.execute("BEGIN IMMEDIATE")
         paths = selected_skill_paths(connection, names)
+        for _, category, _ in paths:
+            require_category_write(user, category)
         # Retain version archives; stage directories so a failed batch can roll back.
         with tempfile.TemporaryDirectory(prefix="skill-delete-", dir=ROOT) as temp_dir:
             try:
@@ -1195,53 +1546,26 @@ def delete_selected_skills(names: list[str]) -> list[str]:
 
 @app.post("/api/skills/batch-delete")
 async def batch_delete_skills(payload: SkillSelection, request: Request) -> dict[str, Any]:
-    await require_manager(request)
-    deleted = delete_selected_skills(payload.names)
+    user = await require_manager(request)
+    deleted = delete_selected_skills(payload.names, user)
     return {"ok": True, "deleted": deleted, "count": len(deleted)}
 
 
-def move_selected_skills(names: list[str], target_category: str) -> list[str]:
+def move_selected_skills(names: list[str], target_category: str, user: dict[str, str] | None = None) -> list[str]:
     target_category = validate_category(target_category)
     connection = db()
-    moved: list[tuple[Path, Path]] = []
     try:
-        connection.execute("BEGIN IMMEDIATE")
-        if connection.execute("SELECT 1 FROM categories WHERE slug=?", (target_category,)).fetchone() is None:
-            raise HTTPException(404, "Category not found")
-        paths = selected_skill_paths(connection, names)
-        with tempfile.TemporaryDirectory(prefix="skill-move-", dir=ROOT) as temp_dir:
-            staging = Path(temp_dir) / "staging"
-            staging.mkdir()
-            try:
-                for name, category, source in paths:
-                    if category == target_category:
-                        continue
-                    destination = skill_root(target_category, name)
-                    if destination.exists():
-                        raise HTTPException(409, f"Target category already contains Skill: {name}")
-                    staged = staging / name
-                    source.rename(staged)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    staged.rename(destination)
-                    moved.append((source, destination))
-                    connection.execute("UPDATE skills SET category_slug=?,updated_at=? WHERE name=?", (target_category, now(), name))
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                for source, destination in reversed(moved):
-                    if destination.exists():
-                        source.parent.mkdir(parents=True, exist_ok=True)
-                        destination.rename(source)
-                raise
-        return [name for name, _, _ in paths]
+        with category_transaction(connection) as (move, mkdir):
+            moved = move_skills_in_transaction(connection, names, target_category, user, move)
+        return moved
     finally:
         connection.close()
 
 
 @app.patch("/api/skills/{name}/category")
 async def move_skill_category(name: str, payload: CategoryAssignment, request: Request) -> dict[str, Any]:
-    await current_user(request)
-    moved = move_selected_skills([name], payload.category)
+    user = await current_user(request)
+    moved = move_selected_skills([name], payload.category, user)
     connection = db()
     row = connection.execute("SELECT name,category_slug FROM skills WHERE name=?", (moved[0],)).fetchone()
     connection.close()
@@ -1250,10 +1574,9 @@ async def move_skill_category(name: str, payload: CategoryAssignment, request: R
 
 @app.post("/api/skills/batch-category")
 async def move_batch_skill_category(payload: BatchCategoryAssignment, request: Request) -> dict[str, Any]:
-    await require_manager(request)
-    moved = move_selected_skills(payload.names, payload.category)
+    user = await require_manager(request)
+    moved = move_selected_skills(payload.names, payload.category, user)
     return {"ok": True, "moved": moved, "category": validate_category(payload.category), "count": len(moved)}
-
 
 @app.post("/api/skills/batch-download")
 async def batch_download_skills(payload: SkillSelection, request: Request) -> StreamingResponse:

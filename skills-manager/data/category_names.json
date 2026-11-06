@@ -1,6 +1,8 @@
 {
+  "current-common": "现有通用",
+  "customer": "客户",
   "customer-common": "客户通用",
   "customer-private": "客户私有",
   "general": "默认",
-  "internal": "内部使用"
+  "internal": "内部"
 }

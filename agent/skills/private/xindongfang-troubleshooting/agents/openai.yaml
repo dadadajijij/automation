@@ -1,0 +1,4 @@
+interface:
+  display_name: "新东方问题初筛"
+  short_description: "依据新东方上报素材运行代码分类，核验 Argus 证据并给出排查建议"
+  default_prompt: "使用 $xindongfang-troubleshooting 先运行本地脚本分类，再按规则完成 Argus 初筛或通用支持排查。"

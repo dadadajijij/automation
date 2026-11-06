@@ -13,6 +13,52 @@ from skill_manager import app as manager
 
 
 class GitImportTests(unittest.TestCase):
+    def test_scp_addresses_preserve_git_path_semantics_and_ref(self):
+        addresses = (
+            "git@github.com:JamieLiu67/orobas-agora-support.git",
+            "git@git.agoralab.co:ai/agora-skills.git",
+            "git@example.com:skill.git",
+            "git@example.com:~/skills.git",
+            "git@example.com:/srv/skills.git",
+            "git@[2001:4860:4860::8888]:team/skills.git",
+        )
+        with patch.object(manager, "allowed_url_hosts", return_value=set()), patch.object(manager.socket, "getaddrinfo", return_value=[(2, 1, 6, '', ('8.8.8.8', 22))]):
+            for url in addresses:
+                with self.subTest(url=url):
+                    self.assertEqual(manager.parse_git_source('  ' + url + '  ', 'athena'), (url, 'athena'))
+
+    def test_scp_addresses_keep_host_validation(self):
+        url = "git@example.com:skills.git"
+        with patch.object(manager, "allowed_url_hosts", return_value=set()), patch.object(manager.socket, "getaddrinfo", return_value=[(2, 1, 6, '', ('127.0.0.1', 22))]):
+            with self.assertRaises(HTTPException) as error:
+                manager.parse_git_source(url, None)
+            self.assertEqual(error.exception.status_code, 400)
+            self.assertIn('non-public', error.exception.detail)
+        with patch.object(manager, "allowed_url_hosts", return_value={'example.com'}), patch.object(manager.socket, 'getaddrinfo') as lookup:
+            self.assertEqual(manager.parse_git_source(url, None), (url, None))
+            lookup.assert_not_called()
+
+    def test_invalid_scp_addresses_rejected(self):
+        for url in ('git@github.com:', 'git@:repo.git', '-git@github.com:repo.git', 'git@github.com:repo\n.git', 'git@[:::]:repo.git'):
+            with self.subTest(url=url), self.assertRaises(HTTPException):
+                manager.parse_git_source(url, None)
+
+    def test_scp_clone_uses_ssh_and_repository_name_for_root_skill(self):
+        for url in ('git@github.com:JamieLiu67/orobas-agora-support.git', 'git@github.com:orobas-agora-support.git'):
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as tmp:
+                def clone(command, **kwargs):
+                    self.assertEqual(command[:5], ['git', 'clone', '--depth', '1', '--no-tags'])
+                    self.assertEqual(command[-3:-1], ['--', url])
+                    self.assertIn('athena', command)
+                    root = Path(command[-1]); root.mkdir()
+                    (root / 'SKILL.md').write_text('# Root Skill')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+
+                with patch.object(manager, 'ROOT', Path(tmp)), patch.object(manager, 'ensure_dirs'), patch.object(manager, 'allowed_url_hosts', return_value={'github.com'}), patch.dict(os.environ, {'username':'fake-user', 'password':''}), patch.object(manager.subprocess, 'run', side_effect=clone):
+                    packages = manager.clone_git_packages(url, 'athena')
+                self.assertEqual(packages[0]['name'], 'orobas-agora-support')
+                self.assertFalse(list(Path(tmp).glob('skill-git-*')))
+
     def test_ssh_import_uses_ssh_auth_instead_of_https_credentials(self):
         url = "ssh://git@git.agoralab.co/ai/agora-skills.git"
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"username": "fake-user", "password": "fake-password"}), patch.object(manager, "ROOT", Path(tmp)), patch.object(manager, "ensure_dirs"), patch.object(manager, "validate_git_url", side_effect=lambda value: value), patch.object(manager.subprocess, "run", return_value=subprocess.CompletedProcess([], 128, "", "Permission denied (publickey).")) as run:
