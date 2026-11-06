@@ -4,6 +4,8 @@ jobs/
 .agents/
 codex-home-cache/
 
+agent/skills/private/
+
 __pycache__/
 *.py[cod]
 .pytest_cache/
