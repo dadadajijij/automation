@@ -500,7 +500,7 @@ def list_users(
               (SELECT COUNT(*) FROM messages m WHERE m.user_id = u.user_id) AS message_count
             FROM users u
             {where}
-            ORDER BY u.updated_at DESC
+            ORDER BY conversation_count DESC, u.updated_at DESC, u.user_id ASC
             LIMIT ? OFFSET ?
             """,
             params,
@@ -861,7 +861,8 @@ def search_admin_context(
                 COALESCE(SUM((SELECT COUNT(*) FROM messages m
                     WHERE m.external_session_id = c.external_session_id)), 0) AS message_count
                 FROM users u LEFT JOIN conversations c ON c.user_id = u.user_id
-                {where} GROUP BY u.user_id ORDER BY u.updated_at DESC, u.user_id ASC""",
+                {where} GROUP BY u.user_id
+                ORDER BY conversation_count DESC, u.updated_at DESC, u.user_id ASC""",
             params,
         ).fetchall()
         users = [dict(row) for row in users]

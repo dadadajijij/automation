@@ -547,6 +547,17 @@ def render_dashboard_page(
             }}
             .request-stage-detail {{ overflow-wrap: anywhere; text-align: right; }}
             .request-stage.nested {{ padding-left: 16px; color: var(--muted); }}
+            .request-timeline {{ margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 5px; background: #111820; }}
+            .request-timeline summary {{ cursor: pointer; color: var(--muted); font-size: 12px; }}
+            .timeline-row {{ display: grid; grid-template-columns: 112px minmax(0, 1fr) 72px; gap: 8px; align-items: center; margin-top: 7px; font-size: 11px; }}
+            .timeline-label {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }}
+            .timeline-track {{ position: relative; height: 10px; border-radius: 5px; background: #263044; overflow: hidden; }}
+            .timeline-bar {{ position: absolute; top: 0; bottom: 0; border-radius: 5px; min-width: 2px; }}
+            .timeline-bar.model {{ background: #78a6ff; }}
+            .timeline-bar.tool {{ background: #61c7a5; }}
+            .timeline-bar.gateway {{ background: #9b8cff; }}
+            .timeline-bar.cli {{ background: #788493; }}
+            .timeline-duration {{ color: var(--muted); text-align: right; }}
             .runtime-audit {{ margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.55; }}
             .runtime-audit strong {{ color: var(--text); font-weight: 600; }}
             .runtime-audit-details {{ margin-top: 8px; }}
@@ -604,8 +615,7 @@ def render_dashboard_page(
             <div class="toolbar">
               <input id="userFilter" type="text" placeholder="搜索用户" autocomplete="off" />
               <input id="searchInput" type="text" placeholder="搜索会话信息" autocomplete="off" />
-              <span class="meta">按回车应用搜索条件</span><button id="refreshBtn">刷新</button><button id="resetBtn">重置全部</button>
-              <button id="clearUserBtn">清除用户条件</button><button id="clearSearchBtn">清除会话条件</button>
+              <button id="resetBtn">重置搜索条件</button>
               <div class="toolbar-nav">
               <a class="nav-link" id="chatLink">在线对话</a>
               <a class="nav-link" id="latencyLink">耗时统计</a>
@@ -680,7 +690,7 @@ def render_dashboard_page(
                   <div class="detail-box">
                     <h3>当前会话命中导航</h3><button id="prevMatchBtn">上一处</button> <button id="nextMatchBtn">下一处</button> <label><input type="checkbox" id="onlyMatches" style="width:auto" />仅看命中</label>
                     <div class="messages" id="searchResults">
-                      <div class="notice">输入会话信息后按回车筛选</div>
+                      <div class="notice">输入会话信息筛选</div>
                     </div>
                   </div>
                 </div>
@@ -709,7 +719,6 @@ def render_dashboard_page(
             const els = {{
               searchInput: document.getElementById('searchInput'),
               userFilter: document.getElementById('userFilter'),
-              refreshBtn: document.getElementById('refreshBtn'),
               logoutBtn: document.getElementById('logoutBtn'),
               usersCount: document.getElementById('usersCount'),
               sessionsCount: document.getElementById('sessionsCount'),
@@ -740,6 +749,19 @@ def render_dashboard_page(
             function formatDuration(value) {{
               const ms = Number(value) || 0;
               return ms < 1000 ? `${{Math.round(ms)}} ms` : `${{(ms / 1000).toFixed(1)}} s`;
+            }}
+
+            function renderTimeline(timing) {{
+              const segments = Array.isArray(timing?.timeline) ? timing.timeline : [];
+              if (!segments.length) return '';
+              const total = Number(timing.timeline_total_ms) || Math.max(...segments.map((x) => Number(x.start_ms || 0) + Number(x.duration_ms || 0)), 1);
+              const rows = segments.map((segment) => {{
+                const left = Math.max(0, Number(segment.start_ms || 0) / total * 100);
+                const width = Math.max(0.2, Number(segment.duration_ms || 0) / total * 100);
+                const title = `${{segment.label || '-'}} · ${{formatDuration(segment.duration_ms)}}${{segment.detail ? ` · ${{segment.detail}}` : ''}}`;
+                return `<div class="timeline-row" title="${{esc(title)}}"><span class="timeline-label">${{esc(segment.label || '-')}}</span><div class="timeline-track"><i class="timeline-bar ${{esc(segment.kind || 'cli')}}" style="left:${{left.toFixed(3)}}%;width:${{Math.min(100 - left, width).toFixed(3)}}%"></i></div><span class="timeline-duration">${{formatDuration(segment.duration_ms)}}</span></div>`;
+              }}).join('');
+              return `<details class="request-timeline"><summary>查看执行时间轴 · 总计 ${{formatDuration(total)}}</summary>${{rows}}</details>`;
             }}
 
             function runtimeEvents(audit) {{
@@ -899,11 +921,7 @@ def render_dashboard_page(
                 return;
               }}
               els.detailMeta.textContent = `${{data.user_id}} / ${{data.external_session_id}}`;
-              els.conversationDetail.innerHTML = [
-                ['用户', data.user_id], ['会话 ID', data.external_session_id], ['标题', data.title],
-                ['状态', data.status], ['创建时间', data.created_at], ['更新时间', data.updated_at],
-              ].map(([label, value]) => `<div><strong>${{label}}：</strong>${{esc(value || '-')}}</div>`).join('') +
-                `<details><summary>展开原始 JSON</summary><pre>${{esc(JSON.stringify(data, null, 2))}}</pre></details>`;
+              els.conversationDetail.innerHTML = `<pre>${{esc(JSON.stringify(data, null, 2))}}</pre>`;
             }}
 
             function highlight(value) {{
@@ -954,6 +972,7 @@ def render_dashboard_page(
                   ${{row.event_type === 'request' ? `
                     <div style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${{highlight(row.prompt)}}</div>
                     ${{renderRuntimeAudit(row.runtime_audit)}}
+                    ${{renderTimeline(row.timing)}}
                     ${{row.request_body ? `<details class="request-body"><summary>展开原始 Body</summary><pre>${{esc(row.request_body)}}</pre></details>` : ''}}
                     ${{row.stages && row.stages.length ? `<details class="request-stages"><summary>展开阶段耗时</summary>${{row.stages.map((stage) => `<div class="request-stage${{stage.nested ? ' nested' : ''}}"><span>${{esc(stage.stage)}}</span><span>${{formatDuration(stage.duration_ms)}}</span>${{stage.detail ? `<span class="request-stage-detail">${{esc(stage.detail)}}</span>` : ''}}</div>`).join('')}}</details>` : ''}}
                     <div class="meta" style="margin-top:8px;">${{row.status === 'completed' ? 'Hermes 已成功返回' : row.status === 'superseded' ? '已被同一会话的后续请求中断' : row.status === 'failed' ? 'Hermes 请求失败' : 'Hermes 正在处理' }}${{row.http_status ? ` • HTTP ${{esc(row.http_status)}}` : ''}}</div>
@@ -962,7 +981,7 @@ def render_dashboard_page(
                 </div>
               `).join('') : '<div class="notice">没有可展示的请求或消息</div>';
               const hits = visibleItems.filter(isMatch).length;
-              els.searchResults.textContent = state.keyword ? (hits ? `当前会话命中 ${{hits}} 条请求 / 消息` : '会话标题 / ID 匹配，或消息元信息匹配；时间线中没有正文命中') : '输入会话信息后按回车筛选';
+              els.searchResults.textContent = state.keyword ? (hits ? `当前会话命中 ${{hits}} 条请求 / 消息` : '会话标题 / ID 匹配，或消息元信息匹配；时间线中没有正文命中') : '输入会话信息筛选';
               document.getElementById('prevMatchBtn').disabled = !hits;
               document.getElementById('nextMatchBtn').disabled = !hits;
               if (hits) navigateMatch();
@@ -1078,12 +1097,9 @@ def render_dashboard_page(
                 showError(error);
               }}
             }}
-            els.refreshBtn.addEventListener('click', refreshAll);
             document.getElementById('resetBtn').addEventListener('click', () => {{
               els.userFilter.value = ''; els.searchInput.value = ''; doSearch();
             }});
-            document.getElementById('clearUserBtn').addEventListener('click', () => {{ els.userFilter.value = ''; doSearch(); }});
-            document.getElementById('clearSearchBtn').addEventListener('click', () => {{ els.searchInput.value = ''; doSearch(); }});
             document.getElementById('allUsersBtn').addEventListener('click', () => {{
               state.scopeUser = ''; state.offset = 0; state.selectedSession = ''; refreshAll();
             }});
@@ -1109,12 +1125,13 @@ def render_dashboard_page(
               await fetch(`${{mountPath}}/admin/logout`, {{ credentials: 'same-origin', redirect: 'manual' }});
               location.replace(`${{mountPath}}/admin/login`);
             }});
-            els.searchInput.addEventListener('keydown', (event) => {{
-              if (event.key === 'Enter') doSearch();
-            }});
-            els.userFilter.addEventListener('keydown', (event) => {{
-              if (event.key === 'Enter') doSearch();
-            }});
+            let searchTimer = null;
+            const scheduleSearch = () => {{
+              if (searchTimer) clearTimeout(searchTimer);
+              searchTimer = setTimeout(() => doSearch(), 250);
+            }};
+            els.searchInput.addEventListener('input', scheduleSearch);
+            els.userFilter.addEventListener('input', scheduleSearch);
 
             refreshAll();
           </script>

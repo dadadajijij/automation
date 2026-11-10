@@ -148,8 +148,13 @@ def _run_command(
             process.kill()
         except Exception:
             pass
-        process.communicate()
-        raise HermesInvocationError(f"Hermes timed out after {settings.timeout_seconds}s") from exc
+        stdout, stderr = process.communicate()
+        raise HermesInvocationError(
+            f"Hermes timed out after {settings.timeout_seconds}s",
+            returncode=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        ) from exc
     finally:
         clear_session_process(run_key, run_generation, process)
 
@@ -190,13 +195,17 @@ def run_first_turn(
         cmd.extend(["-z", prompt, "--usage-file", str(usage_path)])
 
     try:
-        completed = _run_command(
-            settings,
-            cmd,
-            run_key=run_key,
-            run_generation=run_generation,
-            skill_audit_path=skill_audit_path,
-        )
+        try:
+            completed = _run_command(
+                settings,
+                cmd,
+                run_key=run_key,
+                run_generation=run_generation,
+                skill_audit_path=skill_audit_path,
+            )
+        finally:
+            usage = _read_usage_file(usage_path)
+            skill_audit = _read_skill_audit_file(skill_audit_path)
     except FileNotFoundError as exc:
         raise HermesInvocationError(f"Hermes binary not found: {settings.hermes_bin}") from exc
     except HermesInvocationCancelled:
@@ -211,8 +220,6 @@ def run_first_turn(
             skill_audit=skill_audit,
         ) from exc
     finally:
-        usage = _read_usage_file(usage_path)
-        skill_audit = _read_skill_audit_file(skill_audit_path)
         try:
             usage_path.unlink(missing_ok=True)
             skill_audit_path.unlink(missing_ok=True)
@@ -278,13 +285,17 @@ def run_resume_turn(
         cmd.extend(["--image", str(image_path)])
 
     try:
-        completed = _run_command(
-            settings,
-            cmd,
-            run_key=run_key,
-            run_generation=run_generation,
-            skill_audit_path=skill_audit_path,
-        )
+        try:
+            completed = _run_command(
+                settings,
+                cmd,
+                run_key=run_key,
+                run_generation=run_generation,
+                skill_audit_path=skill_audit_path,
+            )
+        finally:
+            usage = _read_usage_file(usage_path)
+            skill_audit = _read_skill_audit_file(skill_audit_path)
     except FileNotFoundError as exc:
         raise HermesInvocationError(f"Hermes binary not found: {settings.hermes_bin}") from exc
     except HermesInvocationCancelled:
@@ -299,8 +310,6 @@ def run_resume_turn(
             skill_audit=skill_audit,
         ) from exc
     finally:
-        usage = _read_usage_file(usage_path)
-        skill_audit = _read_skill_audit_file(skill_audit_path)
         try:
             usage_path.unlink(missing_ok=True)
             skill_audit_path.unlink(missing_ok=True)

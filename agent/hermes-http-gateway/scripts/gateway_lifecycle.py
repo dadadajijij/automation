@@ -127,7 +127,23 @@ def stop(pid):
     while alive(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
     if alive(pid):
-        raise RuntimeError(f'stop timed out for pid {pid}; PID file retained; no SIGKILL sent')
+        # Uvicorn waits for in-flight requests during graceful shutdown. A
+        # Hermes request can legitimately occupy that window for many minutes;
+        # once identity() was verified above, force-stop this gateway process
+        # so restart can recover service availability instead of leaving a
+        # stale PID and a half-shutdown listener behind.
+        os.kill(pid, signal.SIGKILL)
+        kill_deadline = time.monotonic() + max(1.0, STOP_TIMEOUT)
+        while alive(pid) and time.monotonic() < kill_deadline:
+            time.sleep(0.1)
+        if alive(pid):
+            raise RuntimeError(f'forced stop timed out for pid {pid}; PID file retained')
+        PID_FILE.unlink(missing_ok=True)
+        occupied, owners = listeners()
+        if occupied:
+            raise RuntimeError('gateway was killed but ' + conflict(owners))
+        print(f'graceful stop timed out; force-stopped hermes-gateway pid {pid}')
+        return
     PID_FILE.unlink(missing_ok=True)
     occupied, owners = listeners()
     if occupied:

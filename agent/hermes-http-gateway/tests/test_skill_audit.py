@@ -120,6 +120,26 @@ class SkillAuditTests(unittest.TestCase):
         ])
         self.assertEqual(stages[0]["detail"], "30 次模型调用")
 
+    def test_runtime_timing_contains_ordered_segments(self):
+        from hermes_http_gateway.main import _hermes_runtime_breakdown
+        from hermes_http_gateway.config import Settings
+        from pathlib import Path
+        settings = Settings(
+            host="127.0.0.1", port=1, database_url=Path("/tmp/test.sqlite"),
+            hermes_bin="hermes", hermes_workdir=Path("/tmp"), hermes_profile_default="default",
+            gateway_api_key=None, admin_username="admin", admin_password=None,
+            admin_cookie_name="x", admin_session_ttl_seconds=60, admin_cookie_secure=False,
+            public_base_path="", timeout_seconds=1, source_tag="tool", default_model=None,
+            default_provider=None, attachment_max_bytes=1, attachment_download_timeout_seconds=1,
+            attachment_max_images=1, attachment_redirect_limit=1, attachment_storage_root=Path("/tmp"),
+            attachment_retention_days=1,
+        )
+        timing = _hermes_runtime_breakdown(settings, "20261109_015945_52df3f")
+        self.assertTrue(timing["segments"])
+        self.assertLessEqual(
+            timing["segments"][0]["start_ts"], timing["segments"][-1]["end_ts"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

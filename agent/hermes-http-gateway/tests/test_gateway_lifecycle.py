@@ -87,8 +87,9 @@ http.server.HTTPServer((os.environ['HOST'], int(os.environ['PORT'])), Handler).s
     def test_stop_timeout_retains_pid(self):
         self.run_script('start', TEST_IGNORE_TERM='1')
         pid = self.pidfile.read_text()
-        self.assertIn('stop timed out', self.run_script('restart', ok=False).stderr)
-        self.assertEqual(self.pidfile.read_text(), pid)
+        result = self.run_script('restart')
+        self.assertIn('force-stopped', result.stdout)
+        self.assertNotEqual(self.pidfile.read_text(), pid)
 
     def test_start_timeout_cleans_process(self):
         self.run_script('start', ok=False, START_TIMEOUT='0.2', TEST_DELAY='1')

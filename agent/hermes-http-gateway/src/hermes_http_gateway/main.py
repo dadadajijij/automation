@@ -515,6 +515,7 @@ def _hermes_runtime_breakdown(
     tool_ms = 0.0
     model_calls = 0
     tool_calls = 0
+    segments: list[dict[str, Any]] = []
     previous_timestamp: float | None = None
     index = 0
     while index < len(rows):
@@ -530,14 +531,32 @@ def _hermes_runtime_breakdown(
             model_calls += 1
             tool_calls += len(calls)
             if previous_timestamp is not None:
-                model_ms += max(0.0, (timestamp - previous_timestamp) * 1000.0)
+                duration = max(0.0, (timestamp - previous_timestamp) * 1000.0)
+                model_ms += duration
+                if duration:
+                    segments.append({
+                        "kind": "model",
+                        "start_ts": previous_timestamp,
+                        "end_ts": timestamp,
+                        "duration_ms": round(duration, 1),
+                        "detail": "模型调用",
+                    })
             if calls:
                 tool_end = timestamp
                 cursor = index + 1
                 while cursor < len(rows) and rows[cursor]["role"] == "tool":
                     tool_end = max(tool_end, float(rows[cursor]["timestamp"]))
                     cursor += 1
-                tool_ms += max(0.0, (tool_end - timestamp) * 1000.0)
+                duration = max(0.0, (tool_end - timestamp) * 1000.0)
+                tool_ms += duration
+                if duration:
+                    segments.append({
+                        "kind": "tool",
+                        "start_ts": timestamp,
+                        "end_ts": tool_end,
+                        "duration_ms": round(duration, 1),
+                        "detail": f"{len(calls)} 次工具调用",
+                    })
                 previous_timestamp = tool_end
                 index = cursor - 1
             else:
@@ -557,6 +576,7 @@ def _hermes_runtime_breakdown(
         "source": "Hermes state.db message timestamps",
         "hermes_session_id": hermes_session_id,
         "measured_ms": round(measured_ms, 1),
+        "segments": segments[:256],
     }
 
 
@@ -609,6 +629,66 @@ def _request_timing(
         )
         overhead = max(0.0, total_ms - float(timing.get("measured_ms") or 0))
         timing["cli_overhead_ms"] = round(overhead, 1)
+    timeline: list[dict[str, Any]] = []
+    try:
+        request_start = datetime.fromisoformat(window_start).timestamp() if window_start else None
+    except (TypeError, ValueError, OverflowError):
+        request_start = None
+    hermes_start = hermes_end = None
+    for item in stages:
+        try:
+            end_ts = datetime.fromisoformat(str(item["created_at"])).timestamp()
+            duration_ms = float(item.get("duration_ms") or 0)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        start_ts = end_ts - duration_ms / 1000.0
+        if item.get("stage") == "Hermes CLI 运行":
+            hermes_start, hermes_end = start_ts, end_ts
+        elif request_start is not None and duration_ms > 0:
+            timeline.append({
+                "kind": "gateway",
+                "label": str(item.get("stage") or "网关阶段"),
+                "start_ms": round(max(0.0, (start_ts - request_start) * 1000.0), 1),
+                "duration_ms": round(duration_ms, 1),
+                "detail": item.get("detail"),
+            })
+    if request_start is not None and hermes_start is not None and hermes_end is not None:
+        cursor = hermes_start
+        for item in timing.get("segments", []):
+            start_ts = max(hermes_start, float(item.get("start_ts") or hermes_start))
+            end_ts = min(hermes_end, float(item.get("end_ts") or hermes_end))
+            if end_ts <= start_ts:
+                continue
+            if start_ts > cursor:
+                timeline.append({
+                    "kind": "cli",
+                    "label": "CLI 初始化/收尾",
+                    "start_ms": round(max(0.0, (cursor - request_start) * 1000.0), 1),
+                    "duration_ms": round((start_ts - cursor) * 1000.0, 1),
+                    "detail": "消息时间戳未覆盖的 CLI 区间",
+                })
+            kind = str(item.get("kind") or "model")
+            timeline.append({
+                "kind": kind,
+                "label": "模型等待" if kind == "model" else "工具执行",
+                "start_ms": round(max(0.0, (start_ts - request_start) * 1000.0), 1),
+                "duration_ms": round((end_ts - start_ts) * 1000.0, 1),
+                "detail": item.get("detail"),
+            })
+            cursor = max(cursor, end_ts)
+        if cursor < hermes_end:
+            timeline.append({
+                "kind": "cli",
+                "label": "CLI 初始化/收尾",
+                "start_ms": round(max(0.0, (cursor - request_start) * 1000.0), 1),
+                "duration_ms": round((hermes_end - cursor) * 1000.0, 1),
+                "detail": "消息时间戳未覆盖的 CLI 区间",
+            })
+    if timeline:
+        timing["timeline"] = sorted(timeline, key=lambda item: item["start_ms"])
+        timing["timeline_total_ms"] = round(max(
+            item["start_ms"] + item["duration_ms"] for item in timeline
+        ), 1)
     expanded: list[dict[str, Any]] = []
     inserted = False
     for stage in stages:

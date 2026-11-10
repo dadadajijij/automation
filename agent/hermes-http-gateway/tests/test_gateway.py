@@ -20,7 +20,11 @@ from hermes_http_gateway.attachments import attachment_session_dir
 from hermes_http_gateway.config import Settings, load_env_file
 from hermes_http_gateway import db as gateway_db
 from hermes_http_gateway import hermes_client as gateway_hermes_client
-from hermes_http_gateway.hermes_client import HermesInvocationCancelled, HermesRunResult
+from hermes_http_gateway.hermes_client import (
+    HermesInvocationCancelled,
+    HermesInvocationError,
+    HermesRunResult,
+)
 from hermes_http_gateway.locks import begin_session_turn, get_pending_attachments
 
 
@@ -689,6 +693,12 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("stage.nested", page)
         self.assertIn("stage.nested ? ' nested'", page)
 
+    def test_dashboard_renders_conversation_as_raw_json(self):
+        page = render_dashboard_page(username="admin", csrf_token="csrf")
+        self.assertIn("JSON.stringify(data, null, 2)", page)
+        self.assertNotIn("展开原始 JSON", page)
+        self.assertNotIn("['用户', data.user_id]", page)
+
     def test_new_chat_turn_waits_for_previous_attachment_and_reuses_it(self):
         download_started = threading.Event()
         release_download = threading.Event()
@@ -1098,6 +1108,35 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(cmd.count("--image"), 2)
         self.assertIn(str(img1), cmd)
         self.assertIn(str(img2), cmd)
+
+    def test_hermes_timeout_is_returned_as_invocation_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            timeout_error = HermesInvocationError("Hermes timed out after 1200s")
+            with mock.patch.object(gateway_hermes_client, "_run_command", side_effect=timeout_error):
+                with self.assertRaises(HermesInvocationError) as ctx:
+                    gateway_hermes_client.run_first_turn(
+                        settings,
+                        prompt="slow",
+                        profile="default",
+                    )
+            self.assertEqual(str(ctx.exception), "Hermes timed out after 1200s")
+            self.assertIsNone(ctx.exception.usage)
+
+    def test_resumed_hermes_timeout_is_returned_as_invocation_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _make_settings(Path(tmp))
+            timeout_error = HermesInvocationError("Hermes timed out after 1200s")
+            with mock.patch.object(gateway_hermes_client, "_run_command", side_effect=timeout_error):
+                with self.assertRaises(HermesInvocationError) as ctx:
+                    gateway_hermes_client.run_resume_turn(
+                        settings,
+                        prompt="slow",
+                        profile="default",
+                        hermes_session_id="hermes-1",
+                    )
+            self.assertEqual(str(ctx.exception), "Hermes timed out after 1200s")
+            self.assertIsNone(ctx.exception.usage)
 
     def test_gateway_preserves_prompt_in_first_attachment_and_resume_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
